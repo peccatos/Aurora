@@ -1,0 +1,19 @@
+[package]
+name = "aurora-library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+aurora-metadata.workspace = true
+aurora-storage.workspace = true
+walkdir.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+[lints]
+workspace = true

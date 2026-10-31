@@ -1,0 +1,11 @@
+[advisories]
+ignore = [
+    # glib 0.18.5 VariantStrIter unsoundness: Linux-only target dep of gtk/tauri
+    # menu stack; advisory has no fixed 0.18.x release. Track upstream gtk-rs
+    # bump in tauri. Does not affect Windows/macOS builds.
+    "RUSTSEC-2024-0429",
+    # paste/proc-macro-error "unmaintained": transitive proc-macro deps of
+    # lofty/tauri-build; not exploitable at runtime, awaiting upstream bumps.
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2024-0370",
+]

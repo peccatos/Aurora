@@ -1,0 +1,30 @@
+/target
+dist/
+node_modules/
+
+# Rust
+**/*.rs.bk
+
+# IDE
+/.idea
+.vscode/
+.DS_Store
+
+# Logs & env
+*.log
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Tauri build artifacts are committed; the generated Android/iOS folders are
+# not part of the desktop product.
+apps/desktop/icons/android/
+apps/desktop/icons/ios/
+
+# Dependency audit working files
+audit-cache/

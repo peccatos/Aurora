@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/aurora-core",
+    "crates/aurora-decoder",
+    "crates/aurora-dsp",
+    "crates/aurora-audio",
+    "crates/aurora-metadata",
+    "crates/aurora-storage",
+    "crates/aurora-library",
+    "crates/aurora-tauri",
+    "crates/aurora-app",
+    "apps/desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+aurora-core = { path = "crates/aurora-core" }
+aurora-decoder = { path = "crates/aurora-decoder" }
+aurora-dsp = { path = "crates/aurora-dsp" }
+aurora-audio = { path = "crates/aurora-audio" }
+aurora-metadata = { path = "crates/aurora-metadata" }
+aurora-storage = { path = "crates/aurora-storage" }
+aurora-library = { path = "crates/aurora-library" }
+aurora-tauri = { path = "crates/aurora-tauri" }
+aurora-app = { path = "crates/aurora-app" }
+
+# Audio stack
+cpal = "0.18.2"
+symphonia = { version = "0.6.1", features = ["all"] }
+rubato = "5.0.1"
+ringbuf = "0.6.0"
+lofty = "0.25.5"
+
+# Runtime / persistence
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+
+# Desktop
+tauri = "2.12.5"
+tauri-build = "2.7.4"
+
+# Shared infrastructure
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Tests
+tempfile = "3"
+proptest = "1"
+hound = "3.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+perf = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.symphonia]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

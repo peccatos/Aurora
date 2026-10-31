@@ -1,0 +1,19 @@
+[package]
+name = "aurora-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+aurora-decoder.workspace = true
+aurora-dsp.workspace = true
+cpal.workspace = true
+ringbuf.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+[dev-dependencies]
+proptest.workspace = true
+[lints]
+workspace = true

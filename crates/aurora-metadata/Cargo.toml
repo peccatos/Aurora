@@ -1,0 +1,16 @@
+[package]
+name = "aurora-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+lofty.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+[lints]
+workspace = true
