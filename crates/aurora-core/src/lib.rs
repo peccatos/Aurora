@@ -2,173 +2,14 @@
 //! builds on. This crate must not depend on Tauri, SQLite, CPAL, filesystem
 //! scanners, or UI code.
 
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+pub mod domain;
 
-// ---------------------------------------------------------------------------
-// Audio representation
-// ---------------------------------------------------------------------------
-
-/// How individual samples are represented in a PCM stream.
-///
-/// This distinction is load-bearing for the bit-perfect path: converting a
-/// 32-bit integer stream to `f32` is a lossy transformation that must never
-/// become invisible at the type level (ADR 0002).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SampleFormat {
-    /// Signed integer samples, e.g. i16/i24/i32.
-    SignedInt,
-    /// Unsigned integer samples, e.g. u8.
-    UnsignedInt,
-    /// IEEE 754 floating point samples, e.g. f32.
-    Float,
-}
-
-/// Channel layout of a PCM stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChannelLayout {
-    /// Samples interleaved in a single buffer: L R L R ...
-    Interleaved,
-    /// Each channel in a separate plane.
-    Planar,
-}
-
-/// The complete, unambiguous description of a PCM stream.
-///
-/// `bits_per_sample` is the actual sample width in bits (e.g. 24, not the
-/// container's 32-bit storage width for 24-bit-in-32 formats).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PcmFormat {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub bits_per_sample: u16,
-    pub sample_format: SampleFormat,
-    pub channel_layout: ChannelLayout,
-}
-
-impl PcmFormat {
-    /// Bits per second of the raw PCM payload.
-    pub fn bit_rate(&self) -> u64 {
-        u64::from(self.sample_rate) * u64::from(self.channels) * u64::from(self.bits_per_sample)
-    }
-}
-
-/// A transformation applied to the audio signal between decoder and device.
-///
-/// The diagnostics contract (ADR 0002) requires every active transformation
-/// to be reported; this enum is the vocabulary for that report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AudioTransformation {
-    SampleFormatConversion,
-    Resampling,
-    ChannelRemapping,
-    Gain,
-    Equalizer,
-    ReplayGain,
-    Mixing,
-    BitDepthTruncation,
-}
-
-// ---------------------------------------------------------------------------
-// Output backend contract (ADR 0001)
-// ---------------------------------------------------------------------------
-
-/// Eligibility vs verification of bit-perfect output (ADR 0002).
-///
-/// Eligibility is a static property of source format and configured path.
-/// Verification is a runtime property of the actual output chain and can
-/// never be assumed from device selection alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputIntegrity {
-    /// The full chain was verified bit-identical for this path.
-    Verified,
-    /// Transformations are active or the chain could not be verified.
-    Transformed,
-    /// Verification was not attempted or is unavailable on this platform.
-    Unverified,
-}
-
-/// What the output layer reports about the negotiated stream (ADR 0001: no
-/// backend-specific types leak into domain contracts).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputDiagnostics {
-    pub source_format: PcmFormat,
-    pub output_format: PcmFormat,
-    pub transformations: Vec<AudioTransformation>,
-    pub integrity: OutputIntegrity,
-}
-
-// ---------------------------------------------------------------------------
-// Playback domain
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaybackMode {
-    BitPerfect,
-    Dsp,
-    Auto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaybackState {
-    Stopped,
-    Playing,
-    Paused,
-}
-
-// ---------------------------------------------------------------------------
-// Library domain
-// ---------------------------------------------------------------------------
-
-/// Stable, path-independent identity of a track (Phase 6 invariant: a rescan
-/// must never create duplicate library entries).
-///
-/// Identity is derived from a content hash of the audio file, not from a
-/// random value: the same file on a rescan resolves to the same id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TrackId(pub Uuid);
-
-/// A music file in the library, identified by content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Track {
-    pub id: TrackId,
-    pub path: String,
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
-    pub duration_ms: Option<u64>,
-}
-
-impl Track {
-    /// Create a track identity from a content hash of the file's audio data.
-    ///
-    /// The caller (library scanner) is responsible for computing the hash;
-    /// the domain type only fixes that identity is content-derived.
-    pub fn new(id: TrackId, path: impl Into<String>) -> Self {
-        Self {
-            id,
-            path: path.into(),
-            title: None,
-            artist: None,
-            album: None,
-            duration_ms: None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+pub use domain::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn flac_like() -> PcmFormat {
         PcmFormat {
@@ -209,11 +50,29 @@ mod tests {
     }
 
     #[test]
-    fn track_has_stable_id_after_serialization_roundtrip() {
-        let track = Track::new(TrackId(Uuid::new_v4()), "music/example.flac");
-        let encoded = serde_json::to_string(&track).unwrap();
-        let decoded: Track = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(track, decoded);
+    fn pcm_plausibility_rejects_nonsense() {
+        assert!(flac_like().is_plausible());
+        assert!(float_like().is_plausible());
+
+        let zero_channels = PcmFormat {
+            channels: 0,
+            ..flac_like()
+        };
+        assert!(!zero_channels.is_plausible());
+
+        // 24-bit float is not a representation any decoder or device produces.
+        let float24 = PcmFormat {
+            bits_per_sample: 24,
+            sample_format: SampleFormat::Float,
+            ..float_like()
+        };
+        assert!(!float24.is_plausible());
+
+        let absurd_rate = PcmFormat {
+            sample_rate: 10_000_000,
+            ..flac_like()
+        };
+        assert!(!absurd_rate.is_plausible());
     }
 
     #[test]
@@ -245,5 +104,43 @@ mod tests {
                 .transformations
                 .contains(&AudioTransformation::SampleFormatConversion)
         );
+    }
+
+    #[test]
+    fn track_has_stable_id_after_serialization_roundtrip() {
+        let track = Track::new(TrackId(Uuid::new_v4()), "music/example.flac");
+        let encoded = serde_json::to_string(&track).unwrap();
+        let decoded: Track = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(track, decoded);
+    }
+
+    #[test]
+    fn track_id_is_deterministic_from_content() {
+        let digest = [7u8; 32];
+        assert_eq!(
+            TrackId::from_content_digest(digest),
+            TrackId::from_content_digest(digest)
+        );
+        assert_ne!(
+            TrackId::from_content_digest(digest),
+            TrackId::from_content_digest([8u8; 32])
+        );
+    }
+
+    #[test]
+    fn audio_format_extension_parsing_is_case_insensitive() {
+        assert_eq!(AudioFormat::from_extension("flac"), AudioFormat::Flac);
+        assert_eq!(AudioFormat::from_extension("FLAC"), AudioFormat::Flac);
+        assert_eq!(AudioFormat::from_extension(" Flac "), AudioFormat::Flac);
+        assert_eq!(AudioFormat::from_extension("m4a"), AudioFormat::Alac);
+        assert_eq!(AudioFormat::from_extension("exe"), AudioFormat::Unknown);
+    }
+
+    #[test]
+    fn lossless_classification_drives_bit_perfect_eligibility() {
+        assert!(AudioFormat::Flac.is_lossless());
+        assert!(AudioFormat::Wav.is_lossless());
+        assert!(!AudioFormat::Mp3.is_lossless());
+        assert!(!AudioFormat::Opus.is_lossless());
     }
 }
