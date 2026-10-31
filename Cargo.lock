@@ -165,9 +165,13 @@ dependencies = [
  "aurora-decoder",
  "aurora-dsp",
  "cpal",
+ "hound",
  "proptest",
  "ringbuf",
+ "serde",
+ "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 

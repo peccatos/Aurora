@@ -6,5 +6,6 @@
 //! services exist.
 
 pub mod commands;
+pub mod error;
 
 pub use commands::builder;
