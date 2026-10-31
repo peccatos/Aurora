@@ -32,20 +32,29 @@ Linux requires the system packages listed in the Tauri prerequisites.
 Windows requires the Microsoft C++ Build Tools and WebView2.
 macOS requires Xcode Command Line Tools.
 
-## Run
-
-```bash
-npm --prefix frontend install
-npm --prefix frontend run tauri:dev
-```
-
-If the Tauri CLI is not installed locally, use:
+## Run (development)
 
 ```bash
 cd frontend
 npm install
 npm run tauri:dev
 ```
+
+The `tauri:dev` script anchors the working directory to `frontend/` and points
+the Tauri CLI at `apps/desktop/tauri.conf.json`; this works identically on
+Windows, Linux and macOS. Vite serves the frontend on `127.0.0.1:1420` and the
+desktop shell connects to it.
+
+## Build (release bundles)
+
+```bash
+cd frontend
+npm run tauri:build
+```
+
+Produces platform installers: `.msi`/NSIS `.exe` on Windows, `.deb` and
+`.AppImage` on Linux, `.app`/`.dmg` on macOS. CI exercises the bundle step on
+all three operating systems.
 
 ## Validate Rust workspace
 

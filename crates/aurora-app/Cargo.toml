@@ -13,3 +13,8 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[target.unix.dependencies]
+# Termination signal handling (SIGINT/SIGTERM) for macOS and Linux.
+ctrlc = { workspace = true }
+
