@@ -8,8 +8,11 @@ license.workspace = true
 [dependencies]
 aurora-core.workspace = true
 rubato.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tracing.workspace = true
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 [lints]
 workspace = true

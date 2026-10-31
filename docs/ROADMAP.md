@@ -12,7 +12,7 @@ Exit: metadata, check, test and lint commands pass on all CI targets.
 - Track, Artist, Album, AudioFormat, PlaybackState and PlaybackMode.
 - Stable IDs and serialization contracts.
 
-Exit: unit tests and serialization round-trip tests.
+Exit: unit tests and roundtrip-serialization tests.
 
 ## Phase 2 — Decoder
 - Symphonia-backed decoding.
@@ -24,7 +24,7 @@ Exit: fixtures decode with correct duration, rate, channels and sample count.
 ## Phase 3 — Playback
 - CPAL device discovery and stream lifecycle.
 - Worker-to-callback SPSC buffering.
-- Play, pause, stop, seek and device-loss recovery.
+- Play, pause, stop and device-loss recovery.
 
 Exit: long-duration playback tests with observable underrun metrics.
 
@@ -60,3 +60,22 @@ Exit: UI is a thin client of backend state.
 - Crash recovery, packaging, signing, release automation and performance tests.
 
 Exit: reproducible release artifacts and documented platform limitations.
+
+## Phase 9 (post-1.0) — VST3 plugin host
+
+Deferred until the core engine (Phases 4-7) is stable. Deliberately planned
+late: hosting third-party plugins is a large, semi-independent subsystem.
+
+Scope when started:
+- VST3 (open SDK, MIT-licensed interface headers; the modern standard).
+  VST2 is out of scope permanently: closed SDK, licenses no longer issued,
+  legal risk.
+- Host runs plugins out-of-process or sandboxed: a crashing plugin must not
+  take the player down, and untrusted plugin code must not run in-process
+  with our real-time guarantees.
+- Real-time bridge: plugin processing happens on the DSP worker thread with
+  bounded block sizes; the audio callback never calls into plugin code.
+- Any active plugin is an `AudioTransformation` (ADR 0002): bit-perfect mode
+  is mutually exclusive with plugin processing, reported honestly.
+- ADR to be written before implementation starts, covering process isolation
+  strategy, licensing obligations, and the block-size/latency contract.
