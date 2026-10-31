@@ -115,6 +115,93 @@ h1 { margin: 0; font-size: 17px; letter-spacing: .02em; }
 .actions button:disabled { opacity: .6; cursor: wait; }
 #backend-status { color: #a5a3af; font-size: 12px; }
 
+/* --- Phase 3 player --- */
+
+.player {
+  width: min(760px, 100%);
+  margin: 48px auto 0;
+  padding: 28px;
+  border: 1px solid #26242e;
+  border-radius: 16px;
+  background: #16151b;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.player-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.player-controls button, .player-controls select {
+  border: 1px solid #33313d;
+  border-radius: 9px;
+  padding: 10px 14px;
+  background: #1d1c24;
+  color: #e8e6ef;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color .15s ease;
+}
+
+.player-controls button.primary {
+  background: #d9d2ff;
+  border-color: #d9d2ff;
+  color: #17151f;
+  font-weight: 650;
+}
+
+.player-controls button:not(:disabled):hover,
+.player-controls select:hover { border-color: #57536b; }
+
+.player-controls button:disabled { opacity: .45; cursor: not-allowed; }
+
+.player-controls select { max-width: 220px; }
+
+.signal-path {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px 20px;
+}
+
+.signal-path div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid #26242e;
+  border-radius: 10px;
+  background: #1a1921;
+}
+
+.signal-path dt {
+  color: #8d8b98;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .14em;
+}
+
+.signal-path dd {
+  margin: 0;
+  color: #eceaf2;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+#st-transform { font-size: 12px; }
+
+#player-note {
+  margin: 0;
+  color: #a5a3af;
+  font-size: 12px;
+  min-height: 16px;
+}
+
 footer {
   display: flex;
   justify-content: space-between;

@@ -12,7 +12,8 @@
     "tauri:build": "tauri build --config ../apps/desktop/tauri.conf.json"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.12.4"
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.8.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.4",

@@ -11,6 +11,7 @@ tauri-build.workspace = true
 [dependencies]
 aurora-app.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

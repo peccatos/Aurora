@@ -153,6 +153,7 @@ pub fn stop_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandEr
 
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             app_version,

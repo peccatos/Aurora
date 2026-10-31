@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Aurora main window: core invoke + file dialogs for playback.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
