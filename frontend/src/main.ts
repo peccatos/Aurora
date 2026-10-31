@@ -10,7 +10,7 @@ if (!app) {
 app.innerHTML = `
   <main class="shell">
     <header class="topbar">
-      <div class="brand-mark">A</div>
+      <img class="brand-mark" src="/logo-128.png" alt="Aurora" width="44" height="44" />
       <div>
         <p class="eyebrow">LOCAL AUDIO PLAYER</p>
         <h1>Aurora</h1>

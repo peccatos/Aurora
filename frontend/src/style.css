@@ -36,15 +36,11 @@ button { font: inherit; }
 }
 
 .brand-mark {
-  width: 42px;
-  height: 42px;
-  display: grid;
-  place-items: center;
-  border: 1px solid #77718f;
-  border-radius: 13px;
-  color: #d9d2ff;
-  font-size: 22px;
-  font-weight: 700;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  object-fit: contain;
+  display: block;
 }
 
 .eyebrow {
