@@ -80,6 +80,44 @@ impl PcmChunk {
         out
     }
 
+    /// Convert to the target format's wire representation (interleaved).
+    ///
+    /// Used by the playback fallback path when the device format differs
+    /// from the source. Conversion goes through f32 as the pivot, which is
+    /// precise for all integer widths <= 24 and float sources; the caller
+    /// reports this as `SampleFormatConversion` (and `Resampling` /
+    /// `ChannelRemapping` where applicable — those live with the caller).
+    pub fn convert_to(&self, target: PcmFormat) -> Option<Vec<u8>> {
+        if self.format == target {
+            return Some(self.data.clone());
+        }
+        let channels = self.format.channels.max(1) as usize;
+        let frames = self.frames();
+        let src_sb = (self.format.bits_per_sample as usize).div_ceil(8);
+        let frame_bytes = src_sb * channels;
+
+        let dst_channels = target.channels.max(1) as usize;
+        let dst_sb = (target.bits_per_sample as usize).div_ceil(8);
+        let mut out = Vec::with_capacity(frames * dst_channels * dst_sb);
+
+        for frame in 0..frames {
+            let base = frame * frame_bytes;
+            for ch in 0..dst_channels {
+                // Channel remap: fold extra channels down / duplicate mono.
+                let src_ch = if channels == 1 {
+                    0
+                } else {
+                    ch.min(channels - 1)
+                };
+                let off = base + src_ch * src_sb;
+                let f = read_sample_f32(&self.data[off..off + src_sb], self.format.sample_format);
+                let clamped = f.clamp(-1.0, 1.0);
+                write_sample_bytes(&mut out, clamped, target)?;
+            }
+        }
+        Some(out)
+    }
+
     /// Silence of `frames` frames in the chunk's own format.
     pub fn silence(format: PcmFormat, frames: usize) -> Option<Self> {
         let frame_bytes = frame_size_bytes(&format)?;
@@ -123,7 +161,9 @@ fn read_sample_f32(bytes: &[u8], format: SampleFormat) -> f32 {
             let raw = i64::from_le_bytes(pad_le_signed(bytes)) as f64;
             // Scale by the actual bit width, not the byte width: 24-bit in
             // 3 bytes must map to [-1, 1) exactly as a native i24 would.
-            let full = (1u64 << (n * 8 - 1)) as f64;
+            // Positive full-scale is 2^(bits-1) - 1 (32767 for s16),
+            // matching write_sample_bytes so conversion round-trips exactly.
+            let full = ((1u64 << (n * 8 - 1)) - 1) as f64;
             (raw / full) as f32
         }
         SampleFormat::UnsignedInt => {
@@ -160,6 +200,44 @@ fn pad_le_unsigned(bytes: &[u8]) -> [u8; 8] {
     let mut out = [0u8; 8];
     out[..bytes.len()].copy_from_slice(bytes);
     out
+}
+
+/// Write a normalized [-1, 1] sample in the target format's wire bytes.
+///
+/// Returns `None` for formats with no supported wire encoding (e.g. an
+/// integer width this converter does not emit).
+fn write_sample_bytes(out: &mut Vec<u8>, sample: f32, target: PcmFormat) -> Option<()> {
+    let bits = target.bits_per_sample as usize;
+    let bytes = bits.div_ceil(8);
+    match target.sample_format {
+        SampleFormat::SignedInt => {
+            // Full-scale = 2^(bits-1) - 1; e.g. 16-bit: 32767. Round-half-
+            // away keeps 1.0 -> MAX exact through the f32 pivot.
+            let full = (1u64 << (bits - 1)) - 1;
+            let v = (sample.clamp(-1.0, 1.0) * full as f32).round() as i64;
+            let v = v.clamp(-(full as i64 + 1), full as i64) as u64;
+            let le = v.to_le_bytes();
+            out.extend_from_slice(&le[..bytes]);
+        }
+        SampleFormat::UnsignedInt => {
+            // Midpoint 0.0 -> 2^(bits-1); full scale [0, 2^bits - 1].
+            let half = 1u64 << (bits - 1);
+            let v = ((sample.clamp(-1.0, 1.0) * half as f32).round() as i64 + half as i64) as u64;
+            let v = v.min((1u64 << bits) - 1);
+            let le = v.to_le_bytes();
+            out.extend_from_slice(&le[..bytes]);
+        }
+        SampleFormat::Float => {
+            if bits == 32 {
+                out.extend_from_slice(&sample.to_le_bytes());
+            } else if bits == 64 {
+                out.extend_from_slice(&f64::from(sample).to_le_bytes());
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 fn half_to_f32(bits: u16) -> f32 {

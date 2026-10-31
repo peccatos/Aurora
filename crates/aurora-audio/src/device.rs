@@ -27,12 +27,6 @@ impl OutputDevice {
     }
 }
 
-/// Formats the device can accept, as negotiated PCM configurations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceFormat {
-    pub pcm: PcmFormat,
-}
-
 /// List output devices of the default host.
 pub fn output_devices() -> Result<Vec<OutputDevice>, EngineError> {
     let host = cpal::default_host();
@@ -88,10 +82,12 @@ pub(crate) fn find_by_key(key: &str) -> Result<cpal::Device, EngineError> {
 
 /// Negotiate a stream configuration for a device given the source PCM.
 ///
-/// Strategy (Phase 3 — no resampling/DSP yet): if the device supports the
-/// source rate/channels directly, use them; otherwise fall back to the
-/// device default and report the mismatch via the returned diagnostics.
-/// The mismatch itself is *reported*, never hidden (ADR 0002).
+/// Strategy (Phase 3): a *native* match requires rate, channels AND the
+/// sample representation to line up — anything else would reinterpret
+/// decoder bytes in a different wire format (the white-noise bug this
+/// fixed). When no native match exists, the device default is used and the
+/// fallback path converts to the device's exact format, with every applied
+/// transformation reported (ADR 0002).
 pub(crate) fn negotiate(
     device: &cpal::Device,
     source: PcmFormat,
@@ -100,21 +96,25 @@ pub(crate) fn negotiate(
         .supported_output_configs()
         .map_err(|e| EngineError::FormatUnsupported(e.to_string()))?;
 
-    // Try to match: source rate within range, same channels.
+    // Native match: same channels, source rate in range, AND a device
+    // sample format whose wire representation is byte-compatible with the
+    // source (same format family and bit width).
     for cfg in supported {
         let min = cfg.min_sample_rate();
         let max = cfg.max_sample_rate();
-        if (min..=max).contains(&source.sample_rate) && cfg.channels() == source.channels {
-            let rate = source.sample_rate;
+        if (min..=max).contains(&source.sample_rate)
+            && cfg.channels() == source.channels
+            && wire_compatible(cfg.sample_format(), source)
+        {
             let config = cpal::StreamConfig {
                 channels: cfg.channels(),
-                sample_rate: rate,
+                sample_rate: source.sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             };
             let pcm = PcmFormat {
                 sample_rate: source.sample_rate,
                 channels: source.channels,
-                bits_per_sample: source.bits_per_sample,
+                bits_per_sample: cpal_bits_per_sample(cfg.sample_format()),
                 sample_format: source.sample_format,
                 channel_layout: ChannelLayout::Interleaved,
             };
@@ -127,7 +127,9 @@ pub(crate) fn negotiate(
         }
     }
 
-    // No exact match: use the device default and flag the conversion.
+    // No native match: use the device default; the fallback path converts
+    // samples to the device's exact format. Conversions are listed, never
+    // hidden.
     let default = device
         .default_output_config()
         .map_err(|e| EngineError::FormatUnsupported(e.to_string()))?;
@@ -141,7 +143,7 @@ pub(crate) fn negotiate(
     let pcm = PcmFormat {
         sample_rate: default.sample_rate(),
         channels: default.channels(),
-        bits_per_sample: source.bits_per_sample,
+        bits_per_sample: cpal_bits_per_sample(default.sample_format()),
         sample_format: sample_format_from_cpal(default.sample_format()),
         channel_layout: ChannelLayout::Interleaved,
     };
@@ -171,8 +173,38 @@ pub(crate) struct NegotiatedConfig {
     pub stream_config: cpal::StreamConfig,
     pub device_sample_format: cpal::SampleFormat,
     pub pcm: PcmFormat,
-    /// Transformations the fallback path applies (empty for a direct match).
+    /// Transformations the fallback path applies (empty for a native match).
     pub transformations: Vec<aurora_core::AudioTransformation>,
+}
+
+/// True when the device's cpal sample format has the same wire
+/// representation as the source PCM samples (what the decoder pushes
+/// into the ring byte-for-byte).
+pub(crate) fn wire_compatible(device: cpal::SampleFormat, source: PcmFormat) -> bool {
+    match (device, source.sample_format) {
+        (cpal::SampleFormat::I8, SampleFormat::SignedInt) => source.bits_per_sample == 8,
+        (cpal::SampleFormat::I16, SampleFormat::SignedInt) => source.bits_per_sample == 16,
+        // CPAL I24 is 24 significant bits in a 4-byte container; the
+        // decoder's PcmChunk stores 3-byte packed samples, which is NOT
+        // the same wire format -> not wire-compatible (must convert).
+        (cpal::SampleFormat::I32, SampleFormat::SignedInt) => source.bits_per_sample == 32,
+        (cpal::SampleFormat::U8, SampleFormat::UnsignedInt) => source.bits_per_sample == 8,
+        (cpal::SampleFormat::F32, SampleFormat::Float) => source.bits_per_sample == 32,
+        (cpal::SampleFormat::F64, SampleFormat::Float) => source.bits_per_sample == 64,
+        _ => false,
+    }
+}
+
+/// Significant bits per sample of a cpal format.
+pub(crate) fn cpal_bits_per_sample(format: cpal::SampleFormat) -> u16 {
+    match format {
+        cpal::SampleFormat::I8 | cpal::SampleFormat::U8 => 8,
+        cpal::SampleFormat::I16 | cpal::SampleFormat::U16 => 16,
+        cpal::SampleFormat::I24 | cpal::SampleFormat::U24 => 24,
+        cpal::SampleFormat::I32 | cpal::SampleFormat::U32 | cpal::SampleFormat::F32 => 32,
+        cpal::SampleFormat::I64 | cpal::SampleFormat::U64 | cpal::SampleFormat::F64 => 64,
+        _ => 16,
+    }
 }
 
 pub(crate) fn sample_format_from_cpal(format: cpal::SampleFormat) -> SampleFormat {

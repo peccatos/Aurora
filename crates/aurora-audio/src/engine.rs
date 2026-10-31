@@ -127,6 +127,10 @@ impl PlaybackEngine {
         let worker_running = Arc::clone(&self.shared.running);
         let worker_finished = Arc::clone(&self.shared.finished);
 
+        // The wire format the fallback path converts into (the negotiated
+        // device format; equal to the source format on the native path).
+        let target_format = negotiated.pcm;
+
         let worker = std::thread::Builder::new()
             .name("aurora-decode-worker".into())
             .spawn(move || {
@@ -154,10 +158,18 @@ impl PlaybackEngine {
                                     }
                                 }
                             } else {
-                                // Fallback: convert to f32 and push as f32
-                                // bytes (the stream is F32 in this path).
-                                let f32s = chunk.to_f32_interleaved();
-                                let bytes = f32_bytes(&f32s);
+                                // Fallback: convert into the device's
+                                // exact wire format (negotiated above) so
+                                // the callback's bytes match what the
+                                // device expects. Conversions are reported
+                                // via `transformations`.
+                                let bytes = match chunk.convert_to(target_format) {
+                                    Some(b) => b,
+                                    None => {
+                                        tracing::warn!("sample conversion failed, dropping chunk");
+                                        continue;
+                                    }
+                                };
                                 let mut written = 0;
                                 while written < bytes.len() {
                                     let n = prod.push_slice(&bytes[written..]);
@@ -277,14 +289,6 @@ impl Default for PlaybackEngine {
     }
 
     // Note: Default manually implemented; Drop is explicit via stop().
-}
-
-fn f32_bytes(samples: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples.len() * 4);
-    for s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
 }
 
 /// Build the output stream with the real-time callback.

@@ -171,10 +171,15 @@ fn pcm_chunk_f32_conversion_is_symmetric_for_s16() {
 
     let f32s = chunk.to_f32_interleaved();
     assert_eq!(f32s.len(), 3);
-    assert!((f32s[0] + 1.0).abs() < 1e-6, "i16::MIN maps to -1.0");
+    // Symmetric scale (±32767): MIN is a hair below -1.0, MAX is exactly
+    // 1.0, and the mapping round-trips bit-exactly through convert_to.
+    assert!(
+        (f32s[0] + 1.0).abs() < 3.1e-5,
+        "i16::MIN maps to just below -1.0"
+    );
     assert_eq!(f32s[1], 0.0);
     assert!(
-        f32s[2] < 1.0 && f32s[2] > 0.9999,
-        "i16::MAX maps just below +1.0"
+        f32s[2] <= 1.0 && f32s[2] > 0.9999,
+        "i16::MAX maps to full scale"
     );
 }
