@@ -33,6 +33,9 @@ pub struct AudioSource {
     decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
     track_id: u32,
     info: SourceInfo,
+    /// The first decoded chunk, produced by the format probe in `open`;
+    /// yielded by `next_chunk` before pulling new packets.
+    first_chunk: Option<PcmChunk>,
 }
 
 impl AudioSource {
@@ -47,7 +50,7 @@ impl AudioSource {
             hint.with_extension(ext);
         }
 
-        let format = symphonia::default::get_probe()
+        let mut format = symphonia::default::get_probe()
             .probe(
                 &hint,
                 mss,
@@ -80,12 +83,43 @@ impl AudioSource {
             (track.num_frames, track.duration, track.time_base)
         };
 
-        let decoder = symphonia::default::get_codecs()
+        let mut decoder = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(|e| SourceError::UnsupportedCodec(e.to_string()))?;
 
-        let pcm_format = pcm_format_from_params(&params)
-            .ok_or_else(|| SourceError::IncompleteTrack("incomplete audio parameters".into()))?;
+        // Decode the first packet to learn the actual decoder output format.
+        // Codec parameters lie for compressed formats: MP3/Vorbis/FLAC
+        // decode to f32 even when the container declares integer PCM.
+        let (pcm_format, first_chunk) = {
+            let mut first_chunk = None;
+            let mut actual_format = None;
+            while let Some(packet) = format.next_packet().ok().flatten() {
+                if packet.track_id != track_id {
+                    continue;
+                }
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        actual_format = chunk_format_from_decoded(&decoded);
+                        if actual_format.is_some() {
+                            first_chunk = chunk_from_decoded(&decoded);
+                        }
+                        break;
+                    }
+                    // A first corrupt packet is tolerable: fall back to
+                    // parameters and hope the next chunk reveals the truth.
+                    Err(_) => continue,
+                }
+            }
+            match actual_format {
+                Some(f) => (f, first_chunk),
+                None => (
+                    pcm_format_from_params(&params).ok_or_else(|| {
+                        SourceError::IncompleteTrack("incomplete audio parameters".into())
+                    })?,
+                    None,
+                ),
+            }
+        };
 
         // Duration: prefer the container-declared frame count (exact for
         // FLAC/WAV); fall back to timebase-derived duration.
@@ -115,6 +149,7 @@ impl AudioSource {
             decoder,
             track_id,
             info,
+            first_chunk,
         })
     }
 
@@ -132,6 +167,10 @@ impl AudioSource {
     /// of consecutive failures; beyond that the source reports the failure
     /// instead of silently looping over a corrupt region.
     pub fn next_chunk(&mut self) -> Result<PcmChunk, DecodeError> {
+        if let Some(chunk) = self.first_chunk.take() {
+            return Ok(chunk);
+        }
+
         const MAX_CONSECUTIVE_SKIPS: usize = 16;
 
         let mut skips = 0;
@@ -199,12 +238,11 @@ impl AudioSource {
 
 /// Extract a PcmChunk from a decoded symphonia buffer, preserving the native
 /// sample representation (bytes are copied interleaved without conversion).
-fn chunk_from_decoded(
+fn chunk_format_from_decoded(
     decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
-) -> Option<PcmChunk> {
+) -> Option<PcmFormat> {
     let spec = decoded.spec();
     let symphonia_format = symphonia_sample_format(decoded);
-
     let sample_format = match symphonia_format {
         SymphoniaSampleFormat::U8
         | SymphoniaSampleFormat::U16
@@ -216,20 +254,21 @@ fn chunk_from_decoded(
         | SymphoniaSampleFormat::S32 => SampleFormat::SignedInt,
         SymphoniaSampleFormat::F32 | SymphoniaSampleFormat::F64 => SampleFormat::Float,
     };
-
-    let bits = bits_per_sample(symphonia_format);
-    let format = PcmFormat {
+    Some(PcmFormat {
         sample_rate: spec.rate(),
         channels: spec.channels().count() as u16,
-        bits_per_sample: bits,
+        bits_per_sample: bits_per_sample(symphonia_format),
         sample_format,
-        // copy_bytes_to_vec_interleaved delivers interleaved order.
         channel_layout: aurora_core::ChannelLayout::Interleaved,
-    };
+    })
+}
 
+fn chunk_from_decoded(
+    decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
+) -> Option<PcmChunk> {
+    let format = chunk_format_from_decoded(decoded)?;
     let mut data = Vec::new();
     decoded.copy_bytes_to_vec_interleaved(&mut data);
-
     PcmChunk::from_bytes(format, data)
 }
 
