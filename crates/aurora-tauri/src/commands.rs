@@ -16,12 +16,16 @@ use crate::error::CommandError;
 /// Managed application state.
 pub struct AppState {
     pub engine: Mutex<PlaybackEngine>,
+    /// Persisted DSP configuration: the UI edits this and every new
+    /// playback picks it up.
+    pub dsp: std::sync::Mutex<aurora_dsp::DspConfig>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             engine: Mutex::new(PlaybackEngine::new()),
+            dsp: std::sync::Mutex::new(aurora_dsp::DspConfig::default()),
         }
     }
 }
@@ -111,6 +115,9 @@ pub struct PlayRequest {
     pub path: String,
     /// Device key from `list_output_devices`; empty = default device.
     pub device: Option<String>,
+    /// DSP configuration for this stream; defaults to bypassed.
+    #[serde(default)]
+    pub dsp: aurora_dsp::DspConfig,
 }
 
 #[tauri::command]
@@ -126,8 +133,35 @@ pub fn play_track(
             .find(|d| d.key() == key)
             .ok_or_else(|| CommandError::Device(request.device.clone().unwrap_or_default()))?,
     };
-    engine.play(PathBuf::from(&request.path), &device)?;
+    // The request's DSP overrides the persisted config when present;
+    // otherwise the UI's last saved settings apply.
+    let dsp = if request.dsp == aurora_dsp::DspConfig::default() {
+        state
+            .dsp
+            .lock()
+            .map_err(|_| CommandError::Poisoned)?
+            .clone()
+    } else {
+        request.dsp
+    };
+    engine.play(PathBuf::from(&request.path), &device, dsp)?;
     Ok(status_of(&engine))
+}
+
+#[tauri::command]
+pub fn get_dsp(state: State<AppState>) -> Result<aurora_dsp::DspConfig, CommandError> {
+    let dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(dsp.clone())
+}
+
+#[tauri::command]
+pub fn set_dsp(
+    config: aurora_dsp::DspConfig,
+    state: State<AppState>,
+) -> Result<aurora_dsp::DspConfig, CommandError> {
+    let mut dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
+    *dsp = config;
+    Ok(dsp.clone())
 }
 
 #[tauri::command]
@@ -162,6 +196,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             list_output_devices,
             playback_status,
             play_track,
+            get_dsp,
+            set_dsp,
             pause_playback,
             resume_playback,
             stop_playback

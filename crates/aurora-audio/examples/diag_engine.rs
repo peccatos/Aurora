@@ -5,9 +5,16 @@ fn main() {
     let device = aurora_audio::default_output_device().unwrap();
     println!("device: {}", device.name());
 
+    // DSP активен: bass boost + preamp, чтобы услышать и увидеть разницу.
+    let mut dsp = aurora_dsp::DspConfig::default();
+    dsp.eq.bands[0].gain_db = 6.0; // 31 Hz
+    dsp.eq.bands[1].gain_db = 4.0; // 63 Hz
+    dsp.eq.preamp_db = -2.0;
+    dsp.volume_db = -3.0;
+
     let mut engine = aurora_audio::PlaybackEngine::new();
     engine
-        .play(std::path::PathBuf::from(&path), &device)
+        .play(std::path::PathBuf::from(&path), &device, dsp)
         .expect("play");
     println!(
         "state: {:?}, output: {:?}, transforms: {:?}",

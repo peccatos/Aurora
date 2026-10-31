@@ -72,7 +72,9 @@ fn engine_plays_file_and_reports_state() {
     let mut engine = PlaybackEngine::new();
     assert_eq!(engine.state(), EngineState::Idle);
 
-    engine.play(path.clone(), &device).expect("playback starts");
+    engine
+        .play(path.clone(), &device, Default::default())
+        .expect("playback starts");
 
     assert_eq!(engine.state(), EngineState::Playing);
     // A negotiated output format is exposed for diagnostics.
@@ -99,7 +101,9 @@ fn engine_plays_file_and_reports_state() {
     assert_eq!(engine.state(), EngineState::Idle);
 
     // Restart on the same engine instance (state machine reset).
-    engine.play(path, &device).expect("second play");
+    engine
+        .play(path, &device, Default::default())
+        .expect("second play");
     std::thread::sleep(Duration::from_millis(100));
     engine.stop();
 
@@ -127,8 +131,10 @@ fn double_play_is_rejected_while_playing() {
     write_test_wav(&path, 2.0);
 
     let mut engine = PlaybackEngine::new();
-    engine.play(path.clone(), &device).expect("first play");
-    let result = engine.play(path, &device);
+    engine
+        .play(path.clone(), &device, Default::default())
+        .expect("first play");
+    let result = engine.play(path, &device, Default::default());
     assert!(matches!(
         result,
         Err(aurora_audio::EngineError::AlreadyPlaying)

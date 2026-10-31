@@ -268,6 +268,7 @@ dependencies = [
  "anyhow",
  "aurora-audio",
  "aurora-core",
+ "aurora-dsp",
  "aurora-library",
  "aurora-storage",
  "serde",

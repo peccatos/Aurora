@@ -100,8 +100,20 @@ impl PlaybackEngine {
         &self.transformations
     }
 
-    /// Start playing a file on a device.
-    pub fn play(&mut self, path: PathBuf, device: &OutputDevice) -> Result<(), EngineError> {
+    /// Start playing a file on a device with a DSP configuration.
+    ///
+    /// When the config is bypassed AND the device wire format matches the
+    /// source byte-wise, the native path pushes decoder bytes untouched
+    /// (bit-perfect eligible). Otherwise the chunk travels the DSP path:
+    /// f32 -> pipeline (EQ / gain / resampling as configured) -> convert
+    /// into the device's exact wire format. Every transformation — forced
+    /// or user-configured — lands in `transformations` (ADR 0002).
+    pub fn play(
+        &mut self,
+        path: PathBuf,
+        device: &OutputDevice,
+        dsp: aurora_dsp::DspConfig,
+    ) -> Result<(), EngineError> {
         if self.state() == EngineState::Playing {
             return Err(EngineError::AlreadyPlaying);
         }
@@ -113,11 +125,9 @@ impl PlaybackEngine {
 
         let negotiated = negotiate(&cpal_device, source_format)?;
 
-        // Phase 3 plays the source representation when the device format
-        // matches byte-wise; a mismatched negotiation is reported, and the
-        // fallback path converts s16 sources through f32 (Phase 4 DSP will
-        // own proper conversion; here it is a visible, reported transform).
-        let plays_native = negotiated.transformations.is_empty();
+        // The native (untouched) path requires: DSP fully bypassed AND a
+        // byte-exact device format match.
+        let plays_native = negotiated.transformations.is_empty() && dsp.is_bypassed();
 
         let ring = Arc::new(HeapRb::<u8>::new(RING_CAPACITY_BYTES));
         let (prod, cons) = ring.split();
@@ -130,6 +140,32 @@ impl PlaybackEngine {
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
         let target_format = negotiated.pcm;
+
+        // The DSP path pipeline: compiled once for this stream. When the
+        // config is bypassed but the device format mismatches, the
+        // pipeline is still constructed with default (identity) settings
+        // so the rate/format conversion happens through one honest path.
+        let mut dsp_pipeline = if plays_native {
+            None
+        } else {
+            let rate_target = if negotiated.pcm.sample_rate != source_format.sample_rate {
+                Some(negotiated.pcm.sample_rate)
+            } else {
+                None
+            };
+            Some(
+                aurora_dsp::DspPipeline::compile(
+                    &dsp,
+                    source_format,
+                    rate_target,
+                    None, // ReplayGain tag lookup arrives with the library phase.
+                )
+                .map_err(EngineError::from)?,
+            )
+        };
+
+        // Seeded dither for the float->int boundary (stable across runs).
+        let mut ditherer = aurora_dsp::TpdfDither::new(0xA10CA);
 
         let worker = std::thread::Builder::new()
             .name("aurora-decode-worker".into())
@@ -158,15 +194,39 @@ impl PlaybackEngine {
                                     }
                                 }
                             } else {
-                                // Fallback: convert into the device's
-                                // exact wire format (negotiated above) so
-                                // the callback's bytes match what the
-                                // device expects. Conversions are reported
-                                // via `transformations`.
-                                let bytes = match chunk.convert_to(target_format) {
-                                    Some(b) => b,
+                                // DSP path: f32 -> pipeline -> device wire
+                                // format. The pipeline applies the user's
+                                // EQ/gain (and any resampling needed to
+                                // reach the device rate); dither + final
+                                // format conversion happen at the boundary.
+                                let Some(pipeline) = dsp_pipeline.as_mut() else {
+                                    // Unreachable: compiled above.
+                                    continue;
+                                };
+                                let mut samples = chunk.to_f32_interleaved();
+                                let processed = pipeline.process(&mut samples);
+
+                                // Dither only when converting to integer
+                                // output; float output needs none.
+                                let mut dithered = processed;
+                                if !matches!(
+                                    target_format.sample_format,
+                                    aurora_core::SampleFormat::Float
+                                ) {
+                                    ditherer.dither_for(
+                                        &mut dithered,
+                                        target_format.sample_format,
+                                        target_format.bits_per_sample,
+                                    );
+                                }
+
+                                let bytes = match aurora_decoder::PcmChunk::from_bytes(
+                                    target_format,
+                                    f32s_to_wire(&dithered, target_format),
+                                ) {
+                                    Some(c) => c.as_bytes().to_vec(),
                                     None => {
-                                        tracing::warn!("sample conversion failed, dropping chunk");
+                                        tracing::warn!("wire conversion failed, dropping chunk");
                                         continue;
                                     }
                                 };
@@ -222,7 +282,13 @@ impl PlaybackEngine {
         self.stream = Some(stream);
         self.worker = Some(worker);
         self.negotiated = Some(negotiated.pcm);
-        self.transformations = negotiated.transformations;
+        // Report the full honest chain: forced conversions (negotiation)
+        // plus the user-configured DSP stages (ADR 0002).
+        let mut transformations = negotiated.transformations;
+        if !dsp.is_bypassed() {
+            transformations.extend(dsp.transformations());
+        }
+        self.transformations = transformations;
         self.device_key = Some(device.key().to_string());
         self.source_format = Some(source_format);
         *self.state.lock().expect("state mutex") = EngineState::Playing;
@@ -349,5 +415,45 @@ fn callback(
         if !finished.load(Ordering::Acquire) {
             metrics.add_underrun((deficit / frame_bytes) as u64);
         }
+    }
+}
+
+/// Encode normalized f32 samples into the target format's wire bytes.
+///
+/// The inverse of the decoder's read path: full-scale maps back to the
+/// integer grid, floats copy through directly.
+fn f32s_to_wire(samples: &[f32], target: PcmFormat) -> Vec<u8> {
+    let bytes = usize::from(target.bits_per_sample).div_ceil(8);
+    let mut out = Vec::with_capacity(samples.len() * bytes);
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        match target.sample_format {
+            aurora_core::SampleFormat::SignedInt => {
+                let full = (1u64 << (target.bits_per_sample - 1)) - 1;
+                let v = (f64::from(clamped) * full as f64).round() as i64;
+                let v = v.clamp(-(full as i64 + 1), full as i64) as u64;
+                out.extend_from_slice(&v.to_le_bytes()[..bytes]);
+            }
+            aurora_core::SampleFormat::UnsignedInt => {
+                let half = 1u64 << (target.bits_per_sample - 1);
+                let v = (f64::from(clamped) * half as f64).round() as i64 + half as i64;
+                let v = v.clamp(0, ((1u64 << target.bits_per_sample) - 1) as i64) as u64;
+                out.extend_from_slice(&v.to_le_bytes()[..bytes]);
+            }
+            aurora_core::SampleFormat::Float => {
+                if target.bits_per_sample == 64 {
+                    out.extend_from_slice(&f64::from(clamped).to_le_bytes());
+                } else {
+                    out.extend_from_slice(&clamped.to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+impl From<aurora_dsp::DspError> for EngineError {
+    fn from(err: aurora_dsp::DspError) -> Self {
+        EngineError::Internal(err.to_string())
     }
 }
