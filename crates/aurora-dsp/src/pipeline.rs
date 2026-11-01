@@ -154,66 +154,43 @@ impl DspPipeline {
             ))
         };
 
-        // Speed: audio at rate r played at r/speed clocks faster or
-        // slower. Slowed (0.8) resamples as if the source were 25%
-        // faster; sped up (1.25) as if 20% slower.
+        // Speed & rate conversion — one honest decision table.
+        //
+        // Playback speed s means the content must reach the device
+        // as if it had been recorded at rate*s: a "44100 Hz recording"
+        // sped up 2x is a 88200 Hz recording played at 44100. Two
+        // independent reasons force a resampler:
+        //   (a) the device demands a different rate (target_rate != source);
+        //   (b) the user chose a speed != 1.0.
+        //
+        // Combined: resample from the effective source rate r*s to the
+        // device rate t. When only speed is active and t == r, the
+        // output is 1/s times the input per second — 2.0x speed halves
+        // the output, exactly "playing twice as fast".
         let speed = config.speed.clamp(0.5, 2.0);
         let speed_active = (speed - 1.0).abs() > 1e-6;
 
-        let needs_resample = target_rate
-            .map(|t| t != source_format.sample_rate)
-            .unwrap_or(false);
-        // Speed = resampling ratio manipulation: to play at speed s, the
-        // stream must reach the device as if the source had been recorded
-        // at rate/s. With a fixed device rate t, resample source -> t
-        // while treating the source as rate/s (ratio = s * t/source).
+        let device_rate = target_rate.unwrap_or(source_format.sample_rate);
+        // Effective source rate after pretending speed changed the
+        // recording rate. Rounded; rubato takes integer rates.
+        let effective_source = if speed_active {
+            ((f64::from(source_format.sample_rate) * f64::from(speed)).round() as u32).max(1)
+        } else {
+            source_format.sample_rate
+        };
+
+        let needs_resample = speed_active || effective_source != device_rate;
+
         let resampler = if needs_resample {
-            // Fixed device rate: resample from the real source rate to the
-            // device rate (speed changes the ratio interpretation: the
-            // callback clock stays at the device rate, and the content
-            // was produced at rate/s, so it plays at speed s).
-            if let Some(t) = target_rate {
-                if t != source_format.sample_rate {
-                    Some(Resampler::new(
-                        source_format.sample_rate,
-                        t,
-                        source_format.channels,
-                    )?)
-                } else if speed_active {
-                    // Device rate equals the source rate; to play at
-                    // speed s the stream must be resampled by ratio s:
-                    // treat the source as rate/s and resample back to
-                    // source rate (output length scales by s).
-                    let effective_source =
-                        ((f64::from(source_format.sample_rate) / f64::from(speed)).round() as u32)
-                            .max(1);
-                    if effective_source != source_format.sample_rate {
-                        Some(Resampler::new(
-                            source_format.sample_rate,
-                            effective_source,
-                            source_format.channels,
-                        )?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if speed_active {
-                // No device constraint: resample to the speed-scaled rate.
-                let scaled = ((f64::from(source_format.sample_rate) * f64::from(speed)).round()
-                    as u32)
-                    .max(1);
-                if scaled != source_format.sample_rate {
-                    Some(Resampler::new(
-                        source_format.sample_rate,
-                        scaled,
-                        source_format.channels,
-                    )?)
-                } else {
-                    None
-                }
+            if effective_source != device_rate {
+                Some(Resampler::new(
+                    effective_source,
+                    device_rate,
+                    source_format.channels,
+                )?)
             } else {
+                // Rates round to the same integer (e.g. speed 0.9999 or a
+                // 44100/48000 pair that collapses): nothing to do.
                 None
             }
         } else {
@@ -293,6 +270,14 @@ impl DspPipeline {
             }
         }
         out
+    }
+
+    /// Drop samples buffered from before a seek: pre-seek audio inside
+    /// the resampler FIFO is stale and must never play after the jump.
+    /// The resampler's filter/delay state also resets (cheap: the next
+    /// blocks re-prime it within a few ms).
+    pub fn drop_buffered(&mut self) {
+        self.resample_inbuf.clear();
     }
 
     /// Flush the resampler's delay line and tail at end of stream.
@@ -479,6 +464,108 @@ mod tests {
         let _ = pl.process(&mut input);
         assert!(pl.take_clipped());
         assert!(!pl.take_clipped(), "flag must reset");
+    }
+
+    #[test]
+    fn speed_works_when_device_rate_matches_source() {
+        // Regression (user report): speed did nothing when the device
+        // accepted the source rate natively (44.1k -> 44.1k, the common
+        // case) because the resampler was only built inside the
+        // device-rate-mismatch branch. Speed must engage a resampler
+        // regardless of the device rate.
+        let source = PcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 32,
+            sample_format: aurora_core::SampleFormat::Float,
+            channel_layout: aurora_core::ChannelLayout::Interleaved,
+        };
+        // Device rate == source rate: no forced conversion, speed only.
+        let config = DspConfig {
+            speed: 2.0,
+            ..DspConfig::default()
+        };
+        let mut pl = DspPipeline::compile(&config, source, Some(44_100), None).expect("compile");
+        assert!(
+            pl.transformations()
+                .contains(&AudioTransformation::Resampling),
+            "speed must report Resampling even when device rate matches"
+        );
+
+        // 1s of input at 2.0x speed must produce ~0.5s of output.
+        let mut fed = 0usize;
+        let mut out_samples = 0usize;
+        while fed < 44_100 {
+            let n = 2048usize.min(44_100 - fed);
+            let mut chunk: Vec<f32> = (0..n * 2)
+                .map(|i| ((i % 512) as f64 * 0.01).sin() as f32)
+                .collect();
+            out_samples += pl.process(&mut chunk).len();
+            fed += n;
+        }
+        out_samples += pl.flush().len();
+        let out_frames = out_samples / 2;
+        // Expected ~22050 frames; allow the resampler's transient slack.
+        assert!(
+            (out_frames as i64 - 22_050).abs() < 2_000,
+            "2.0x speed produced {out_frames} output frames for 44100 input              (expected ~22050); speed is not being applied"
+        );
+
+        // And the slowed direction: 0.5x stretches to ~2x length.
+        let config = DspConfig {
+            speed: 0.5,
+            ..DspConfig::default()
+        };
+        let mut pl = DspPipeline::compile(&config, source, Some(44_100), None).expect("compile");
+        let mut fed = 0usize;
+        let mut out_samples = 0usize;
+        while fed < 44_100 {
+            let n = 2048usize.min(44_100 - fed);
+            let mut chunk: Vec<f32> = (0..n * 2)
+                .map(|i| ((i % 512) as f64 * 0.01).sin() as f32)
+                .collect();
+            out_samples += pl.process(&mut chunk).len();
+            fed += n;
+        }
+        out_samples += pl.flush().len();
+        let out_frames = out_samples / 2;
+        assert!(
+            (out_frames as i64 - 88_200).abs() < 4_000,
+            "0.5x speed produced {out_frames} output frames for 44100 input              (expected ~88200); speed is not being applied"
+        );
+    }
+
+    #[test]
+    fn seek_drops_stale_resampler_fifo() {
+        // Regression: pre-seek samples inside the resampler FIFO played
+        // after a jump. drop_buffered() must clear them.
+        let source = PcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 32,
+            sample_format: aurora_core::SampleFormat::Float,
+            channel_layout: aurora_core::ChannelLayout::Interleaved,
+        };
+        let config = DspConfig {
+            speed: 0.8,
+            ..DspConfig::default()
+        };
+        let mut pl = DspPipeline::compile(&config, source, Some(44_100), None).expect("compile");
+        // Feed an odd-sized chunk (leaves a remainder in the FIFO).
+        let mut chunk: Vec<f32> = (0..1152 * 2)
+            .map(|i| ((i % 512) as f64 * 0.01).sin() as f32)
+            .collect();
+        let _ = pl.process(&mut chunk);
+        // Seek: buffered pre-seek samples must vanish.
+        pl.drop_buffered();
+        // Flush after a drop must not emit the dropped samples as audio
+        // (only the resampler delay-line tail, small).
+        let tail = pl.flush();
+        let tail_frames = tail.len() / 2;
+        assert!(
+            tail_frames < 4096,
+            "post-seek flush emitted {tail_frames} frames; stale FIFO not dropped"
+        );
     }
 
     #[test]

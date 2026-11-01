@@ -25,6 +25,13 @@ use crate::metrics::PlaybackMetrics;
 /// sized for 44.1k/16/2 comfortably; tuned by Phase 3 soak tests).
 const RING_CAPACITY_BYTES: usize = 1024 * 1024;
 
+/// Low-water mark for the worker's back-pressure loop (bytes). With a
+/// 44.1k/16-bit stereo stream this is ~150ms of processed audio: enough
+/// slack to absorb decode/DSP jitter, small enough that (a) a live DSP
+/// recompile + drain takes effect in well under a second and (b) the
+/// stale audio played after a seek is one or two callbacks, not seconds.
+const RING_TARGET_BYTES: usize = 128 * 1024;
+
 /// Live-DSP latency budget: with a 1MB ring the old audio drains in
 /// ~5.4s at f32/48k/stereo — still audible delay for preset changes.
 /// The worker therefore drains the ring on DSP recompile (see the
@@ -59,6 +66,11 @@ struct Shared {
     /// audio (produced by the OLD config) so the new preset is heard
     /// immediately instead of after the ring's worth of audio.
     drain: Arc<AtomicBool>,
+    /// Seek rebase: (output frames played when the seek happened, the
+    /// position in seconds the stream jumped to). `position_s()` reads
+    /// this so the UI bar matches reality after a seek instead of
+    /// continuing the pre-seek count.
+    seek_rebase: Arc<Mutex<Option<(u64, f64)>>>,
     /// Stream failure signal (Phase 8): set by the CPAL error callback
     /// when the device is lost mid-flight. The app layer polls this via
     /// `take_stream_error`, stops the dead stream and can re-play on
@@ -117,6 +129,7 @@ impl PlaybackEngine {
                 drain: Arc::new(AtomicBool::new(false)),
                 track_ended: Arc::new(AtomicBool::new(false)),
                 stream_error: Arc::new(AtomicBool::new(false)),
+                seek_rebase: Arc::new(Mutex::new(None)),
                 worker_panicked: Arc::new(AtomicBool::new(false)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
@@ -235,6 +248,8 @@ impl PlaybackEngine {
         let live_drain = Arc::clone(&self.shared.drain);
         let track_ended_flag = Arc::clone(&self.shared.track_ended);
         let self_worker_panicked = Arc::clone(&self.shared.worker_panicked);
+        let live_seek_rebase = Arc::clone(&self.shared.seek_rebase);
+        let worker_frames_played = Arc::clone(&self.metrics);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -387,9 +402,21 @@ impl PlaybackEngine {
                                 },
                             ) {
                                 Ok(()) => {
-                                    // Old buffered audio plays out briefly
-                                    // (~90ms at 8MB/44.1k stereo worst case is
-                                    // far less: ring drains in one callback).
+                                    // Rebase the position counter: the
+                                    // frames-played count maps to the sought
+                                    // point from here on, so the UI bar
+                                    // reflects the jump immediately (the
+                                    // fraction of a second of ring audio
+                                    // still in flight lands after it).
+                                    let played = worker_frames_played.frames_played();
+                                    if let Ok(mut rb) = live_seek_rebase.lock() {
+                                        *rb = Some((played, position_s));
+                                    }
+                                    // Stale pre-seek samples inside the
+                                    // resampler FIFO are garbage now.
+                                    if let Some(pl) = compiled_pipeline.as_mut() {
+                                        pl.drop_buffered();
+                                    }
                                     tracing::info!(position_s, "seeked");
                                 }
                                 Err(e) => {
@@ -405,12 +432,12 @@ impl PlaybackEngine {
                                     let mut written = 0;
                                     let bytes = chunk.as_bytes();
                                     while written < bytes.len() {
-                                        let n = prod.push_slice(&bytes[written..]);
-                                        written += n;
-                                        if n == 0 {
-                                            // Buffer full: back-pressure with
-                                            // bounded wait; pause/seek/DSP
-                                            // updates must stay serviced.
+                                        // Low-water back-pressure: hold the
+                                        // ring near RING_TARGET_BYTES, not at
+                                        // capacity. This bounds the stale
+                                        // old-config audio in flight when a
+                                        // live DSP change (or seek) lands.
+                                        if prod_len(&prod) >= RING_TARGET_BYTES {
                                             if !running.load(Ordering::Acquire)
                                                 || live_paused.load(Ordering::Acquire)
                                             {
@@ -424,7 +451,10 @@ impl PlaybackEngine {
                                                 break;
                                             }
                                             std::thread::sleep(std::time::Duration::from_millis(5));
+                                            continue;
                                         }
+                                        let n = prod.push_slice(&bytes[written..]);
+                                        written += n;
                                     }
                                 } else {
                                     // DSP path: f32 -> pipeline -> device wire
@@ -467,9 +497,9 @@ impl PlaybackEngine {
                                     };
                                     let mut written = 0;
                                     while written < bytes.len() {
-                                        let n = prod.push_slice(&bytes[written..]);
-                                        written += n;
-                                        if n == 0 {
+                                        // Same low-water back-pressure as the
+                                        // native path (see above).
+                                        if prod_len(&prod) >= RING_TARGET_BYTES {
                                             if !running.load(Ordering::Acquire)
                                                 || live_paused.load(Ordering::Acquire)
                                             {
@@ -483,7 +513,10 @@ impl PlaybackEngine {
                                                 break;
                                             }
                                             std::thread::sleep(std::time::Duration::from_millis(5));
+                                            continue;
                                         }
+                                        let n = prod.push_slice(&bytes[written..]);
+                                        written += n;
                                     }
                                 }
                             }
@@ -667,13 +700,22 @@ impl PlaybackEngine {
     }
 
     /// Approximate playback position in seconds, derived from frames
-    /// played and the output rate.
+    /// played and the output rate — rebased after a seek so the UI bar
+    /// reflects the jump immediately instead of continuing the pre-seek
+    /// count.
     pub fn position_s(&self) -> f64 {
         let rate = self.negotiated.map(|f| f.sample_rate).unwrap_or(0);
         if rate == 0 {
             return 0.0;
         }
-        self.metrics.frames_played() as f64 / f64::from(rate)
+        let played = self.metrics.frames_played();
+        let rebase = self.shared.seek_rebase.lock().ok().and_then(|rb| *rb);
+        match rebase {
+            Some((base, position)) => {
+                position + played.saturating_sub(base) as f64 / f64::from(rate)
+            }
+            None => played as f64 / f64::from(rate),
+        }
     }
 
     /// Stop playback and release the stream.
@@ -683,6 +725,9 @@ impl PlaybackEngine {
     }
 
     fn stop_internal(&mut self) {
+        if let Ok(mut rb) = self.shared.seek_rebase.lock() {
+            *rb = None;
+        }
         self.shared.running.store(false, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

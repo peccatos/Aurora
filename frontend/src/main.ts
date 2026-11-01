@@ -682,14 +682,26 @@ async function setupSeek() {
   if (!bar) return;
 
   bar.addEventListener("pointerdown", () => (seeking = true));
-  bar.addEventListener("pointerup", async () => {
-    seeking = false;
+  bar.addEventListener("input", () => (seeking = true));
+  // `change` fires on release (mouse or keyboard) and always carries the
+  // final value; pointerup alone could race the value update on a fast
+  // click into the middle of the track.
+  bar.addEventListener("change", async () => {
     const pos = (Number.parseFloat(bar.value) / 100) * currentDurationS;
     try {
       await invoke("seek", { positionS: pos });
+      // Reflect the jump immediately: the position poll (400ms) would
+      // otherwise show the pre-seek position for up to half a second.
+      if (cur) cur.textContent = fmtTime(pos);
     } catch (e) {
       setNote(`Seek failed: ${String(e)}`);
+    } finally {
+      seeking = false;
     }
+  });
+  bar.addEventListener("pointerup", () => {
+    // Keyboard/edge-case safety net: re-arm the poll on any release.
+    setTimeout(() => (seeking = false), 250);
   });
 
   setInterval(async () => {
