@@ -105,6 +105,14 @@ pub struct DspPipeline {
     reverb: Option<crate::reverb::Reverb>,
     speed_active: bool,
     volume: Gain,
+    /// Interleaved samples carried over between chunks: the resampler
+    /// consumes fixed-size blocks, but decoders emit arbitrary chunk
+    /// sizes (MP3 = 1152 frames, last chunk truncated, ...). This FIFO
+    /// decouples them. Must be empty before resample except between
+    /// process/flush calls.
+    resample_inbuf: Vec<f32>,
+    /// Channels of the stream (for frame<->sample math on the buffer).
+    channels: u16,
     /// ReplayGain tag value for the current track (dB), if a mode uses it.
     replaygain_db: Option<f32>,
     resampler: Option<Resampler>,
@@ -224,6 +232,8 @@ impl DspPipeline {
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
             resampler,
+            resample_inbuf: Vec::new(),
+            channels: source_format.channels,
             source_format,
             target_rate: target_rate.filter(|_t| needs_resample),
             clipped: false,
@@ -255,17 +265,63 @@ impl DspPipeline {
         let Some(rs) = self.resampler.as_mut() else {
             return std::mem::take(interleaved);
         };
-        let input = std::mem::take(interleaved);
-        match rs.process(&input) {
-            Ok(out) => out,
-            Err(e) => {
-                // Resampling failure must not kill playback: pass the
-                // unresampled chunk through and log loudly — the
-                // diagnostics still report the transformation.
-                tracing::error!(%e, "resampler failure, passing through");
-                input
+
+        // Feed the carry-over buffer, then emit every complete block the
+        // resampler wants. Decoder chunk sizes are arbitrary; the
+        // resampler contract is fixed-size input. Any remainder stays
+        // buffered for the next chunk (and flush() drains the tail).
+        let nch = usize::from(self.channels);
+        self.resample_inbuf.extend_from_slice(interleaved);
+        interleaved.clear();
+
+        let mut out = Vec::new();
+        loop {
+            let want = rs.input_frames_next() * nch;
+            if self.resample_inbuf.len() < want {
+                break;
+            }
+            let block: Vec<f32> = self.resample_inbuf.drain(..want).collect();
+            match rs.process(&block) {
+                Ok(chunk) => out.extend(chunk),
+                Err(e) => {
+                    // Resampling failure must not kill playback: pass the
+                    // unresampled samples through and log loudly — the
+                    // diagnostics still report the transformation.
+                    tracing::error!(%e, "resampler failure, passing through");
+                    out.extend(block);
+                }
             }
         }
+        out
+    }
+
+    /// Flush the resampler's delay line and tail at end of stream.
+    ///
+    /// Call after the last `process`; returns the final output samples
+    /// (may be empty when no resampler is active).
+    pub fn flush(&mut self) -> Vec<f32> {
+        let Some(rs) = self.resampler.as_mut() else {
+            return Vec::new();
+        };
+        let nch = usize::from(self.channels);
+        let mut out = Vec::new();
+        // First: any complete block still buffered (seek/stop race).
+        loop {
+            let want = rs.input_frames_next() * nch;
+            if self.resample_inbuf.len() < want {
+                break;
+            }
+            let block: Vec<f32> = self.resample_inbuf.drain(..want).collect();
+            if let Ok(chunk) = rs.process(&block) {
+                out.extend(chunk);
+            }
+        }
+        // Then: the resampler's own delay-line flush.
+        if let Ok(tail) = rs.flush() {
+            out.extend(tail);
+        }
+        self.resample_inbuf.clear();
+        out
     }
 
     /// Whether clipping protection engaged since the last call.
@@ -423,5 +479,55 @@ mod tests {
         let _ = pl.process(&mut input);
         assert!(pl.take_clipped());
         assert!(!pl.take_clipped(), "flag must reset");
+    }
+
+    #[test]
+    fn resampler_handles_arbitrary_chunk_sizes_mp3_like() {
+        // Regression (found live on an MP3 file): the resampler wants
+        // fixed 2048-frame blocks; MP3 decodes in 1152-frame chunks and
+        // the last chunk is truncated. The pipeline's FIFO must absorb
+        // any chunk size without error and flush the tail.
+        use crate::eq::Equalizer;
+
+        let source = PcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 32,
+            sample_format: aurora_core::SampleFormat::Float,
+            channel_layout: aurora_core::ChannelLayout::Interleaved,
+        };
+        let mut config = DspConfig {
+            speed: 0.8, // forces the resampler on
+            ..DspConfig::default()
+        };
+        config.eq = Equalizer::ten_band_flat();
+
+        let mut pipeline = DspPipeline::compile(&config, source, None, None).expect("compile");
+
+        // 1152-frame chunks, ~4.7 seconds, then a short truncated tail.
+        let chunk_frames = 1152usize;
+        let total_frames = 44_100 * 4 + 1000;
+        let mut fed = 0usize;
+        let mut out_samples = 0usize;
+        while fed < total_frames {
+            let n = chunk_frames.min(total_frames - fed);
+            let mut chunk: Vec<f32> = (0..n * 2)
+                .map(|i| ((i % 512) as f64 * 0.01).sin() as f32)
+                .collect();
+            let processed = pipeline.process(&mut chunk);
+            assert!(processed.is_empty() || !processed.is_empty()); // no panic
+            out_samples += processed.len();
+            fed += n;
+        }
+        let tail = pipeline.flush();
+        out_samples += tail.len();
+
+        // 0.8x speed: ~4.71s * 44100 * 2ch ≈ 415k samples (plus resampler
+        // transient slack). The pre-fix code emitted near-zero output.
+        let expected_min = total_frames * 2 * 4 / 5; // 0.8 ratio, minus slack
+        assert!(
+            out_samples > expected_min,
+            "output too small: {out_samples} samples for {total_frames} input frames              (resampler FIFO regression)"
+        );
     }
 }

@@ -488,6 +488,36 @@ impl PlaybackEngine {
                                 }
                             }
                             Err(DecodeError::EndOfStream) => {
+                                // Drain the pipeline tail (resampler FIFO
+                                // + delay line) so the last ~90ms of the
+                                // track actually plays.
+                                if let Some(pipeline) =
+                                    compiled_pipeline.as_mut().filter(|_| !plays_native)
+                                {
+                                    let tail = pipeline.flush();
+                                    if !tail.is_empty() {
+                                        let bytes = aurora_decoder::PcmChunk::from_bytes(
+                                            target_format,
+                                            f32s_to_wire(&tail, target_format),
+                                        )
+                                        .map(|c| c.as_bytes().to_vec());
+                                        if let Some(bytes) = bytes {
+                                            let mut written = 0;
+                                            while written < bytes.len() {
+                                                let n = prod.push_slice(&bytes[written..]);
+                                                written += n;
+                                                if n == 0 {
+                                                    if !running.load(Ordering::Acquire) {
+                                                        break;
+                                                    }
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(5),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 worker_finished.store(true, Ordering::Release);
                                 track_ended_flag.store(true, Ordering::Release);
                                 break;
