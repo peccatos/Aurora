@@ -574,6 +574,10 @@ pub fn list_output_devices(state: State<AppState>) -> Result<Vec<DeviceDto>, Com
 #[derive(Debug, Serialize)]
 pub struct PlaybackStatus {
     pub state: EngineState,
+    /// Phase 8: set when the stream errored (device loss) or the decode
+    /// worker panicked since the last status poll. The UI shows a
+    /// recovery note; faults are one-shot (cleared on read).
+    pub fault: Option<String>,
     /// Negotiated output sample rate, when playing.
     pub sample_rate: Option<u32>,
     pub channels: Option<u16>,
@@ -590,8 +594,18 @@ pub struct PlaybackStatus {
 
 fn status_of(engine: &PlaybackEngine) -> PlaybackStatus {
     let format = engine.output_format();
+    // One-shot fault flags: reading consumes them, so each fault is
+    // reported to the UI exactly once (not on every 500ms poll).
+    let fault = if engine.take_stream_error() {
+        Some("output stream error (device lost?)".to_string())
+    } else if engine.take_worker_panicked() {
+        Some("decode worker crashed; playback stopped".to_string())
+    } else {
+        None
+    };
     PlaybackStatus {
         state: engine.state(),
+        fault,
         sample_rate: format.map(|f| f.sample_rate),
         channels: format.map(|f| f.channels),
         bits_per_sample: format.map(|f| f.bits_per_sample),
@@ -879,6 +893,32 @@ pub struct ExclusiveProbe {
     pub note: String,
 }
 
+/// Phase 8: stop a faulted stream and optionally replay the current
+/// queue track on the (new) default device — the recovery path for
+/// device loss. The engine itself never restarts on its own: recovery is
+/// an explicit, honest action.
+#[tauri::command]
+pub fn recover_playback(
+    replay: bool,
+    state: State<AppState>,
+) -> Result<PlaybackStatus, CommandError> {
+    {
+        let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+        engine.stop();
+    }
+    if replay {
+        let track = {
+            let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+            queue.current.and_then(|i| queue.tracks.get(i).cloned())
+        };
+        if let Some(track) = track {
+            return start_track_at(&track, &state);
+        }
+    }
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(status_of(&engine))
+}
+
 #[tauri::command]
 pub fn pause_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
     let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
@@ -938,6 +978,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             play_queue_index,
             next_track,
             prev_track,
+            recover_playback,
             pause_playback,
             resume_playback,
             stop_playback

@@ -1,6 +1,6 @@
 # Aurora — сводка состояния проекта
 
-_Дата: 1 ноября 2026 (обновлено после Phase 7). Полный отчёт для продолжения в новом окне._
+_Дата: 1 ноября 2026 (обновлено после Phase 8). Полный отчёт для продолжения в новом окне._
 
 ## Что такое Aurora
 
@@ -60,7 +60,12 @@ frontend/       — плеер + EQ + reverb/speed + ПАНЕЛЬ LIBRARY (ск�
   персистентный выбор устройства (SQLite settings + fallback при
   отключённом устройстве), rescan всех корней, queue UI панель,
   add-to-queue, выбор из библиотеки |
-| 8 Hardening | ⬜ |
+| 8 Hardening | ✅ crash containment (worker panics ловятся
+  catch_unwind, процесс жив), device-loss recovery (stream_error +
+  recover_playback + кнопка Recover & Replay), graceful shutdown (WAL
+  checkpoint при закрытии окна), перф-тесты DSP (10x realtime floor,
+  44.1k/96k), release workflow (draft release, бандлы 3 ОС),
+  PLATFORM_LIMITATIONS.md |
 | 9 VST3 host (post-1.0) | задокументирован в ROADMAP |
 
 ## Ключевые баги, которые мы поймали и починили (уроки!)
@@ -111,7 +116,8 @@ cd apps/desktop && TAURI_DEV="true" cargo run
 
 ## Что делать дальше (приоритеты)
 
-1. Полный WASAPI exclusive-стрим (поверх probe из Phase 5)
+1. Полный WASAPI exclusive-стрим (поверх probe из Phase 5) — поднимет
+   honest-статус с unverified до проверяемого
 3. Физический loopback-захват (верификация Verified)
 4. VST3-хост (Phase 9, out-of-process изоляция)
 
@@ -126,3 +132,6 @@ cd apps/desktop && TAURI_DEV="true" cargo run
   сохранения), нет экспорта/импорта
 - Устройство применяется к следующему треку (не hot-swap текущего стрима)
 - Настройки хранятся в library.db (в settings), отдельного конфига нет
+- Подпись релизов требует секретов (TAURI_SIGNING_PRIVATE_KEY, Apple
+  notarization) — без них артефакты unsigned
+- Frontend-валидация (tsc+build) не в CI-джобе rust (есть в release.yml)

@@ -7,6 +7,8 @@
 //! services are constructed and injected here — never inside the tauri
 //! adapter, which stays a thin command/event boundary.
 
+use tauri::Manager;
+
 use aurora_tauri::commands;
 
 /// Initialize process-wide observability (tracing).
@@ -49,5 +51,28 @@ pub fn install_termination_handling() {
 /// The caller supplies Tauri's generated context (`tauri::generate_context!`),
 /// which must be expanded inside the binary crate.
 pub fn compose() -> tauri::Builder<tauri::Wry> {
-    commands::builder()
+    commands::builder().on_window_event(|window, event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
+            // Phase 8: graceful teardown. The async library close runs on
+            // the Tauri runtime, which is still alive during Destroyed.
+            let handle = window.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                shutdown_library(&handle).await;
+            });
+        }
+    })
+}
+
+/// Close the SQLite pool cleanly (WAL checkpoint + connection close).
+///
+/// WAL+NORMAL already tolerates a hard kill (the next scan repairs), so
+/// this is best-effort polish, not a correctness requirement.
+async fn shutdown_library(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let state = app.state::<aurora_tauri::commands::AppState>();
+    let service = state.library.lock().await.take();
+    if let Some(service) = service {
+        service.pool().close().await;
+        tracing::info!("library closed cleanly (WAL checkpointed)");
+    }
 }

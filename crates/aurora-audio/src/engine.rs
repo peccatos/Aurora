@@ -59,6 +59,15 @@ struct Shared {
     /// audio (produced by the OLD config) so the new preset is heard
     /// immediately instead of after the ring's worth of audio.
     drain: Arc<AtomicBool>,
+    /// Stream failure signal (Phase 8): set by the CPAL error callback
+    /// when the device is lost mid-flight. The app layer polls this via
+    /// `take_stream_error`, stops the dead stream and can re-play on
+    /// another device. Never panics the process (invariant 8).
+    stream_error: Arc<AtomicBool>,
+    /// Worker panic signal (Phase 8): the decode worker is caught with
+    /// catch_unwind; a panicking worker sets this, the stream drains out
+    /// (silence), and the app layer reports the failure instead of dying.
+    worker_panicked: Arc<AtomicBool>,
     /// Auto-advance signal: set by the callback side when the stream ends
     /// naturally (checked by the app layer for next-track behavior).
     track_ended: Arc<AtomicBool>,
@@ -107,6 +116,8 @@ impl PlaybackEngine {
                 paused: Arc::new(AtomicBool::new(false)),
                 drain: Arc::new(AtomicBool::new(false)),
                 track_ended: Arc::new(AtomicBool::new(false)),
+                stream_error: Arc::new(AtomicBool::new(false)),
+                worker_panicked: Arc::new(AtomicBool::new(false)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
@@ -223,6 +234,7 @@ impl PlaybackEngine {
         let live_paused = Arc::clone(&self.shared.paused);
         let live_drain = Arc::clone(&self.shared.drain);
         let track_ended_flag = Arc::clone(&self.shared.track_ended);
+        let self_worker_panicked = Arc::clone(&self.shared.worker_panicked);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -260,218 +272,241 @@ impl PlaybackEngine {
         let worker = std::thread::Builder::new()
             .name("aurora-decode-worker".into())
             .spawn(move || {
-                let mut prod = prod;
-                let running = worker_running;
-                // Live pipeline: compiled for the initial config, replaced
-                // in place when the UI bumps the version. Track the
-                // compiled version to detect changes cheaply.
-                let mut compiled_version = 0u64;
-                let mut compiled_pipeline = dsp_pipeline;
-                loop {
-                    if !running.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    // Drain: wait for the callback to consume the stale
-                    // buffered audio (produced by the old DSP config).
-                    // The callback drains ~10ms of audio per call; 1MB
-                    // clears in well under a second.
-                    if live_drain.load(Ordering::Acquire) && !live_paused.load(Ordering::Acquire) {
-                        if prod_len(&prod) == 0 {
-                            live_drain.store(false, Ordering::Release);
-                        } else {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                            continue;
+                // Phase 8 crash containment: a panic in decode/DSP code is
+                // caught here; the worker flags it and exits cleanly. The
+                // stream plays out buffered audio, then silence — the
+                // process survives and the app layer reports the failure.
+                let panic_flag = Arc::clone(&self_worker_panicked);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut prod = prod;
+                    let running = worker_running;
+                    // Live pipeline: compiled for the initial config, replaced
+                    // in place when the UI bumps the version. Track the
+                    // compiled version to detect changes cheaply.
+                    let mut compiled_version = 0u64;
+                    let mut compiled_pipeline = dsp_pipeline;
+                    loop {
+                        if !running.load(Ordering::Acquire) {
+                            break;
                         }
-                    }
 
-                    // Paused: do not decode (the ring cannot drain while
-                    // the callback is paused), but keep servicing live
-                    // recompiles and seek requests below. Sleep briefly
-                    // instead of spinning.
-                    if live_paused.load(Ordering::Acquire) {
-                        // DSP/seek still need servicing while paused.
-                        if live_dsp.lock().map(|d| d.version).unwrap_or(0) != compiled_version
-                            || live_seek.lock().map(|s| s.is_some()).unwrap_or(false)
+                        // Drain: wait for the callback to consume the stale
+                        // buffered audio (produced by the old DSP config).
+                        // The callback drains ~10ms of audio per call; 1MB
+                        // clears in well under a second.
+                        if live_drain.load(Ordering::Acquire)
+                            && !live_paused.load(Ordering::Acquire)
                         {
-                            // fall through to the handling below
-                        } else {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            continue;
-                        }
-                    }
-
-                    // Live DSP: recompile when the config version advanced.
-                    // Filter states reset; the stream continues seamlessly.
-                    if let Some(pl) = compiled_pipeline.as_ref() {
-                        let _ = pl;
-                    }
-                    let needs_recompile = {
-                        match live_dsp.lock() {
-                            Ok(d) => d.version != compiled_version,
-                            Err(_) => false,
-                        }
-                    };
-                    if needs_recompile && !plays_native {
-                        let new_cfg = live_dsp
-                            .lock()
-                            .ok()
-                            .map(|d| d.config.clone())
-                            .unwrap_or_default();
-                        let rate_target = if negotiated.pcm.sample_rate != source_format.sample_rate
-                        {
-                            Some(negotiated.pcm.sample_rate)
-                        } else {
-                            None
-                        };
-                        match aurora_dsp::DspPipeline::compile(
-                            &new_cfg,
-                            source_format,
-                            rate_target,
-                            rg_tag_for_mode(&new_cfg, rg_track_db, rg_album_db),
-                        ) {
-                            Ok(new_pl) => {
-                                tracing::info!("dsp recompiled live");
-                                compiled_version = {
-                                    let mut d = live_dsp.lock().expect("dsp lock");
-                                    let v = d.version;
-                                    d.config = new_cfg;
-                                    v
-                                };
-                                compiled_pipeline = Some(new_pl);
-                                // Drop audio buffered under the old config:
-                                // a preset must be audible now, not after
-                                // the ring plays out.
-                                live_drain.store(true, Ordering::Release);
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "live dsp recompile failed, keeping old");
-                                compiled_version = {
-                                    let d = live_dsp.lock().expect("dsp lock");
-                                    d.version
-                                };
-                            }
-                        }
-                    }
-
-                    // Seek: drain the ring, seek the source, continue.
-                    let pending_seek = live_seek.lock().ok().and_then(|mut s| s.take());
-                    if let Some(position_s) = pending_seek {
-                        let time = symphonia::core::units::Time::try_from_secs_f64(position_s)
-                            .unwrap_or_default();
-                        match source_seek(
-                            &mut source,
-                            symphonia::core::formats::SeekTo::Time {
-                                time,
-                                track_id: None,
-                            },
-                        ) {
-                            Ok(()) => {
-                                // Old buffered audio plays out briefly
-                                // (~90ms at 8MB/44.1k stereo worst case is
-                                // far less: ring drains in one callback).
-                                tracing::info!(position_s, "seeked");
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "seek failed");
-                            }
-                        }
-                        continue;
-                    }
-
-                    match source.next_chunk() {
-                        Ok(chunk) => {
-                            if plays_native {
-                                let mut written = 0;
-                                let bytes = chunk.as_bytes();
-                                while written < bytes.len() {
-                                    let n = prod.push_slice(&bytes[written..]);
-                                    written += n;
-                                    if n == 0 {
-                                        // Buffer full: back-pressure with
-                                        // bounded wait; pause/seek/DSP
-                                        // updates must stay serviced.
-                                        if !running.load(Ordering::Acquire)
-                                            || live_paused.load(Ordering::Acquire)
-                                        {
-                                            break;
-                                        }
-                                        if live_seek.lock().map(|s| s.is_some()).unwrap_or(false) {
-                                            break;
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(5));
-                                    }
-                                }
+                            if prod_len(&prod) == 0 {
+                                live_drain.store(false, Ordering::Release);
                             } else {
-                                // DSP path: f32 -> pipeline -> device wire
-                                // format. The pipeline applies the user's
-                                // EQ/gain (and any resampling needed to
-                                // reach the device rate); dither + final
-                                // format conversion happen at the boundary.
-                                let Some(pipeline) = compiled_pipeline.as_mut() else {
-                                    // Unreachable: compiled above.
-                                    continue;
-                                };
-                                let mut samples = chunk.to_f32_interleaved();
-                                let processed = pipeline.process(&mut samples);
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                continue;
+                            }
+                        }
 
-                                // Dither only when converting to integer
-                                // output; float output needs none.
-                                let mut dithered = processed;
-                                if !matches!(
-                                    target_format.sample_format,
-                                    aurora_core::SampleFormat::Float
-                                ) {
-                                    ditherer.dither_for(
-                                        &mut dithered,
-                                        target_format.sample_format,
-                                        target_format.bits_per_sample,
-                                    );
+                        // Paused: do not decode (the ring cannot drain while
+                        // the callback is paused), but keep servicing live
+                        // recompiles and seek requests below. Sleep briefly
+                        // instead of spinning.
+                        if live_paused.load(Ordering::Acquire) {
+                            // DSP/seek still need servicing while paused.
+                            if live_dsp.lock().map(|d| d.version).unwrap_or(0) != compiled_version
+                                || live_seek.lock().map(|s| s.is_some()).unwrap_or(false)
+                            {
+                                // fall through to the handling below
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                continue;
+                            }
+                        }
+
+                        // Live DSP: recompile when the config version advanced.
+                        // Filter states reset; the stream continues seamlessly.
+                        if let Some(pl) = compiled_pipeline.as_ref() {
+                            let _ = pl;
+                        }
+                        let needs_recompile = {
+                            match live_dsp.lock() {
+                                Ok(d) => d.version != compiled_version,
+                                Err(_) => false,
+                            }
+                        };
+                        if needs_recompile && !plays_native {
+                            let new_cfg = live_dsp
+                                .lock()
+                                .ok()
+                                .map(|d| d.config.clone())
+                                .unwrap_or_default();
+                            let rate_target =
+                                if negotiated.pcm.sample_rate != source_format.sample_rate {
+                                    Some(negotiated.pcm.sample_rate)
+                                } else {
+                                    None
+                                };
+                            match aurora_dsp::DspPipeline::compile(
+                                &new_cfg,
+                                source_format,
+                                rate_target,
+                                rg_tag_for_mode(&new_cfg, rg_track_db, rg_album_db),
+                            ) {
+                                Ok(new_pl) => {
+                                    tracing::info!("dsp recompiled live");
+                                    compiled_version = {
+                                        let mut d = live_dsp.lock().expect("dsp lock");
+                                        let v = d.version;
+                                        d.config = new_cfg;
+                                        v
+                                    };
+                                    compiled_pipeline = Some(new_pl);
+                                    // Drop audio buffered under the old config:
+                                    // a preset must be audible now, not after
+                                    // the ring plays out.
+                                    live_drain.store(true, Ordering::Release);
                                 }
-
-                                let bytes = match aurora_decoder::PcmChunk::from_bytes(
-                                    target_format,
-                                    f32s_to_wire(&dithered, target_format),
-                                ) {
-                                    Some(c) => c.as_bytes().to_vec(),
-                                    None => {
-                                        tracing::warn!("wire conversion failed, dropping chunk");
-                                        continue;
-                                    }
-                                };
-                                let mut written = 0;
-                                while written < bytes.len() {
-                                    let n = prod.push_slice(&bytes[written..]);
-                                    written += n;
-                                    if n == 0 {
-                                        if !running.load(Ordering::Acquire)
-                                            || live_paused.load(Ordering::Acquire)
-                                        {
-                                            break;
-                                        }
-                                        if live_seek.lock().map(|s| s.is_some()).unwrap_or(false) {
-                                            break;
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(5));
-                                    }
+                                Err(e) => {
+                                    tracing::warn!(%e, "live dsp recompile failed, keeping old");
+                                    compiled_version = {
+                                        let d = live_dsp.lock().expect("dsp lock");
+                                        d.version
+                                    };
                                 }
                             }
                         }
-                        Err(DecodeError::EndOfStream) => {
-                            worker_finished.store(true, Ordering::Release);
-                            track_ended_flag.store(true, Ordering::Release);
-                            break;
-                        }
-                        Err(DecodeError::Recoverable(msg)) => {
-                            tracing::warn!(%msg, "worker skipping packet");
+
+                        // Seek: drain the ring, seek the source, continue.
+                        let pending_seek = live_seek.lock().ok().and_then(|mut s| s.take());
+                        if let Some(position_s) = pending_seek {
+                            let time = symphonia::core::units::Time::try_from_secs_f64(position_s)
+                                .unwrap_or_default();
+                            match source_seek(
+                                &mut source,
+                                symphonia::core::formats::SeekTo::Time {
+                                    time,
+                                    track_id: None,
+                                },
+                            ) {
+                                Ok(()) => {
+                                    // Old buffered audio plays out briefly
+                                    // (~90ms at 8MB/44.1k stereo worst case is
+                                    // far less: ring drains in one callback).
+                                    tracing::info!(position_s, "seeked");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "seek failed");
+                                }
+                            }
                             continue;
                         }
-                        Err(other) => {
-                            tracing::error!(%other, "worker decode failure");
-                            worker_finished.store(true, Ordering::Release);
-                            break;
+
+                        match source.next_chunk() {
+                            Ok(chunk) => {
+                                if plays_native {
+                                    let mut written = 0;
+                                    let bytes = chunk.as_bytes();
+                                    while written < bytes.len() {
+                                        let n = prod.push_slice(&bytes[written..]);
+                                        written += n;
+                                        if n == 0 {
+                                            // Buffer full: back-pressure with
+                                            // bounded wait; pause/seek/DSP
+                                            // updates must stay serviced.
+                                            if !running.load(Ordering::Acquire)
+                                                || live_paused.load(Ordering::Acquire)
+                                            {
+                                                break;
+                                            }
+                                            if live_seek
+                                                .lock()
+                                                .map(|s| s.is_some())
+                                                .unwrap_or(false)
+                                            {
+                                                break;
+                                            }
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                        }
+                                    }
+                                } else {
+                                    // DSP path: f32 -> pipeline -> device wire
+                                    // format. The pipeline applies the user's
+                                    // EQ/gain (and any resampling needed to
+                                    // reach the device rate); dither + final
+                                    // format conversion happen at the boundary.
+                                    let Some(pipeline) = compiled_pipeline.as_mut() else {
+                                        // Unreachable: compiled above.
+                                        continue;
+                                    };
+                                    let mut samples = chunk.to_f32_interleaved();
+                                    let processed = pipeline.process(&mut samples);
+
+                                    // Dither only when converting to integer
+                                    // output; float output needs none.
+                                    let mut dithered = processed;
+                                    if !matches!(
+                                        target_format.sample_format,
+                                        aurora_core::SampleFormat::Float
+                                    ) {
+                                        ditherer.dither_for(
+                                            &mut dithered,
+                                            target_format.sample_format,
+                                            target_format.bits_per_sample,
+                                        );
+                                    }
+
+                                    let bytes = match aurora_decoder::PcmChunk::from_bytes(
+                                        target_format,
+                                        f32s_to_wire(&dithered, target_format),
+                                    ) {
+                                        Some(c) => c.as_bytes().to_vec(),
+                                        None => {
+                                            tracing::warn!(
+                                                "wire conversion failed, dropping chunk"
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    let mut written = 0;
+                                    while written < bytes.len() {
+                                        let n = prod.push_slice(&bytes[written..]);
+                                        written += n;
+                                        if n == 0 {
+                                            if !running.load(Ordering::Acquire)
+                                                || live_paused.load(Ordering::Acquire)
+                                            {
+                                                break;
+                                            }
+                                            if live_seek
+                                                .lock()
+                                                .map(|s| s.is_some())
+                                                .unwrap_or(false)
+                                            {
+                                                break;
+                                            }
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(DecodeError::EndOfStream) => {
+                                worker_finished.store(true, Ordering::Release);
+                                track_ended_flag.store(true, Ordering::Release);
+                                break;
+                            }
+                            Err(DecodeError::Recoverable(msg)) => {
+                                tracing::warn!(%msg, "worker skipping packet");
+                                continue;
+                            }
+                            Err(other) => {
+                                tracing::error!(%other, "worker decode failure");
+                                worker_finished.store(true, Ordering::Release);
+                                break;
+                            }
                         }
                     }
+                }));
+                if result.is_err() {
+                    tracing::error!("decode worker panicked; stream will run dry");
+                    panic_flag.store(true, Ordering::Release);
                 }
             })
             .map_err(|e| EngineError::Internal(e.to_string()))?;
@@ -479,14 +514,18 @@ impl PlaybackEngine {
         // Callback: drain the ring into cpal's Data buffer.
         let cb_metrics = Arc::clone(&self.metrics);
         let cb_state_finished = Arc::clone(&self.shared.finished);
+        let cb_stream_error = Arc::clone(&self.shared.stream_error);
 
         self.shared.running.store(true, Ordering::Release);
+        self.shared.stream_error.store(false, Ordering::Release);
+        self.shared.worker_panicked.store(false, Ordering::Release);
         let stream = build_stream(
             &cpal_device,
             &negotiated,
             cons,
             cb_metrics,
             cb_state_finished,
+            cb_stream_error,
         )?;
 
         stream
@@ -583,6 +622,20 @@ impl PlaybackEngine {
         self.shared.track_ended.swap(false, Ordering::AcqRel)
     }
 
+    /// True when the output stream reported an error since the last check
+    /// (device loss, driver failure). The app layer should stop the dead
+    /// stream; it may offer re-play on a surviving device.
+    pub fn take_stream_error(&self) -> bool {
+        self.shared.stream_error.swap(false, Ordering::AcqRel)
+    }
+
+    /// True when the decode worker panicked since the last check. The
+    /// process is alive (crash containment), but this stream cannot
+    /// continue; the app layer should stop and surface the failure.
+    pub fn take_worker_panicked(&self) -> bool {
+        self.shared.worker_panicked.swap(false, Ordering::AcqRel)
+    }
+
     /// Approximate playback position in seconds, derived from frames
     /// played and the output rate.
     pub fn position_s(&self) -> f64 {
@@ -635,11 +688,24 @@ fn build_stream(
     mut cons: ringbuf::wrap::caching::CachingCons<Arc<HeapRb<u8>>>,
     metrics: Arc<PlaybackMetrics>,
     finished: Arc<AtomicBool>,
+    stream_error: Arc<AtomicBool>,
 ) -> Result<Stream, EngineError> {
     let pcm = config.pcm;
     let device_format = config.device_sample_format;
 
-    let err_fn = |err: cpal::Error| tracing::error!(%err, "audio stream error");
+    // Phase 8 device-loss path: the error callback flags the failure; the
+    // app layer polls `take_stream_error` and recovers (stop + optional
+    // re-play on a surviving device). Logging happens at the poller, not
+    // here — the CPAL error callback must stay tiny.
+    let err_stream_error = Arc::clone(&stream_error);
+    let err_fn = move |err: cpal::Error| {
+        // Device-removal is an expected lifecycle event, not a bug.
+        let fatal = !matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable);
+        if fatal {
+            tracing::error!(%err, "audio stream error");
+        }
+        err_stream_error.store(true, Ordering::Release);
+    };
 
     // All formats go through the raw builder: the callback works on bytes,
     // which is representation-agnostic and never allocates.

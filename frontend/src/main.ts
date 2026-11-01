@@ -84,6 +84,8 @@ interface PlaylistDto {
 
 interface PlaybackStatus {
   state: "idle" | "playing" | "draining" | "paused";
+  /** One-shot fault report (device loss / worker crash) for recovery UI. */
+  fault?: string | null;
   sample_rate: number | null;
   channels: number | null;
   bits_per_sample: number | null;
@@ -122,6 +124,7 @@ app.innerHTML = `
         <button id="btn-stop" type="button" disabled>⏹ Stop</button>
         <button id="btn-next" type="button" disabled>⏭</button>
         <button id="btn-shuffle" type="button">🔀</button>
+        <button id="btn-recover" type="button" class="primary" hidden>↻ Recover & Replay</button>
       </div>
 
       <div class="seek-row">
@@ -278,6 +281,12 @@ function renderStatus(status: PlaybackStatus) {
   $<HTMLElement>("st-underruns")!.textContent =
     status.underruns.toLocaleString();
 
+  if (status.fault) {
+    setNote(`⚠ ${status.fault} — playback recovered safe; use Replay to retry.`);
+    const recover = document.querySelector<HTMLButtonElement>("#btn-recover");
+    if (recover) recover.hidden = false;
+  }
+
   const playing = status.state === "playing";
   const paused = status.state === "paused";
   btnPlay!.disabled = !selectedPath || playing;
@@ -415,6 +424,22 @@ btnResume?.addEventListener("click", async () => {
     setNote(`Resume failed: ${String(e)}`);
   }
 });
+
+document
+  .querySelector<HTMLButtonElement>("#btn-recover")
+  ?.addEventListener("click", async () => {
+    const recover = document.querySelector<HTMLButtonElement>("#btn-recover");
+    try {
+      const status = await invoke<PlaybackStatus>("recover_playback", {
+        replay: true,
+      });
+      renderStatus(status);
+      if (recover) recover.hidden = true;
+      setNote("Recovered and replaying.");
+    } catch (e) {
+      setNote(`Recover failed: ${String(e)}`);
+    }
+  });
 
 btnStop?.addEventListener("click", async () => {
   try {
