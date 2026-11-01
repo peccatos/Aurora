@@ -117,7 +117,7 @@ fn engine_plays_file_and_reports_state() {
 }
 
 #[test]
-fn double_play_is_rejected_while_playing() {
+fn double_play_restarts_the_stream_while_playing() {
     let device = match aurora_audio::default_output_device() {
         Ok(d) => d,
         Err(_) => {
@@ -134,10 +134,11 @@ fn double_play_is_rejected_while_playing() {
     engine
         .play(path.clone(), &device, Default::default())
         .expect("first play");
-    let result = engine.play(path, &device, Default::default());
-    assert!(matches!(
-        result,
-        Err(aurora_audio::EngineError::AlreadyPlaying)
-    ));
+    // Restart semantics: re-play while playing switches the stream
+    // (mode switch, e.g. shared -> exclusive), never errors out.
+    engine
+        .play(path, &device, Default::default())
+        .expect("second play restarts");
+    assert_eq!(engine.state(), EngineState::Playing);
     engine.stop();
 }

@@ -229,15 +229,15 @@ impl PlaybackEngine {
         // track tag when no album tag exists (single-file "albums").
         let rg_track_db = replaygain_tags.map(|(t, _)| t);
         let rg_album_db = replaygain_tags.and_then(|(_, a)| a);
-        if self.state() == EngineState::Playing {
-            return Err(EngineError::AlreadyPlaying);
-        }
+        // Exclusive is a restart of the current track in a different
+        // output mode, not an error: clicking "Bit-perfect" while a
+        // shared-mode stream is playing must switch modes gracefully.
         self.stop_internal();
-
         let cpal_device = find_by_key(device.key())?;
         let mut source = AudioSource::open(&path)?;
         let source_format = source.pcm_format();
-
+        // Restart semantics: switching to exclusive while shared-mode
+        // playback is running must restart the stream, not error out.
         let negotiated = negotiate(&cpal_device, source_format)?;
 
         // The native (untouched) path requires: DSP fully bypassed AND a
@@ -654,9 +654,9 @@ impl PlaybackEngine {
         path: PathBuf,
         device: &OutputDevice,
     ) -> Result<(), EngineError> {
-        if self.state() == EngineState::Playing {
-            return Err(EngineError::AlreadyPlaying);
-        }
+        // Mode switch, not an error: clicking "Bit-perfect" while a
+        // shared-mode stream plays restarts the current track in
+        // exclusive mode (stop_internal joins the old worker/stream).
         self.stop_internal();
 
         let mut source = AudioSource::open(&path)?;
