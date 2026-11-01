@@ -381,6 +381,59 @@ pub async fn playlist_tracks(
     Ok(rows.iter().map(row_to_track).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Settings (key-value, Phase 7)
+// ---------------------------------------------------------------------------
+
+/// Read a setting value by key.
+pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, StorageError> {
+    let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("value").ok()))
+}
+
+/// Write a setting value by key (upsert).
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove a setting by key.
+pub async fn delete_setting(pool: &SqlitePool, key: &str) -> Result<(), StorageError> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Folders the user has scanned (library roots), oldest first.
+pub async fn library_roots(pool: &SqlitePool) -> Result<Vec<String>, StorageError> {
+    Ok(get_setting(pool, "library_roots")
+        .await?
+        .map(|raw| serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
+        .unwrap_or_default())
+}
+
+/// Append a scan root (idempotent: no duplicate entries).
+pub async fn add_library_root(pool: &SqlitePool, root: &str) -> Result<(), StorageError> {
+    let mut roots = library_roots(pool).await?;
+    if !roots.iter().any(|r| r == root) {
+        roots.push(root.to_string());
+        set_setting(pool, "library_roots", &serde_json::json!(roots).to_string()).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +528,41 @@ mod tests {
         rename_playlist(&pool, &pl, "Late Night").await.unwrap();
         delete_playlist(&pool, &pl).await.unwrap();
         assert!(all_playlists(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_roundtrip_and_idempotent_roots() {
+        let pool = pool().await;
+        assert_eq!(get_setting(&pool, "output_device").await.unwrap(), None);
+        set_setting(&pool, "output_device", "wasapi:default")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_setting(&pool, "output_device")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("wasapi:default")
+        );
+        // Upsert overwrites.
+        set_setting(&pool, "output_device", "wasapi:speakers")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_setting(&pool, "output_device")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("wasapi:speakers")
+        );
+
+        add_library_root(&pool, "C:/music").await.unwrap();
+        add_library_root(&pool, "C:/music").await.unwrap(); // no dupe
+        add_library_root(&pool, "D:/flac").await.unwrap();
+        assert_eq!(
+            library_roots(&pool).await.unwrap(),
+            vec!["C:/music".to_string(), "D:/flac".to_string()]
+        );
     }
 
     #[tokio::test]

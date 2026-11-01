@@ -581,3 +581,78 @@ button.ghost:hover { border-color: #57536b; color: #eceaf2; }
   font-size: 11px;
   min-height: 14px;
 }
+
+/* --- Phase 7: queue panel --- */
+
+.queue-panel {
+  width: min(1100px, 100%);
+  margin: 20px auto 0;
+  padding: 18px 24px;
+  border: 1px solid #26242e;
+  border-radius: 16px;
+  background: #16151b;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 7px;
+  padding: 2px 6px;
+}
+
+.queue-row:hover { background: #201e28; }
+
+.queue-row.current {
+  background: #26223a;
+  box-shadow: inset 2px 0 0 #8f84c9;
+}
+
+.queue-name {
+  flex: 1;
+  border: 0;
+  background: none;
+  color: #c9c6d4;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-row.current .queue-name { color: #eceaf2; }
+.queue-name:hover { color: #d9d2ff; }
+
+#lib-refresh, #lib-play-sel, #lib-queue-sel {
+  border: 1px solid #33313d;
+  border-radius: 9px;
+  padding: 9px 14px;
+  background: #1d1c24;
+  color: #e8e6ef;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color .15s ease;
+}
+
+#lib-refresh:hover, #lib-play-sel:not(:disabled):hover,
+#lib-queue-sel:not(:disabled):hover { border-color: #57536b; }
+#lib-play-sel:disabled, #lib-queue-sel:disabled { opacity: .45; cursor: not-allowed; }

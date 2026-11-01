@@ -1,6 +1,6 @@
 # Aurora — сводка состояния проекта
 
-_Дата: 1 ноября 2026 (обновлено после Phase 6). Полный отчёт для продолжения в новом окне._
+_Дата: 1 ноября 2026 (обновлено после Phase 7). Полный отчёт для продолжения в новом окне._
 
 ## Что такое Aurora
 
@@ -56,7 +56,10 @@ frontend/       — плеер + EQ + reverb/speed + ПАНЕЛЬ LIBRARY (ск�
   идемпотентный rescan (контент-хеш → TrackId), поиск, плейлисты,
   корректные имена (display_title/display_line), ReplayGain-теги до DSP.
   ADR 0003 написан |
-| 7 Desktop product | ⬜ СЛЕДУЮЩАЯ |
+| 7 Desktop product | ✅ автозагрузка библиотеки из app-data,
+  персистентный выбор устройства (SQLite settings + fallback при
+  отключённом устройстве), rescan всех корней, queue UI панель,
+  add-to-queue, выбор из библиотеки |
 | 8 Hardening | ⬜ |
 | 9 VST3 host (post-1.0) | задокументирован в ROADMAP |
 
@@ -108,10 +111,7 @@ cd apps/desktop && TAURI_DEV="true" cargo run
 
 ## Что делать дальше (приоритеты)
 
-1. **Phase 7: Desktop product** — UI как тонкий клиент бэкенда: queue UI
-   на QueueTrack, настройки (device selection persistence), автозагрузка
-   библиотеки из app-data (решение из ADR 0003), типизированный фронтенд-API.
-2. Полный WASAPI exclusive-стрим (поверх probe из Phase 5)
+1. Полный WASAPI exclusive-стрим (поверх probe из Phase 5)
 3. Физический loopback-захват (верификация Verified)
 4. VST3-хост (Phase 9, out-of-process изоляция)
 
@@ -124,3 +124,5 @@ cd apps/desktop && TAURI_DEV="true" cargo run
 - Библиотека: нет watch (изменения папки на лету), нет обложек
 - Плейлисты: нет drag-n-drop переупорядочивания (только порядок
   сохранения), нет экспорта/импорта
+- Устройство применяется к следующему треку (не hot-swap текущего стрима)
+- Настройки хранятся в library.db (в settings), отдельного конфига нет

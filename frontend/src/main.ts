@@ -183,13 +183,27 @@ app.innerHTML = `
       <p id="player-note" role="status"></p>
     </section>
 
+    <section class="queue-panel">
+      <div class="eq-head">
+        <span class="eyebrow">QUEUE</span>
+        <div class="eq-meta">
+          <span id="queue-count" class="lib-count"></span>
+          <button id="queue-clear" type="button" class="ghost">Clear</button>
+        </div>
+      </div>
+      <ul id="queue-list" class="queue-list"></ul>
+    </section>
+
     <section class="library">
       <div class="eq-head">
         <span class="eyebrow">LIBRARY · SQLITE</span>
         <div class="eq-meta">
           <button id="lib-open" type="button">Open library…</button>
           <button id="lib-scan" type="button" class="primary">Scan folder…</button>
+          <button id="lib-refresh" type="button">↻ Rescan</button>
           <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
+          <button id="lib-play-sel" type="button" disabled>▶ Play selected</button>
+          <button id="lib-queue-sel" type="button" disabled>+ Queue</button>
           <span id="lib-count" class="lib-count"></span>
         </div>
       </div>
@@ -280,22 +294,49 @@ async function refreshStatus() {
   }
 }
 
-// Device list on load.
+// Device list on load; restore the persisted selection (Phase 7).
 async function loadDevices() {
   try {
     const devices = await invoke<DeviceDto[]>("list_output_devices");
     if (!deviceSelect) return;
     deviceSelect.innerHTML = "";
+    const defaultOpt = document.createElement("option");
+    defaultOpt.value = "";
+    defaultOpt.textContent = "System default";
+    deviceSelect.appendChild(defaultOpt);
     for (const d of devices) {
       const opt = document.createElement("option");
       opt.value = d.key;
       opt.textContent = d.name;
       deviceSelect.appendChild(opt);
     }
+    // Restore saved selection (library must be open; best effort).
+    try {
+      const saved = await invoke<string | null>("get_output_device_setting");
+      if (saved) deviceSelect.value = saved;
+    } catch {
+      /* library not open yet */
+    }
   } catch (e) {
     setNote(`Device list failed: ${String(e)}`);
   }
 }
+
+// Persist device selection when changed.
+deviceSelect?.addEventListener("change", async () => {
+  try {
+    await invoke("select_output_device", {
+      deviceKey: deviceSelect?.value || null,
+    });
+    setNote(
+      deviceSelect?.value
+        ? `Output device: ${deviceSelect.selectedOptions[0]?.textContent}`
+        : "Output device: system default",
+    );
+  } catch (e) {
+    setNote(`Device select failed: ${String(e)}`);
+  }
+});
 
 loadDevices();
 refreshStatus();
@@ -529,6 +570,8 @@ function fmtTime(s: number): string {
 async function playIndex(idx: number) {
   try {
     const q = await invoke<QueueDto>("play_queue_index", { index: idx });
+    queueCurrent = q.current;
+    renderQueuePanel();
     const name = q.display[q.current ?? 0] ?? `Track ${idx + 1}`;
     setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
@@ -542,6 +585,7 @@ async function nextTrack() {
     if (q) {
       queueTracks = q.tracks;
       queueCurrent = q.current;
+      renderQueuePanel();
       const name = q.display[q.current ?? 0] ?? "";
       setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
     } else if (queueTracks.length === 1) {
@@ -560,6 +604,7 @@ async function prevTrack() {
     const q = await invoke<QueueDto>("prev_track");
     queueTracks = q.tracks;
     queueCurrent = q.current;
+    renderQueuePanel();
     const name = q.display[q.current ?? 0] ?? "";
     setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
@@ -790,6 +835,7 @@ function renderTracks(tracks: TrackDto[]) {
     check.addEventListener("change", () => {
       if (check.checked) libSelectedIds.add(t.id);
       else libSelectedIds.delete(t.id);
+      refreshSelectionButtons();
     });
 
     const label = document.createElement("button");
@@ -814,6 +860,51 @@ function renderTracks(tracks: TrackDto[]) {
   }
   const count = $id<HTMLElement>("lib-count");
   if (count) count.textContent = `${tracks.length} tracks`;
+  refreshSelectionButtons();
+}
+
+function refreshSelectionButtons() {
+  const has = libSelectedIds.size > 0;
+  const play = $id<HTMLButtonElement>("lib-play-sel");
+  const add = $id<HTMLButtonElement>("lib-queue-sel");
+  if (play) play.disabled = !has;
+  if (add) add.disabled = !has;
+}
+
+function renderQueuePanel() {
+  const ul = $id<HTMLUListElement>("queue-list");
+  const count = $id<HTMLElement>("queue-count");
+  if (count) count.textContent = `${queueTracks.length} tracks`;
+  if (!ul) return;
+  ul.innerHTML = "";
+  queueTracks.forEach((t, idx) => {
+    const li = document.createElement("li");
+    li.className = "queue-row" + (idx === queueCurrent ? " current" : "");
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "queue-name";
+    const stem = t.path.split(/[\\/]/).pop() ?? t.path;
+    name.textContent = t.artist
+      ? `${t.artist} — ${t.title ?? stem}`
+      : (t.title ?? stem);
+    name.addEventListener("click", () => playIndex(idx));
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "lib-pl-del";
+    del.title = "Remove from queue";
+    del.textContent = "×";
+    del.addEventListener("click", async () => {
+      queueTracks.splice(idx, 1);
+      if (queueCurrent != null) {
+        if (idx < queueCurrent) queueCurrent -= 1;
+        else if (idx === queueCurrent) queueCurrent = Math.min(queueCurrent, queueTracks.length - 1);
+      }
+      await invoke("set_queue", { tracks: queueTracks });
+      renderQueuePanel();
+    });
+    li.append(name, del);
+    ul.appendChild(li);
+  });
 }
 
 async function playNow(tracks: TrackDto[]) {
@@ -825,6 +916,7 @@ async function playNow(tracks: TrackDto[]) {
     await invoke("set_queue", { tracks: queueTracks });
     await invoke("play_queue_index", { index: 0 });
     refreshQueueButtons();
+    renderQueuePanel();
     if (btnPlay) btnPlay.disabled = true;
     setNote(tracks[0].display);
   } catch (e) {
@@ -980,8 +1072,86 @@ function setupLibraryActions() {
     const sel = libTracks.filter((t) => libSelectedIds.has(t.id));
     if (sel.length) playNow(sel);
   });
+
+  $id<HTMLButtonElement>("lib-play-sel")?.addEventListener("click", () => {
+    const sel = libTracks.filter((t) => libSelectedIds.has(t.id));
+    playNow(sel);
+  });
+
+  $id<HTMLButtonElement>("lib-queue-sel")?.addEventListener("click", async () => {
+    const sel = libTracks.filter((t) => libSelectedIds.has(t.id));
+    if (!sel.length) return;
+    try {
+      const q = await invoke<QueueDto>("queue_add_tracks", {
+        tracks: sel.map(trackToQueueTrack),
+      });
+      queueTracks = q.tracks;
+      queueCurrent = q.current;
+      renderQueuePanel();
+      refreshQueueButtons();
+      setNote(`Added ${sel.length} to queue (now ${q.tracks.length}).`);
+    } catch (e) {
+      setNote(`Queue add failed: ${String(e)}`);
+    }
+  });
+
+  $id<HTMLButtonElement>("queue-clear")?.addEventListener("click", async () => {
+    queueTracks = [];
+    queueCurrent = null;
+    try {
+      await invoke("set_queue", { tracks: [] });
+    } catch {
+      /* ignore */
+    }
+    renderQueuePanel();
+    refreshQueueButtons();
+    setNote("Queue cleared.");
+  });
+
+  $id<HTMLButtonElement>("lib-refresh")?.addEventListener("click", async () => {
+    if (!libOpen) {
+      libNote("No library open.");
+      return;
+    }
+    libNote("Rescanning known roots…");
+    try {
+      const summary = await invoke<ScanSummary>("rescan_all");
+      libNote(
+        `Rescan: ${summary.discovered} found, ${summary.added} added, ` +
+          `${summary.updated} updated, ${summary.pruned} removed` +
+          (summary.failed ? `, ${summary.failed} failed` : ""),
+      );
+      await refreshLibraryStatus();
+      await loadTracks();
+    } catch (e) {
+      libNote(String(e));
+    }
+  });
 }
 
 setupLibrary();
 setupLibraryActions();
 refreshLibraryStatus();
+renderQueuePanel();
+
+// Phase 7: the backend auto-opens the library at app start; the panel
+// fills itself once that completes (bounded wait, then manual mode).
+let bootTries = 0;
+const bootTimer = setInterval(async () => {
+  bootTries += 1;
+  try {
+    const st = await invoke<LibraryStatus>("library_status");
+    if (st.open) {
+      libOpen = true;
+      await refreshLibraryStatus();
+      await loadTracks();
+      await loadPlaylists();
+      clearInterval(bootTimer);
+    } else if (bootTries > 40) {
+      // ~20s: give up polling; user can open manually.
+      clearInterval(bootTimer);
+    }
+  } catch {
+    clearInterval(bootTimer);
+  }
+}, 500);

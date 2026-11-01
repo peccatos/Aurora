@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use aurora_audio::{EngineState, PlaybackEngine};
 use aurora_core::PlaybackMode;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::error::CommandError;
 
@@ -27,6 +27,8 @@ pub struct AppState {
     pub library: tokio::sync::Mutex<Option<aurora_library::LibraryService>>,
     /// Library database path (None = library not opened yet).
     pub library_path_slot: std::sync::Mutex<Option<PathBuf>>,
+    /// Selected output device key ("" = default). Persisted to settings.
+    pub device_key: std::sync::Mutex<Option<String>>,
 }
 
 /// One queue entry: the path plus what the engine needs from the library
@@ -100,6 +102,7 @@ impl AppState {
             queue: std::sync::Mutex::new(TrackQueue::default()),
             library: tokio::sync::Mutex::new(None),
             library_path_slot: std::sync::Mutex::new(None),
+            device_key: std::sync::Mutex::new(None),
         }
     }
 }
@@ -228,16 +231,89 @@ pub async fn scan_folder(
     state: State<'_, AppState>,
 ) -> Result<aurora_library::ScanSummary, CommandError> {
     let library = state.library.lock().await;
-    let summary = library
-        .as_ref()
-        .ok_or(CommandError::LibraryNotOpen)?
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let summary = service
         .scan_folder(std::path::Path::new(&root))
         .await
         .map_err(|e| CommandError::Library {
             message: e.to_string(),
         })?;
+    // Remember the root so future "refresh" rescans can replay it
+    // (Phase 7: device-independent library roots).
+    aurora_storage::add_library_root(service.pool(), &root)
+        .await
+        .map_err(CommandError::from)?;
     drop(library);
     Ok(summary)
+}
+
+/// Rescan every known library root (the "refresh library" button).
+#[tauri::command]
+pub async fn rescan_all(
+    state: State<'_, AppState>,
+) -> Result<aurora_library::ScanSummary, CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let roots = aurora_storage::library_roots(service.pool())
+        .await
+        .map_err(CommandError::from)?;
+    let mut total = aurora_library::ScanSummary::default();
+    for root in roots {
+        let summary = service
+            .scan_folder(std::path::Path::new(&root))
+            .await
+            .map_err(|e| CommandError::Library {
+                message: e.to_string(),
+            })?;
+        total.discovered += summary.discovered;
+        total.added += summary.added;
+        total.updated += summary.updated;
+        total.pruned += summary.pruned;
+        total.failed += summary.failed;
+    }
+    drop(library);
+    Ok(total)
+}
+
+/// Get a persisted setting (e.g. "output_device").
+#[tauri::command]
+pub async fn get_setting_cmd(
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let value = aurora_storage::get_setting(service.pool(), &key)
+        .await
+        .map_err(CommandError::from)?;
+    drop(library);
+    Ok(value)
+}
+
+/// Persist a setting (device selection, UI prefs).
+#[tauri::command]
+pub async fn set_setting_cmd(
+    key: String,
+    value: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    match value {
+        Some(v) => {
+            aurora_storage::set_setting(service.pool(), &key, &v)
+                .await
+                .map_err(CommandError::from)?;
+        }
+        None => {
+            // Erase by writing an empty sentinel-free delete.
+            aurora_storage::delete_setting(service.pool(), &key)
+                .await
+                .map_err(CommandError::from)?;
+        }
+    }
+    drop(library);
+    Ok(())
 }
 
 /// All library tracks (ordered artist/album/track).
@@ -392,6 +468,67 @@ pub async fn playlist_tracks(
     Ok(tracks.iter().map(TrackDto::from_track).collect())
 }
 
+/// Select the output device for all playback (persisted across runs).
+///
+/// Empty key = system default. Applied to the next track; the current
+/// stream keeps its device until it ends (switching a live CPAL stream
+/// mid-flight is a device-loss recovery path, not a hot-swap).
+#[tauri::command]
+pub async fn select_output_device(
+    device_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    {
+        let mut slot = state
+            .device_key
+            .lock()
+            .map_err(|_| CommandError::Poisoned)?;
+        *slot = device_key.clone().filter(|k| !k.is_empty());
+    }
+    // Persist into settings when the library is open (best effort).
+    let library = state.library.lock().await;
+    if let Some(service) = library.as_ref() {
+        let value = device_key.clone().filter(|k| !k.is_empty());
+        let result = match value {
+            Some(v) => aurora_storage::set_setting(service.pool(), "output_device", &v).await,
+            None => aurora_storage::delete_setting(service.pool(), "output_device").await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(%e, "could not persist output device setting");
+        }
+    }
+    drop(library);
+    Ok(())
+}
+
+/// The persisted output device key, for restoring the selector on start.
+#[tauri::command]
+pub async fn get_output_device_setting(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let value = aurora_storage::get_setting(service.pool(), "output_device")
+        .await
+        .map_err(CommandError::from)?;
+    drop(library);
+    Ok(value.filter(|k| !k.is_empty()))
+}
+
+/// Append tracks to the end of the queue (library "add to queue").
+#[tauri::command]
+pub fn queue_add_tracks(
+    tracks: Vec<QueueTrack>,
+    state: State<AppState>,
+) -> Result<QueueDto, CommandError> {
+    let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+    queue.tracks.extend(tracks);
+    if queue.current.is_none() && !queue.tracks.is_empty() {
+        queue.current = Some(0);
+    }
+    Ok(queue_dto(&queue))
+}
+
 #[tauri::command]
 pub fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -493,12 +630,26 @@ pub fn play_track(
     state: State<AppState>,
 ) -> Result<PlaybackStatus, CommandError> {
     let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let device = match request.device.as_deref() {
-        None | Some("") => aurora_audio::default_output_device()?,
+    let selected = state
+        .device_key
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .clone();
+    let requested = request
+        .device
+        .clone()
+        .filter(|d| !d.is_empty())
+        .or(selected);
+    let device = match requested.as_deref() {
+        None => aurora_audio::default_output_device()?,
         Some(key) => aurora_audio::output_devices()?
             .into_iter()
             .find(|d| d.key() == key)
-            .ok_or_else(|| CommandError::Device(request.device.clone().unwrap_or_default()))?,
+            .ok_or_else(|| {
+                tracing::warn!(key, "requested device missing, using default");
+                CommandError::Device(key.to_string())
+            })
+            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e))?,
     };
     // The request's DSP overrides the persisted config when present;
     // otherwise the UI's last saved settings apply.
@@ -565,7 +716,24 @@ fn start_track_at(
     track: &QueueTrack,
     state: &State<AppState>,
 ) -> Result<PlaybackStatus, CommandError> {
-    let device = aurora_audio::default_output_device()?;
+    let device = match state
+        .device_key
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .as_deref()
+    {
+        None | Some("") => aurora_audio::default_output_device()?,
+        Some(key) => aurora_audio::output_devices()?
+            .into_iter()
+            .find(|d| d.key() == key)
+            .ok_or_else(|| {
+                // Saved/selected device vanished (unplugged): fall back
+                // to the default instead of failing playback (invariant 8).
+                tracing::warn!(key, "selected output device missing, using default");
+                CommandError::Device(key.to_string())
+            })
+            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e))?,
+    };
     let dsp = state
         .dsp
         .lock()
@@ -743,6 +911,12 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             library_status,
             open_library,
             scan_folder,
+            rescan_all,
+            get_setting_cmd,
+            set_setting_cmd,
+            select_output_device,
+            get_output_device_setting,
+            queue_add_tracks,
             list_tracks,
             search_library,
             list_playlists,
@@ -774,6 +948,43 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 version = %app.package_info().version,
                 "Aurora desktop initialized"
             );
+
+            // Phase 7: auto-open the library at the app data dir. The
+            // user never has to pick a .db by hand; `open_library`
+            // remains available to point the app at a different one.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                    tracing::warn!(%e, "cannot create app data dir");
+                } else {
+                    let db_path = data_dir.join("library.db");
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = handle.state::<AppState>();
+                        match aurora_library::LibraryService::open(&db_path).await {
+                            Ok(service) => {
+                                let count = aurora_storage::track_count(service.pool())
+                                    .await
+                                    .unwrap_or(0);
+                                *state.library.lock().await = Some(service);
+                                *state.library_path_slot.lock().expect("path slot") =
+                                    Some(db_path.clone());
+                                tracing::info!(
+                                    path = %db_path.display(),
+                                    count,
+                                    "library auto-opened"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %db_path.display(),
+                                    %e,
+                                    "auto-open library failed"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
             Ok(())
         })
 }
