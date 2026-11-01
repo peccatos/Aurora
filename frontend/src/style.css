@@ -656,3 +656,41 @@ button.ghost:hover { border-color: #57536b; color: #eceaf2; }
 #lib-refresh:hover, #lib-play-sel:not(:disabled):hover,
 #lib-queue-sel:not(:disabled):hover { border-color: #57536b; }
 #lib-play-sel:disabled, #lib-queue-sel:disabled { opacity: .45; cursor: not-allowed; }
+
+/* --- Bit-perfect exclusive + loopback verification --- */
+
+#btn-bitperfect, #btn-verify {
+  border: 1px solid #33313d;
+  border-radius: 9px;
+  padding: 9px 14px;
+  background: #1d1c24;
+  color: #e8e6ef;
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: border-color .15s ease, color .15s ease;
+}
+
+#btn-bitperfect:not(:disabled):hover, #btn-verify:not(:disabled):hover {
+  border-color: #57536b;
+  color: #d9d2ff;
+}
+
+#btn-bitperfect:disabled, #btn-verify:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.bitperfect-note {
+  font-size: 11px;
+  color: #a5a3af;
+  letter-spacing: .03em;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bitperfect-note.bp-verified { color: #8bcca8; }
+.bitperfect-note.bp-fallback { color: #d8b08a; }

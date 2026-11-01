@@ -96,6 +96,22 @@ interface PlaybackStatus {
   underruns: number;
 }
 
+/** Result of `play_exclusive_track`: did we take the exclusive path? */
+interface ExclusivePlayResult {
+  exclusive: boolean;
+  fallback_reason: string | null;
+  status: PlaybackStatus;
+}
+
+/** Result of `verify_bit_perfect`: the honest loopback measurement. */
+interface BitPerfectVerdict {
+  exclusive_active: boolean;
+  identity: number | null;
+  frames_compared: number | null;
+  integrity: "verified" | "transformed" | "unverified";
+  note: string;
+}
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -124,6 +140,9 @@ app.innerHTML = `
         <button id="btn-stop" type="button" disabled>⏹ Stop</button>
         <button id="btn-next" type="button" disabled>⏭</button>
         <button id="btn-shuffle" type="button">🔀</button>
+        <button id="btn-bitperfect" type="button" disabled title="Play through WASAPI exclusive mode — no mixer, no DSP, exact source bytes">◎ Bit-perfect</button>
+        <button id="btn-verify" type="button" disabled title="Physically capture what the endpoint rendered and compare byte-for-byte">✓ Verify</button>
+        <span id="bitperfect-note" class="bitperfect-note"></span>
         <button id="btn-recover" type="button" class="primary" hidden>↻ Recover & Replay</button>
       </div>
 
@@ -293,6 +312,10 @@ function renderStatus(status: PlaybackStatus) {
   btnPause!.disabled = !playing;
   btnResume!.disabled = !paused;
   btnStop!.disabled = status.state === "idle";
+  // Exclusive state resets when playback stops (status may reflect a
+  // shared-mode stream started elsewhere, e.g. queue auto-advance).
+  if (status.state === "idle") exclusiveActive = false;
+  refreshBitPerfectButtons();
 }
 
 async function refreshStatus() {
@@ -661,7 +684,99 @@ function wireQueueControls() {
   $id<HTMLButtonElement>("btn-prev")?.addEventListener("click", prevTrack);
   $id<HTMLButtonElement>("btn-next")?.addEventListener("click", nextTrack);
   $id<HTMLButtonElement>("btn-shuffle")?.addEventListener("click", toggleShuffle);
+  wireBitPerfectControls();
   refreshQueueButtons();
+}
+
+// ---------------------------------------------------------------------------
+// Bit-perfect (WASAPI exclusive + physical loopback verification)
+// ---------------------------------------------------------------------------
+
+/** True while an exclusive-mode stream is playing (no shared-mode fallback). */
+let exclusiveActive = false;
+
+function setBpNote(text: string, verified?: boolean) {
+  const el = $id<HTMLElement>("bitperfect-note");
+  if (!el) return;
+  el.textContent = text;
+  el.className = "bitperfect-note" + (verified === true ? " bp-verified" : verified === false ? " bp-fallback" : "");
+}
+
+function refreshBitPerfectButtons() {
+  const play = $id<HTMLButtonElement>("btn-bitperfect");
+  const verify = $id<HTMLButtonElement>("btn-verify");
+  if (play) play.disabled = !selectedPath;
+  if (verify) verify.disabled = !exclusiveActive || lastStatus?.state !== "playing";
+}
+
+function wireBitPerfectControls() {
+  $id<HTMLButtonElement>("btn-bitperfect")?.addEventListener("click", playExclusive);
+  $id<HTMLButtonElement>("btn-verify")?.addEventListener("click", runBitPerfectVerify);
+  refreshBitPerfectButtons();
+}
+
+/** Play the current track through WASAPI exclusive mode.
+ *  Falls back to the shared path (honestly reported) when the device
+ *  refuses the format. */
+async function playExclusive() {
+  if (!selectedPath) return;
+  const btn = $id<HTMLButtonElement>("btn-bitperfect");
+  const current = queueTracks[queueCurrent ?? 0];
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = "◎ …"; }
+    setBpNote("Requesting exclusive mode…");
+    const result = await invoke<ExclusivePlayResult>("play_exclusive_track", {
+      request: {
+        path: selectedPath,
+        device: deviceSelect?.value || null,
+        replaygain_track_db: current?.replaygain_track_db ?? null,
+        replaygain_album_db: current?.replaygain_album_db ?? null,
+      },
+    });
+    renderStatus(result.status);
+    exclusiveActive = result.exclusive;
+    if (result.exclusive) {
+      setBpNote("EXCLUSIVE — no mixer, no DSP. Verify to measure the wire.");
+    } else {
+      setBpNote(`Shared fallback: ${result.fallback_reason ?? "device refused"}`, false);
+      setNote(`Exclusive refused — playing shared: ${result.fallback_reason ?? ""}`);
+    }
+  } catch (e) {
+    exclusiveActive = false;
+    setBpNote("Exclusive failed", false);
+    setNote(`Bit-perfect failed: ${String(e)}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "◎ Bit-perfect"; }
+    refreshBitPerfectButtons();
+  }
+}
+
+/** Physically capture the endpoint's rendered output and compare
+ *  byte-for-byte with the reference the engine pushed. */
+async function runBitPerfectVerify() {
+  const btn = $id<HTMLButtonElement>("btn-verify");
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = "✓ …"; }
+    setBpNote("Measuring loopback (~2 s)…");
+    const verdict = await invoke<BitPerfectVerdict>("verify_bit_perfect", { seconds: 2.0 });
+    if (verdict.exclusive_active && verdict.identity != null) {
+      const pct = (verdict.identity * 100).toFixed(2);
+      const verified = verdict.integrity === "verified";
+      setBpNote(
+        verified
+          ? `VERIFIED ✓ ${pct}% byte-identical (${verdict.frames_compared?.toLocaleString()} frames measured)`
+          : `${verdict.integrity.toUpperCase()}: ${verdict.note}`,
+        verified,
+      );
+    } else {
+      setBpNote(`Not measurable: ${verdict.note}`, false);
+    }
+  } catch (e) {
+    setBpNote(`Verify failed: ${String(e)}`, false);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "✓ Verify"; }
+    refreshBitPerfectButtons();
+  }
 }
 
 function refreshQueueButtons() {
