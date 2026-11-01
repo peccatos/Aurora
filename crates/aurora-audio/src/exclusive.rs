@@ -164,7 +164,7 @@ unsafe fn probe_device(device: &cpal::Device, source: PcmFormat) -> Result<bool,
     Err(EngineError::DeviceNotFound(target_name))
 }
 
-fn prop_variant_string(
+pub fn prop_variant_string(
     value: &windows::Win32::System::Com::StructuredStorage::PROPVARIANT,
 ) -> String {
     // The union's LPWSTR member, read as *const u16 (same pattern cpal uses:
@@ -193,7 +193,7 @@ fn prop_variant_string(
 ///
 /// Exclusive mode does no conversion: 24-bit PCM probes as the packed
 /// 3-byte-per-sample representation, floats as IEEE float.
-fn pcm_to_waveformatex(source: PcmFormat) -> windows::Win32::Media::Audio::WAVEFORMATEX {
+pub fn pcm_to_waveformatex(source: PcmFormat) -> windows::Win32::Media::Audio::WAVEFORMATEX {
     use windows::Win32::Media::Audio::WAVEFORMATEX;
 
     let bits = source.bits_per_sample;

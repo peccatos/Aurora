@@ -99,6 +99,13 @@ pub struct PlaybackEngine {
     metrics: Arc<PlaybackMetrics>,
     state: Mutex<EngineState>,
     stream: Option<Stream>,
+    /// Wire bytes pushed by the exclusive worker (loopback reference).
+    /// Only populated on the exclusive path.
+    exclusive_reference: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// WASAPI exclusive-mode stream (Windows). When active, it replaces
+    /// the CPAL stream entirely: the source's exact bytes go to the
+    /// endpoint, bypassing the Windows audio engine.
+    exclusive_stream: Option<crate::exclusive_stream::ExclusiveStream>,
     worker: Option<JoinHandle<()>>,
     /// The negotiated output PCM format (for diagnostics).
     negotiated: Option<PcmFormat>,
@@ -135,6 +142,8 @@ impl PlaybackEngine {
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
             stream: None,
+            exclusive_stream: None,
+            exclusive_reference: None,
             worker: None,
             negotiated: None,
             transformations: Vec::new(),
@@ -631,6 +640,136 @@ impl PlaybackEngine {
         Ok(())
     }
 
+    /// Play a file in WASAPI exclusive mode (Windows only, ADR 0002
+    /// bit-perfect-eligible path).
+    ///
+    /// The device receives the source's exact wire format — no mixer, no
+    /// conversion, no DSP. If the device rejects the format, the error is
+    /// honest (`FormatUnsupported`) and the caller falls back to the
+    /// shared path. Integrity is `Unverified` until loopback measurement
+    /// proves it (see `verify_loopback`).
+    #[cfg(target_os = "windows")]
+    pub fn play_exclusive(
+        &mut self,
+        path: PathBuf,
+        device: &OutputDevice,
+    ) -> Result<(), EngineError> {
+        if self.state() == EngineState::Playing {
+            return Err(EngineError::AlreadyPlaying);
+        }
+        self.stop_internal();
+
+        let mut source = AudioSource::open(&path)?;
+        let source_format = source.pcm_format();
+
+        // Exclusive mode requires: the device accepts this exact format.
+        // The probe already validated acceptance; Initialize re-checks.
+        if !crate::exclusive::probe_exclusive_support(device.key(), source_format)? {
+            return Err(EngineError::FormatUnsupported(format!(
+                "exclusive mode: device does not accept {:?} natively",
+                source_format
+            )));
+        }
+
+        let ring = Arc::new(HeapRb::<u8>::new(RING_CAPACITY_BYTES));
+        let (prod, cons) = ring.split();
+
+        let worker_running = Arc::clone(&self.shared.running);
+        let track_ended_flag = Arc::clone(&self.shared.track_ended);
+
+        // Reference tap for loopback verification: a bounded record of
+        // the exact wire bytes pushed to the device. The loopback capture
+        // is compared against this (ADR 0002: verification is a
+        // measurement of what actually played).
+        let reference: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_reference = Arc::clone(&reference);
+
+        let source_duration_ms = source.info().duration_ms;
+
+        // Native-only decode worker: no DSP path, bytes go verbatim.
+        let worker = std::thread::Builder::new()
+            .name("aurora-decode-worker".into())
+            .spawn(move || {
+                let mut prod = prod;
+                let running = worker_running;
+                loop {
+                    if !running.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match source.next_chunk() {
+                        Ok(chunk) => {
+                            let mut written = 0;
+                            let bytes = chunk.as_bytes();
+                            // Tap the reference (bounded: first ~30s is
+                            // plenty for a verification window).
+                            if let Ok(mut rb) = worker_reference.lock() {
+                                let cap = 30 * 44_100 * 8;
+                                if rb.len() < cap {
+                                    rb.extend_from_slice(bytes);
+                                }
+                            }
+                            while written < bytes.len() {
+                                if prod_len(&prod) >= RING_TARGET_BYTES {
+                                    if !running.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    continue;
+                                }
+                                let n = prod.push_slice(&bytes[written..]);
+                                written += n;
+                            }
+                        }
+                        Err(DecodeError::EndOfStream) => {
+                            track_ended_flag.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(DecodeError::Recoverable(msg)) => {
+                            tracing::warn!(%msg, "worker skipping packet");
+                            continue;
+                        }
+                        Err(other) => {
+                            tracing::error!(%other, "worker decode failure");
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+        self.shared.running.store(true, Ordering::Release);
+        let exclusive = crate::exclusive_stream::ExclusiveStream::start(
+            device.key(),
+            source_format,
+            cons,
+            Arc::clone(&self.shared.running),
+            Arc::clone(&self.shared.paused),
+            Arc::clone(&self.shared.finished),
+        )?;
+
+        self.metrics.reset();
+        self.worker = Some(worker);
+        self.exclusive_stream = Some(exclusive);
+        self.exclusive_reference = Some(reference);
+        self.stream = None;
+        self.source_duration_ms = source_duration_ms;
+        self.negotiated = Some(source_format);
+        // Honest: no transformations in software, but the *hardware path*
+        // is not yet measured — that is loopback's job.
+        self.transformations.clear();
+        self.integrity = aurora_core::OutputIntegrity::Unverified;
+        self.device_key = Some(device.key().to_string());
+        self.source_format = Some(source_format);
+        *self.state.lock().expect("state mutex") = EngineState::Playing;
+
+        tracing::info!(
+            device = device.key(),
+            source = ?source_format,
+            "exclusive playback started"
+        );
+        Ok(())
+    }
+
     /// Pause the stream (callback keeps running, emitting silence).
     ///
     /// The worker also stops decoding: with the callback not draining the
@@ -699,6 +838,31 @@ impl PlaybackEngine {
         self.shared.worker_panicked.swap(false, Ordering::AcqRel)
     }
 
+    /// Run the physical loopback verification on the current exclusive
+    /// stream: capture what the endpoint rendered and compare with the
+    /// reference bytes. Honest verdict per ADR 0002 — `Verified` only
+    /// from >= 99.9% byte identity.
+    pub fn verify_loopback(
+        &self,
+        duration: std::time::Duration,
+    ) -> Result<crate::loopback::LoopbackVerdict, EngineError> {
+        let Some(device_key) = self.device_key.clone() else {
+            return Err(EngineError::NoSourceLoaded);
+        };
+        let Some(format) = self.negotiated else {
+            return Err(EngineError::NoSourceLoaded);
+        };
+        let Some(reference_slot) = self.exclusive_reference.as_ref() else {
+            return Err(EngineError::Internal(
+                "loopback verification requires an exclusive stream".into(),
+            ));
+        };
+        let reference = reference_slot
+            .lock()
+            .map_err(|_| EngineError::Internal("reference lock poisoned".into()))?;
+        crate::loopback::verify_playback(&device_key, format, &reference, duration)
+    }
+
     /// Approximate playback position in seconds, derived from frames
     /// played and the output rate — rebased after a seek so the UI bar
     /// reflects the jump immediately instead of continuing the pre-seek
@@ -724,6 +888,19 @@ impl PlaybackEngine {
         *self.state.lock().expect("state mutex") = EngineState::Idle;
     }
 
+    /// Exclusive-mode playback is Windows-only; other platforms get an
+    /// honest error (the shared path remains available).
+    #[cfg(not(target_os = "windows"))]
+    pub fn play_exclusive(
+        &mut self,
+        _path: PathBuf,
+        _device: &OutputDevice,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Internal(
+            "exclusive output is only available on Windows (WASAPI)".into(),
+        ))
+    }
+
     fn stop_internal(&mut self) {
         if let Ok(mut rb) = self.shared.seek_rebase.lock() {
             *rb = None;
@@ -732,6 +909,12 @@ impl PlaybackEngine {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // Stop the exclusive stream first (its render thread joins);
+        // then the CPAL stream if any.
+        if let Some(mut exclusive) = self.exclusive_stream.take() {
+            exclusive.stop();
+        }
+        self.exclusive_reference = None;
         // Drop the stream (stops the callback); the worker dropped its
         // producer on exit, closing the ring for writes.
         self.stream = None;
