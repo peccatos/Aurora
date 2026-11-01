@@ -31,9 +31,55 @@ interface DspConfig {
   speed: number;
 }
 
+interface QueueTrack {
+  path: string;
+  title?: string | null;
+  artist?: string | null;
+  replaygain_track_db?: number | null;
+  replaygain_album_db?: number | null;
+}
+
 interface QueueDto {
-  tracks: string[];
+  tracks: QueueTrack[];
   current: number | null;
+  display: string[];
+}
+
+interface TrackDto {
+  id: string;
+  path: string;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  genre: string | null;
+  year: number | null;
+  track_number: number | null;
+  format: string;
+  duration_ms: number | null;
+  replaygain_track_db: number | null;
+  replaygain_album_db: number | null;
+  display: string;
+  duration_display: string;
+}
+
+interface ScanSummary {
+  discovered: number;
+  added: number;
+  updated: number;
+  pruned: number;
+  failed: number;
+}
+
+interface LibraryStatus {
+  open: boolean;
+  path: string | null;
+  track_count: number;
+}
+
+interface PlaylistDto {
+  id: string;
+  name: string;
+  track_count: number;
 }
 
 interface PlaybackStatus {
@@ -62,7 +108,7 @@ app.innerHTML = `
         <p class="eyebrow">LOCAL AUDIO PLAYER</p>
         <h1>Aurora</h1>
       </div>
-      <span class="status"><i></i> PHASE 4 · DSP ENGINE</span>
+      <span class="status"><i></i> PHASE 6 · LIBRARY</span>
     </header>
 
     <section class="player">
@@ -135,6 +181,32 @@ app.innerHTML = `
       </div>
 
       <p id="player-note" role="status"></p>
+    </section>
+
+    <section class="library">
+      <div class="eq-head">
+        <span class="eyebrow">LIBRARY · SQLITE</span>
+        <div class="eq-meta">
+          <button id="lib-open" type="button">Open library…</button>
+          <button id="lib-scan" type="button" class="primary">Scan folder…</button>
+          <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
+          <span id="lib-count" class="lib-count"></span>
+        </div>
+      </div>
+
+      <div class="lib-layout">
+        <div class="lib-playlists">
+          <div class="lib-pl-head">
+            <span>PLAYLISTS</span>
+            <button id="pl-new" type="button" class="ghost" title="New playlist">+</button>
+          </div>
+          <ul id="lib-playlist-list"></ul>
+        </div>
+        <div class="lib-tracks-wrap">
+          <ul id="lib-tracks" class="lib-tracks"></ul>
+          <p id="lib-note" class="lib-note"></p>
+        </div>
+      </div>
     </section>
 
     <footer>
@@ -248,9 +320,9 @@ pickFile?.addEventListener("click", async () => {
   const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
   if (paths.length > 0) {
     selectedPath = paths[0];
-    queueTracks = paths;
+    queueTracks = paths.map((path) => ({ path }));
     queueCurrent = 0;
-    await invoke("set_queue", { tracks: paths });
+    await invoke("set_queue", { tracks: queueTracks });
     refreshQueueButtons();
     const name = paths[0].split(/[\\/]/).pop();
     setNote(paths.length > 1 ? `Queue: ${paths.length} tracks` : `Loaded: ${name}`);
@@ -270,8 +342,14 @@ btnPlay?.addEventListener("click", async () => {
     if (queueTracks.length > 1) {
       await playIndex(queueCurrent ?? 0);
     } else {
+      const current = queueTracks[queueCurrent ?? 0];
       const status = await invoke<PlaybackStatus>("play_track", {
-        request: { path: selectedPath, device: deviceSelect?.value || null },
+        request: {
+          path: selectedPath,
+          device: deviceSelect?.value || null,
+          replaygain_track_db: current?.replaygain_track_db ?? null,
+          replaygain_album_db: current?.replaygain_album_db ?? null,
+        },
       });
       renderStatus(status);
       setNote("Playing.");
@@ -437,7 +515,7 @@ loadDsp();
 const $id = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`);
 
 let currentDurationS = 0;
-let queueTracks: string[] = [];
+let queueTracks: QueueTrack[] = [];
 let queueCurrent: number | null = null;
 let shuffleMode = false;
 
@@ -450,8 +528,9 @@ function fmtTime(s: number): string {
 
 async function playIndex(idx: number) {
   try {
-    await invoke("play_queue_index", { index: idx });
-    setNote(`Track ${idx + 1}/${queueTracks.length}`);
+    const q = await invoke<QueueDto>("play_queue_index", { index: idx });
+    const name = q.display[q.current ?? 0] ?? `Track ${idx + 1}`;
+    setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
     setNote(`Queue play failed: ${String(e)}`);
   }
@@ -463,7 +542,8 @@ async function nextTrack() {
     if (q) {
       queueTracks = q.tracks;
       queueCurrent = q.current;
-      setNote(`Track ${(q.current ?? 0) + 1}/${q.tracks.length}`);
+      const name = q.display[q.current ?? 0] ?? "";
+      setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
     } else if (queueTracks.length === 1) {
       // Single track: replay from the top.
       await playIndex(0);
@@ -480,7 +560,8 @@ async function prevTrack() {
     const q = await invoke<QueueDto>("prev_track");
     queueTracks = q.tracks;
     queueCurrent = q.current;
-    setNote(`Track ${(q.current ?? 0) + 1}/${q.tracks.length}`);
+    const name = q.display[q.current ?? 0] ?? "";
+    setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
     setNote(`Prev failed: ${String(e)}`);
   }
@@ -558,11 +639,6 @@ async function setupSeek() {
       /* not playing */
     }
   }, 400);
-}
-
-function trackDurationHint(path: string) {
-  // Duration comes from the backend on play; approximate until then.
-  currentDurationS = 0;
 }
 
 // Reverb panel.
@@ -659,3 +735,253 @@ document
   ?.addEventListener("change", (e) => {
     applyPreset((e.target as HTMLSelectElement).value);
   });
+
+// ---------------------------------------------------------------------------
+// Library (Phase 6): open db, scan, search, playlists, correct names
+// ---------------------------------------------------------------------------
+
+let libOpen = false;
+let libTracks: TrackDto[] = [];
+let libPlaylists: PlaylistDto[] = [];
+let libActivePlaylist: string | null = null;
+let libSelectedIds = new Set<string>();
+
+function libNote(text: string) {
+  const el = $id<HTMLElement>("lib-note");
+  if (el) el.textContent = text;
+}
+
+async function refreshLibraryStatus() {
+  try {
+    const st = await invoke<LibraryStatus>("library_status");
+    libOpen = st.open;
+    const count = $id<HTMLElement>("lib-count");
+    if (count) {
+      count.textContent = st.open ? `${st.track_count} tracks` : "not open";
+    }
+  } catch {
+    /* backend not ready */
+  }
+}
+
+function trackToQueueTrack(t: TrackDto): QueueTrack {
+  return {
+    path: t.path,
+    title: t.title,
+    artist: t.artist,
+    replaygain_track_db: t.replaygain_track_db,
+    replaygain_album_db: t.replaygain_album_db,
+  };
+}
+
+function renderTracks(tracks: TrackDto[]) {
+  libTracks = tracks;
+  const list = $id<HTMLUListElement>("lib-tracks");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const t of tracks) {
+    const li = document.createElement("li");
+    li.className = "lib-track";
+    li.dataset.id = t.id;
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = libSelectedIds.has(t.id);
+    check.addEventListener("change", () => {
+      if (check.checked) libSelectedIds.add(t.id);
+      else libSelectedIds.delete(t.id);
+    });
+
+    const label = document.createElement("button");
+    label.type = "button";
+    label.className = "lib-track-name";
+    label.textContent = t.display;
+    label.title = t.path;
+    label.addEventListener("dblclick", () => playNow([t]));
+
+    const meta = document.createElement("span");
+    meta.className = "lib-track-meta";
+    meta.textContent = [t.album, t.year ? String(t.year) : null, t.format]
+      .filter(Boolean)
+      .join(" · ");
+
+    const dur = document.createElement("span");
+    dur.className = "lib-track-dur";
+    dur.textContent = t.duration_display;
+
+    li.append(check, label, meta, dur);
+    list.appendChild(li);
+  }
+  const count = $id<HTMLElement>("lib-count");
+  if (count) count.textContent = `${tracks.length} tracks`;
+}
+
+async function playNow(tracks: TrackDto[]) {
+  if (!tracks.length) return;
+  queueTracks = tracks.map(trackToQueueTrack);
+  queueCurrent = 0;
+  selectedPath = queueTracks[0].path;
+  try {
+    await invoke("set_queue", { tracks: queueTracks });
+    await invoke("play_queue_index", { index: 0 });
+    refreshQueueButtons();
+    if (btnPlay) btnPlay.disabled = true;
+    setNote(tracks[0].display);
+  } catch (e) {
+    setNote(`Play failed: ${String(e)}`);
+  }
+}
+
+async function loadTracks(query?: string) {
+  try {
+    const tracks = query
+      ? await invoke<TrackDto[]>("search_library", { query })
+      : await invoke<TrackDto[]>("list_tracks");
+    renderTracks(tracks);
+    if (query && !tracks.length) libNote(`No matches for “${query}”.`);
+    else libNote("");
+  } catch (e) {
+    libNote(String(e));
+  }
+}
+
+async function loadPlaylists() {
+  try {
+    libPlaylists = await invoke<PlaylistDto[]>("list_playlists");
+    renderPlaylists();
+  } catch (e) {
+    libNote(String(e));
+  }
+}
+
+function renderPlaylists() {
+  const ul = $id<HTMLUListElement>("lib-playlist-list");
+  if (!ul) return;
+  ul.innerHTML = "";
+  for (const pl of libPlaylists) {
+    const li = document.createElement("li");
+    li.dataset.id = pl.id;
+    if (pl.id === libActivePlaylist) li.classList.add("active");
+
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "lib-pl-name";
+    name.textContent = `${pl.name} (${pl.track_count})`;
+    name.addEventListener("click", async () => {
+      libActivePlaylist = pl.id;
+      renderPlaylists();
+      try {
+        const tracks = await invoke<TrackDto[]>("playlist_tracks", {
+          playlistId: pl.id,
+        });
+        renderTracks(tracks);
+      } catch (e) {
+        libNote(String(e));
+      }
+    });
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "lib-pl-del";
+    del.title = "Delete playlist";
+    del.textContent = "×";
+    del.addEventListener("click", async () => {
+      try {
+        await invoke("delete_playlist", { playlistId: pl.id });
+        if (libActivePlaylist === pl.id) {
+          libActivePlaylist = null;
+          await loadTracks();
+        }
+        await loadPlaylists();
+      } catch (e) {
+        libNote(String(e));
+      }
+    });
+
+    li.append(name, del);
+    ul.appendChild(li);
+  }
+}
+
+function setupLibrary() {
+  $id<HTMLButtonElement>("lib-open")?.addEventListener("click", async () => {
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: "Aurora library", extensions: ["db"] }],
+    });
+    const path = typeof picked === "string" ? picked : null;
+    if (!path) return;
+    try {
+      const st = await invoke<LibraryStatus>("open_library", { path });
+      libOpen = st.open;
+      libNote(st.open ? `Library: ${st.path}` : "Failed to open library");
+      await refreshLibraryStatus();
+      await loadTracks();
+      await loadPlaylists();
+    } catch (e) {
+      libNote(String(e));
+    }
+  });
+
+  $id<HTMLButtonElement>("lib-scan")?.addEventListener("click", async () => {
+    if (!libOpen) {
+      libNote("Open a library (.db) first.");
+      return;
+    }
+    const picked = await open({ multiple: false, directory: true });
+    const root = typeof picked === "string" ? picked : null;
+    if (!root) return;
+    libNote("Scanning…");
+    try {
+      const summary = await invoke<ScanSummary>("scan_folder", { root });
+      libNote(
+        `Scanned: ${summary.discovered} found, ${summary.added} added, ` +
+          `${summary.updated} updated, ${summary.pruned} removed` +
+          (summary.failed ? `, ${summary.failed} failed` : ""),
+      );
+      await refreshLibraryStatus();
+      await loadTracks();
+      await loadPlaylists();
+    } catch (e) {
+      libNote(String(e));
+    }
+  });
+
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  $id<HTMLInputElement>("lib-search")?.addEventListener("input", (e) => {
+    const q = (e.target as HTMLInputElement).value.trim();
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      if (!libOpen) {
+        libNote("Open a library first.");
+        return;
+      }
+      loadTracks(q || undefined);
+    }, 250);
+  });
+
+  $id<HTMLButtonElement>("pl-new")?.addEventListener("click", async () => {
+    if (!libOpen) return;
+    const name = prompt("Playlist name");
+    if (!name) return;
+    try {
+      await invoke("create_playlist", { name });
+      await loadPlaylists();
+    } catch (e) {
+      libNote(String(e));
+    }
+  });
+}
+
+// Double-click a track row plays it now; buttons below act on selection.
+function setupLibraryActions() {
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const sel = libTracks.filter((t) => libSelectedIds.has(t.id));
+    if (sel.length) playNow(sel);
+  });
+}
+
+setupLibrary();
+setupLibraryActions();
+refreshLibraryStatus();

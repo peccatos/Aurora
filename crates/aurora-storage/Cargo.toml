@@ -6,11 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 aurora-core.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 [lints]

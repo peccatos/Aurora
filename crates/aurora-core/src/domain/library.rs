@@ -32,15 +32,26 @@ impl TrackId {
 }
 
 /// A music file in the library, identified by content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub path: String,
     pub title: Option<String>,
     pub artist: Option<Artist>,
     pub album: Option<Album>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
+    /// Position on the album (1-based), when tagged.
+    pub track_number: Option<u32>,
     pub format: AudioFormat,
     pub duration_ms: Option<u64>,
+    /// ReplayGain track gain tag in dB, when present.
+    ///
+    /// Read from tags by the metadata layer (Phase 6); consumed by the DSP
+    /// pipeline when the user enables ReplayGain normalization.
+    pub replaygain_track_db: Option<f64>,
+    /// ReplayGain album gain tag in dB, when present.
+    pub replaygain_album_db: Option<f64>,
 }
 
 impl Track {
@@ -55,10 +66,45 @@ impl Track {
             title: None,
             artist: None,
             album: None,
+            genre: None,
+            year: None,
+            track_number: None,
             format: AudioFormat::Unknown,
             duration_ms: None,
+            replaygain_track_db: None,
+            replaygain_album_db: None,
         }
     }
+
+    /// The name a UI should display for this track ("correct names" rule):
+    /// the tagged title, or — for untagged files — the file stem, never the
+    /// full raw path and never a synthetic placeholder.
+    pub fn display_title(&self) -> &str {
+        self.title.as_deref().unwrap_or_else(|| {
+            let p = self.path.as_str();
+            let stem_start = p.rfind(['/', '\\']).map_or(0, |i| i + 1);
+            let stem_end = p.rfind('.').filter(|&i| i > stem_start).unwrap_or(p.len());
+            &p[stem_start..stem_end]
+        })
+    }
+
+    /// One-line label: "Artist — Title" or just the title when untagged.
+    pub fn display_line(&self) -> String {
+        match &self.artist {
+            Some(a) => format!("{} — {}", a.name, self.display_title()),
+            None => self.display_title().to_string(),
+        }
+    }
+}
+
+/// A saved, named, ordered list of library tracks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Playlist {
+    /// Stable identifier (UUID string form).
+    pub id: String,
+    pub name: String,
+    /// Number of tracks in the playlist (denormalized for list views).
+    pub track_count: u64,
 }
 
 /// A performing artist. Identity by name for now; storage may promote to a

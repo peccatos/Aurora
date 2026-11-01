@@ -12,5 +12,5 @@ pub use audio::{
     AudioFormat, AudioTransformation, ChannelLayout, OutputDiagnostics, OutputIntegrity, PcmFormat,
     SampleFormat,
 };
-pub use library::{Album, Artist, Track, TrackId};
+pub use library::{Album, Artist, Playlist, Track, TrackId};
 pub use playback::{PlaybackMode, PlaybackState};

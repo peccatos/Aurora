@@ -178,6 +178,24 @@ impl PlaybackEngine {
         device: &OutputDevice,
         dsp: aurora_dsp::DspConfig,
     ) -> Result<(), EngineError> {
+        self.play_with_replaygain(path, device, dsp, None)
+    }
+
+    /// Like [`play`], with ReplayGain tags from the library (Phase 6).
+    ///
+    /// The tags feed the pipeline's loudness normalization when the user
+    /// enables ReplayGain; `None` tags simply leave normalization inert.
+    pub fn play_with_replaygain(
+        &mut self,
+        path: PathBuf,
+        device: &OutputDevice,
+        dsp: aurora_dsp::DspConfig,
+        replaygain_tags: Option<(f64, Option<f64>)>,
+    ) -> Result<(), EngineError> {
+        // Track mode uses the track tag; album mode falls back to the
+        // track tag when no album tag exists (single-file "albums").
+        let rg_track_db = replaygain_tags.map(|(t, _)| t);
+        let rg_album_db = replaygain_tags.and_then(|(_, a)| a);
         if self.state() == EngineState::Playing {
             return Err(EngineError::AlreadyPlaying);
         }
@@ -227,7 +245,7 @@ impl PlaybackEngine {
                     &dsp,
                     source_format,
                     rate_target,
-                    None, // ReplayGain tag lookup arrives with the library phase.
+                    rg_tag_for_mode(&dsp, rg_track_db, rg_album_db),
                 )
                 .map_err(EngineError::from)?,
             )
@@ -310,7 +328,7 @@ impl PlaybackEngine {
                             &new_cfg,
                             source_format,
                             rate_target,
-                            None,
+                            rg_tag_for_mode(&new_cfg, rg_track_db, rg_album_db),
                         ) {
                             Ok(new_pl) => {
                                 tracing::info!("dsp recompiled live");
@@ -724,4 +742,19 @@ impl From<aurora_dsp::DspError> for EngineError {
     fn from(err: aurora_dsp::DspError) -> Self {
         EngineError::Internal(err.to_string())
     }
+}
+
+/// ReplayGain tag selection for the active mode (see DspConfig::replaygain).
+fn rg_tag_for_mode(
+    config: &aurora_dsp::DspConfig,
+    track_db: Option<f64>,
+    album_db: Option<f64>,
+) -> Option<f32> {
+    use aurora_dsp::ReplayGainModeDef;
+    match config.replaygain {
+        ReplayGainModeDef::Off => None,
+        ReplayGainModeDef::Track => track_db,
+        ReplayGainModeDef::Album => album_db.or(track_db),
+    }
+    .map(|v| v as f32)
 }

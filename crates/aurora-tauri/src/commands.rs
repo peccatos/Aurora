@@ -21,17 +21,59 @@ pub struct AppState {
     pub dsp: std::sync::Mutex<aurora_dsp::DspConfig>,
     /// Playback queue with the current index.
     pub queue: std::sync::Mutex<TrackQueue>,
+    /// Track library (SQLite + scanner). Async by nature: scanning and
+    /// queries run on the tokio runtime, never blocking the UI thread.
+    /// None until `open_library` runs.
+    pub library: tokio::sync::Mutex<Option<aurora_library::LibraryService>>,
+    /// Library database path (None = library not opened yet).
+    pub library_path_slot: std::sync::Mutex<Option<PathBuf>>,
+}
+
+/// One queue entry: the path plus what the engine needs from the library
+/// (ReplayGain tags) and what the UI shows (display name).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueTrack {
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub replaygain_track_db: Option<f64>,
+    #[serde(default)]
+    pub replaygain_album_db: Option<f64>,
+}
+
+impl QueueTrack {
+    /// Display label: "Artist — Title" with file-stem fallback.
+    pub fn display_line(&self) -> String {
+        let title = self
+            .title
+            .as_deref()
+            .unwrap_or_else(|| file_stem(&self.path));
+        match &self.artist {
+            Some(a) if !a.is_empty() => format!("{a} — {title}"),
+            _ => title.to_string(),
+        }
+    }
+}
+
+/// File stem of a path (both separators, no extension).
+fn file_stem(path: &str) -> &str {
+    let start = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let end = path.rfind('.').filter(|&i| i > start).unwrap_or(path.len());
+    &path[start..end]
 }
 
 /// The user's playback queue.
 #[derive(Default)]
 pub struct TrackQueue {
-    pub tracks: Vec<String>,
+    pub tracks: Vec<QueueTrack>,
     pub current: Option<usize>,
 }
 
 impl TrackQueue {
-    fn next(&mut self) -> Option<String> {
+    fn next(&mut self) -> Option<QueueTrack> {
         let idx = self.current? + 1;
         if idx >= self.tracks.len() {
             return None;
@@ -40,7 +82,7 @@ impl TrackQueue {
         self.tracks.get(idx).cloned()
     }
 
-    fn prev(&mut self) -> Option<String> {
+    fn prev(&mut self) -> Option<QueueTrack> {
         let idx = self.current?;
         if idx == 0 {
             return self.tracks.first().cloned();
@@ -56,6 +98,8 @@ impl AppState {
             engine: Mutex::new(PlaybackEngine::new()),
             dsp: std::sync::Mutex::new(aurora_dsp::DspConfig::default()),
             queue: std::sync::Mutex::new(TrackQueue::default()),
+            library: tokio::sync::Mutex::new(None),
+            library_path_slot: std::sync::Mutex::new(None),
         }
     }
 }
@@ -64,6 +108,288 @@ impl Default for AppState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Library commands (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Track as the frontend sees it: display fields + what playback needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackDto {
+    pub id: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
+    pub track_number: Option<u32>,
+    pub format: String,
+    pub duration_ms: Option<u64>,
+    pub replaygain_track_db: Option<f64>,
+    pub replaygain_album_db: Option<f64>,
+    /// "Artist - Title" (file stem when untagged): the correct name.
+    pub display: String,
+    /// Duration formatted "m:ss" for list rows.
+    pub duration_display: String,
+}
+
+impl TrackDto {
+    fn from_track(t: &aurora_core::Track) -> Self {
+        let duration_display = t
+            .duration_ms
+            .map(|ms| {
+                let sec = ms / 1000;
+                format!("{}:{:02}", sec / 60, sec % 60)
+            })
+            .unwrap_or_default();
+        Self {
+            id: t.id.0.to_string(),
+            path: t.path.clone(),
+            title: t.title.clone(),
+            artist: t.artist.as_ref().map(|a| a.name.clone()),
+            album: t.album.as_ref().map(|a| a.title.clone()),
+            genre: t.genre.clone(),
+            year: t.year,
+            track_number: t.track_number,
+            format: format!("{:?}", t.format).to_lowercase(),
+            duration_ms: t.duration_ms,
+            replaygain_track_db: t.replaygain_track_db,
+            replaygain_album_db: t.replaygain_album_db,
+            display: t.display_line(),
+            duration_display,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct LibraryStatus {
+    pub open: bool,
+    pub path: Option<String>,
+    pub track_count: u64,
+}
+
+#[tauri::command]
+pub async fn library_status(state: State<'_, AppState>) -> Result<LibraryStatus, CommandError> {
+    let count = {
+        let slot = state.library.lock().await;
+        match slot.as_ref() {
+            Some(lib) => aurora_storage::track_count(lib.pool())
+                .await
+                .map_err(CommandError::from)?,
+            None => 0,
+        }
+    };
+    let path = state
+        .library_path_slot
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .as_ref()
+        .map(|p| p.display().to_string());
+    Ok(LibraryStatus {
+        open: path.is_some(),
+        path,
+        track_count: count,
+    })
+}
+
+/// Open (or create) the library database at `path` (a .db file).
+#[tauri::command]
+pub async fn open_library(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<LibraryStatus, CommandError> {
+    let service = aurora_library::LibraryService::open(std::path::Path::new(&path))
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })?;
+    let count = aurora_storage::track_count(service.pool())
+        .await
+        .map_err(CommandError::from)?;
+    let mut slot = state.library.lock().await;
+    *slot = Some(service);
+    *state
+        .library_path_slot
+        .lock()
+        .map_err(|_| CommandError::Poisoned)? = Some(PathBuf::from(&path));
+    Ok(LibraryStatus {
+        open: true,
+        path: Some(path),
+        track_count: count,
+    })
+}
+
+/// Scan a folder into the library. Returns the honest scan summary.
+#[tauri::command]
+pub async fn scan_folder(
+    root: String,
+    state: State<'_, AppState>,
+) -> Result<aurora_library::ScanSummary, CommandError> {
+    let library = state.library.lock().await;
+    let summary = library
+        .as_ref()
+        .ok_or(CommandError::LibraryNotOpen)?
+        .scan_folder(std::path::Path::new(&root))
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })?;
+    drop(library);
+    Ok(summary)
+}
+
+/// All library tracks (ordered artist/album/track).
+#[tauri::command]
+pub async fn list_tracks(state: State<'_, AppState>) -> Result<Vec<TrackDto>, CommandError> {
+    let library = state.library.lock().await;
+    let tracks = library
+        .as_ref()
+        .ok_or(CommandError::LibraryNotOpen)?
+        .tracks()
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })?;
+    drop(library);
+    Ok(tracks.iter().map(TrackDto::from_track).collect())
+}
+
+/// Case-insensitive search over title/artist/album/file name.
+#[tauri::command]
+pub async fn search_library(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TrackDto>, CommandError> {
+    let library = state.library.lock().await;
+    let tracks = library
+        .as_ref()
+        .ok_or(CommandError::LibraryNotOpen)?
+        .search(&query)
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })?;
+    drop(library);
+    Ok(tracks.iter().map(TrackDto::from_track).collect())
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaylistDto {
+    pub id: String,
+    pub name: String,
+    pub track_count: u64,
+}
+
+#[tauri::command]
+pub async fn list_playlists(state: State<'_, AppState>) -> Result<Vec<PlaylistDto>, CommandError> {
+    let library = state.library.lock().await;
+    let playlists = {
+        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+        aurora_storage::all_playlists(lib.pool())
+            .await
+            .map_err(|e| CommandError::Library {
+                message: e.to_string(),
+            })?
+    };
+    Ok(playlists
+        .into_iter()
+        .map(|p| PlaylistDto {
+            id: p.id,
+            name: p.name,
+            track_count: p.track_count,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn create_playlist(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<PlaylistDto, CommandError> {
+    let library = state.library.lock().await;
+    let id = {
+        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+        aurora_storage::create_playlist(lib.pool(), &name)
+            .await
+            .map_err(|e| CommandError::Library {
+                message: e.to_string(),
+            })?
+    };
+    Ok(PlaylistDto {
+        id,
+        name,
+        track_count: 0,
+    })
+}
+
+#[tauri::command]
+pub async fn rename_playlist(
+    playlist_id: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let library = state.library.lock().await;
+    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    aurora_storage::rename_playlist(lib.pool(), &playlist_id, &new_name)
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })
+}
+
+#[tauri::command]
+pub async fn delete_playlist(
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let library = state.library.lock().await;
+    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    aurora_storage::delete_playlist(lib.pool(), &playlist_id)
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })
+}
+
+/// Set playlist contents (track ids, order preserved).
+#[tauri::command]
+pub async fn set_playlist_tracks(
+    playlist_id: String,
+    track_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let library = state.library.lock().await;
+    let ids: Vec<aurora_core::TrackId> = track_ids
+        .iter()
+        .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+        .map(aurora_core::TrackId)
+        .collect();
+    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    aurora_storage::set_playlist_tracks(lib.pool(), &playlist_id, &ids)
+        .await
+        .map_err(|e| CommandError::Library {
+            message: e.to_string(),
+        })
+}
+
+/// Playlist tracks as full DTOs, in saved order.
+#[tauri::command]
+pub async fn playlist_tracks(
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TrackDto>, CommandError> {
+    let library = state.library.lock().await;
+    let tracks = {
+        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+        aurora_storage::playlist_tracks(lib.pool(), &playlist_id)
+            .await
+            .map_err(|e| CommandError::Library {
+                message: e.to_string(),
+            })?
+    };
+    Ok(tracks.iter().map(TrackDto::from_track).collect())
 }
 
 #[tauri::command]
@@ -154,6 +480,11 @@ pub struct PlayRequest {
     /// DSP configuration for this stream; defaults to bypassed.
     #[serde(default)]
     pub dsp: aurora_dsp::DspConfig,
+    /// ReplayGain tags for this track (from the library), when known.
+    #[serde(default)]
+    pub replaygain_track_db: Option<f64>,
+    #[serde(default)]
+    pub replaygain_album_db: Option<f64>,
 }
 
 #[tauri::command]
@@ -180,7 +511,10 @@ pub fn play_track(
     } else {
         request.dsp
     };
-    engine.play(PathBuf::from(&request.path), &device, dsp)?;
+    let rg = request
+        .replaygain_track_db
+        .map(|t| (t, request.replaygain_album_db));
+    engine.play_with_replaygain(PathBuf::from(&request.path), &device, dsp, rg)?;
     Ok(status_of(&engine))
 }
 
@@ -196,31 +530,41 @@ pub fn get_dsp(state: State<AppState>) -> Result<aurora_dsp::DspConfig, CommandE
 
 #[derive(Debug, Serialize)]
 pub struct QueueDto {
-    tracks: Vec<String>,
+    tracks: Vec<QueueTrack>,
     current: Option<usize>,
+    /// "Artist — Title" per entry, in order (the UI's correct names).
+    display: Vec<String>,
+}
+
+fn queue_dto(queue: &TrackQueue) -> QueueDto {
+    QueueDto {
+        display: queue.tracks.iter().map(|t| t.display_line()).collect(),
+        tracks: queue.tracks.clone(),
+        current: queue.current,
+    }
 }
 
 #[tauri::command]
-pub fn set_queue(tracks: Vec<String>, state: State<AppState>) -> Result<QueueDto, CommandError> {
+pub fn set_queue(
+    tracks: Vec<QueueTrack>,
+    state: State<AppState>,
+) -> Result<QueueDto, CommandError> {
     let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
     queue.tracks = tracks;
     queue.current = None;
-    Ok(QueueDto {
-        tracks: queue.tracks.clone(),
-        current: queue.current,
-    })
+    Ok(queue_dto(&queue))
 }
 
 #[tauri::command]
 pub fn get_queue(state: State<AppState>) -> Result<QueueDto, CommandError> {
     let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(QueueDto {
-        tracks: queue.tracks.clone(),
-        current: queue.current,
-    })
+    Ok(queue_dto(&queue))
 }
 
-fn start_track_at(path: &str, state: &State<AppState>) -> Result<PlaybackStatus, CommandError> {
+fn start_track_at(
+    track: &QueueTrack,
+    state: &State<AppState>,
+) -> Result<PlaybackStatus, CommandError> {
     let device = aurora_audio::default_output_device()?;
     let dsp = state
         .dsp
@@ -229,7 +573,10 @@ fn start_track_at(path: &str, state: &State<AppState>) -> Result<PlaybackStatus,
         .clone();
     let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
     engine.stop();
-    engine.play(std::path::PathBuf::from(path), &device, dsp)?;
+    let rg = track
+        .replaygain_track_db
+        .map(|t| (t, track.replaygain_album_db));
+    engine.play_with_replaygain(std::path::PathBuf::from(&track.path), &device, dsp, rg)?;
     Ok(status_of(&engine))
 }
 
@@ -238,33 +585,30 @@ pub fn play_queue_index(
     index: usize,
     state: State<AppState>,
 ) -> Result<PlaybackStatus, CommandError> {
-    let path = {
+    let track = {
         let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-        let path = queue
+        let track = queue
             .tracks
             .get(index)
             .cloned()
             .ok_or_else(|| CommandError::Device(format!("queue index {index} out of range")))?;
         queue.current = Some(index);
-        path
+        track
     };
-    start_track_at(&path, &state)
+    start_track_at(&track, &state)
 }
 
 #[tauri::command]
 pub fn next_track(state: State<AppState>) -> Result<Option<QueueDto>, CommandError> {
-    let path = {
+    let track = {
         let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
         queue.next()
     };
-    match path {
-        Some(p) => {
-            start_track_at(&p, &state)?;
+    match track {
+        Some(t) => {
+            start_track_at(&t, &state)?;
             let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-            Ok(Some(QueueDto {
-                tracks: queue.tracks.clone(),
-                current: queue.current,
-            }))
+            Ok(Some(queue_dto(&queue)))
         }
         None => {
             let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
@@ -276,17 +620,14 @@ pub fn next_track(state: State<AppState>) -> Result<Option<QueueDto>, CommandErr
 
 #[tauri::command]
 pub fn prev_track(state: State<AppState>) -> Result<QueueDto, CommandError> {
-    let path = {
+    let track = {
         let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
         queue.prev()
     };
-    let path = path.ok_or_else(|| CommandError::Device("empty queue".into()))?;
-    start_track_at(&path, &state)?;
+    let track = track.ok_or_else(|| CommandError::Device("empty queue".into()))?;
+    start_track_at(&track, &state)?;
     let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(QueueDto {
-        tracks: queue.tracks.clone(),
-        current: queue.current,
-    })
+    Ok(queue_dto(&queue))
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +740,17 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             app_version,
             app_name,
             playback_modes,
+            library_status,
+            open_library,
+            scan_folder,
+            list_tracks,
+            search_library,
+            list_playlists,
+            create_playlist,
+            rename_playlist,
+            delete_playlist,
+            set_playlist_tracks,
+            playlist_tracks,
             list_output_devices,
             playback_status,
             playback_position,

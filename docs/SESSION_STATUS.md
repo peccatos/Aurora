@@ -1,6 +1,6 @@
 # Aurora — сводка состояния проекта
 
-_Дата: 1 ноября 2026. Полный отчёт для продолжения в новом окне._
+_Дата: 1 ноября 2026 (обновлено после Phase 6). Полный отчёт для продолжения в новом окне._
 
 ## Что такое Aurora
 
@@ -16,35 +16,28 @@ Rust + Tauri 2 + TypeScript. Windows/Linux/macOS.
 ## Архитектура (Cargo workspace, 9 крейтов)
 
 ```
-aurora-core     — домен: PcmFormat (SampleFormat+ChannelLayout!), TrackId
-                  (контент-хеш), AudioTransformation, OutputIntegrity,
-                  AudioFormat (lossless/lossy), EQ/Reverb/DSP конфиги
-aurora-decoder  — Symphonia. ВАЖНО: формат берётся из РЕАЛЬНОГО
-                  декодированного буфера (F32 для MP3/FLAC/Vorbis!),
-                  не из параметров кодека — это фиксило белый шум.
-                  Seek (accurate mode), bounded skip corrupt packets
-aurora-dsp      — biquad EQ (f64, Audio EQ Cookbook), 10-band parametric,
-                  Freeverb reverb (8 comb + 4 allpass), Gain/ReplayGain,
-                  TPDF dither, rubato FFT resampler, speed (0.5–2.0x),
-                  DspPipeline: EQ -> Reverb -> ReplayGain -> volume ->
-                  resample. Bypass identity бит-точный, всё серилизуемо
-aurora-audio    — движок: decoder worker -> SPSC ring (1MB) -> CPAL
-                  callback (ноль аллокаций/блокировок). Live-DSP:
-                  version-счётчик, worker перекомпилирует pipeline на
-                  лету + DRAIN старого буфера (мгновенное применение
-                  пресетов). Пауза стопит worker (иначе back-pressure
-                  пинит его навсегда). WASAPI exclusive probe
-                  (exclusive.rs), loopback-verification математика
-aurora-tauri    — команды: устройства, play/pause/resume/stop/seek/
-                  next/prev/queue/shuffle, get_dsp/set_dsp (live!),
-                  playback_status (integrity+duration+transforms),
-                  probe_exclusive
-aurora-storage  — заглушка (Phase 6)
-aurora-library  — заглушка (Phase 6)
+aurora-core     — домен: PcmFormat, TrackId (контент-хеш), Track (+genre/
+                  year/track_no/ReplayGain, display_title/display_line),
+                  Playlist, AudioTransformation, OutputIntegrity
+aurora-decoder  — Symphonia; формат из РЕАЛЬНОГО буфера (F32 для MP3/FLAC!)
+aurora-dsp      — EQ (10-band), Freeverb, Gain/ReplayGain, TPDF dither,
+                  resampler, speed; DspPipeline, live-рекомпиляция
+aurora-audio    — движок: worker -> SPSC ring (1MB) -> CPAL; live-DSP,
+                  пауза/seek; play_with_replaygain(теги из библиотеки)
+aurora-metadata — lofty: title/artist/album/genre/year/track, duration,
+                  ReplayGain-парсер ("−6.5 dB" / "−6.5", мусор→None)
+aurora-storage  — SQLite (sqlx 0.9, WAL, миграции), upsert по TrackId
+                  (идемпотентность rescan!), search, prune, плейлисты,
+                  blake3 content_digest
+aurora-library  — LibraryService: scan_folder (walkdir→digest→метаданные→
+                  upsert→prune, honest ScanSummary), search, async-мьютекс
+                  на сканы, spawn_blocking на метаданные
+aurora-tauri    — команды: движок + очередь (QueueTrack с RG-тегами и
+                  display-именами) + 10 библиотечных команд
 aurora-app      — composition root
-apps/desktop    — Tauri бинарник, capabilities (core+dialog:allow-open)
-frontend/       — TypeScript+Vite. UI: плеер с очередью, seek-бар,
-                  10-band EQ с 8 пресетами, reverb+speed панель
+apps/desktop    — Tauri бинарник
+frontend/       — плеер + EQ + reverb/speed + ПАНЕЛЬ LIBRARY (скан, поиск,
+                  плейлисты, корректные имена)
 ```
 
 ## Фазы (по ROADMAP.md)
@@ -59,81 +52,75 @@ frontend/       — TypeScript+Vite. UI: плеер с очередью, seek-б
 | 5 Output integrity | ✅ честная классификация + WASAPI
   exclusive probe (Realtek: 16/24-bit YES) + loopback-математика.
   Полный exclusive-стрим и физ. loopback — следующий слой |
-| 6 Library+SQLite | ⬜ СЛЕДУЮЩАЯ: база треков, сканирование,
-  метаданные (lofty), плейлисты, корректные имена |
-| 7 Desktop product | ⬜ |
+| 6 Library+SQLite | ✅ СВЕРШИЛОСЬ: сканер, метаданные (lofty),
+  идемпотентный rescan (контент-хеш → TrackId), поиск, плейлисты,
+  корректные имена (display_title/display_line), ReplayGain-теги до DSP.
+  ADR 0003 написан |
+| 7 Desktop product | ⬜ СЛЕДУЮЩАЯ |
 | 8 Hardening | ⬜ |
 | 9 VST3 host (post-1.0) | задокументирован в ROADMAP |
 
 ## Ключевые баги, которые мы поймали и починили (уроки!)
 
-1. **Белый шум #1**: negotiate брал sample format первый из enum (U8!),
-   worker пушал S16-байты → переинтерпретация wire-формата. Фикс:
-   `wire_compatible()` — совпадение семейства И битовой ширины.
+1. **Белый шум #1**: negotiate брал sample format первый из enum (U8!).
+   Фикс: `wire_compatible()` — совпадение семейства И битовой ширины.
 2. **Белый шум #2 (главный)**: symphonia декодит MP3/FLAC в **F32**-буферы,
-   а формат брался из параметров кодека (None → дефолт S16). PcmChunk нёс
-   F32-байты с меткой S16. Фикс: формат из фактического варианта буфера,
-   probe-чанк буферизуется. **Урок: формат бери из реального буфера.**
-3. **Задержка пресетов**: ring 8MB = ~46 сек старой обработки в буфере.
-   Фикс: ring 1MB + drain-флаг при рекомпиляции.
-4. **Worker-пиннинг на паузе**: back-pressure цикл крутился вечно (ring
-   полон, колбэк стоит), DSP/seek мертвы. Фикс: paused-флаг + bounded waits.
-5. **Play вместо Resume**: кнопка Play рестартила трек после паузы.
+   а формат брался из параметров кодека (None → дефолт S16). **Урок:
+   формат бери из реального буфера.**
+3. **Задержка пресетов**: ring 8MB = ~46 сек старой обработки. Фикс:
+   ring 1MB + drain-флаг.
+4. **Worker-пиннинг на паузе**: back-pressure цикл крутился вечно. Фикс:
+   paused-флаг + bounded waits.
+5. **Play вместо Resume**.
+6. **Два одинаковых WAV в тесте сканера = один трек**: контент-хеш
+   действительно делает то, что обещает — тест-файлы должны отличаться.
 
 ## Фронтенд-структура (frontend/src/main.ts)
 
-- `PlaybackStatus {state, sample_rate, channels, bits, transformations,
-  integrity, duration_s, frames_played, underruns}`
-- `DspConfig {eq:{bands[10],preamp_db}, volume_db, replaygain, reverb,
-  speed}` — всё через `get_dsp`/`set_dsp` (применяется live)
-- Очередь: `set_queue`/`next_track`/`prev_track`/`play_queue_index`,
-  shuffle = Fisher-Yates на фронте
-- Пресеты EQ: EQ_PRESETS (flat/bass/vocal/rock/jazz/electronic/classical/
-  night); Speed кнопки: Slowed (0.8x) / Speed Up (1.25x)
-- Poll статуса 500ms, позиция 400ms, авто-advance в конце трека
+- Плеер: PlaybackStatus, DspConfig (get_dsp/set_dsp live), очередь
+  `QueueTrack[]` (path + title/artist + RG-теги), seek, shuffle
+- **Библиотека (новое)**: `open_library` (диалог .db) → `scan_folder`
+  (диалог папки, honest summary) → `list_tracks`/`search_library`
+  (debounce 250ms) → чекбоксы → Enter = играть выбранное; плейлисты
+  (создать/открыть/удалить), `display` = "Artist — Title" со
+  stem-fallback
+- Пресеты EQ (8), Speed кнопки (Slowed 0.8x / Speed Up 1.25x)
+- Poll статуса 500ms, позиция 400ms, авто-advance
 
 ## Команды запуска/валидации
 
 ```bash
-# Валидация
+# Валидация (всё зелёное на коммите Phase 6)
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+cd frontend && npx tsc --noEmit && npm run build
 
 # Запуск (vite должен слушать 127.0.0.1:1420)
 cd frontend && npm run dev      # отдельный терминал
 cd apps/desktop && TAURI_DEV="true" cargo run
-
-# Диагностика движка на реальном файле
-cargo run --example diag_engine -p aurora-audio -- "C:\...\трек.mp3"
 ```
 
 ## Правила для агента (CLAUDE.md в корне!)
 
-После инцидента со сжиганием ~100М токенов на повторах падающих команд —
-в корне проекта лежит **CLAUDE.md** с железными правилами:
 - максимум 2 попытки одной команды, потом смена подхода
 - сложные команды → Write в файл-скрипт → запуск одним вызовом
 - EOF/syntax error = сломан вызов, НЕ проект
 - повторяешься 3-й раз → СТОП и скажи пользователю
 
-## Что делать дальше (приоритеты пользователя)
+## Что делать дальше (приоритеты)
 
-Пользователь просит «идеальную фазу 4+»: реверб, EQ, перемотки, shuffle,
-база треков, плейлисты, корректные имена, VST.
-
-1. **Phase 6: Library + SQLite** (следующая по плану): sqlx 0.9 (уже в
-   deps, features: runtime-tokio, tls-rustls, sqlite...), сканер папки
-   (walkdir), метаданные через lofty (уже в deps), TrackId контент-хеш,
-   плейлисты, поиск. Это даст «базу треков» и «корректные имена».
+1. **Phase 7: Desktop product** — UI как тонкий клиент бэкенда: queue UI
+   на QueueTrack, настройки (device selection persistence), автозагрузка
+   библиотеки из app-data (решение из ADR 0003), типизированный фронтенд-API.
 2. Полный WASAPI exclusive-стрим (поверх probe из Phase 5)
 3. Физический loopback-захват (верификация Verified)
 4. VST3-хост (Phase 9, out-of-process изоляция)
 
 ## Технический долг / известные границы
 
-- Seek: старый буфер доигрывает ~1MB (секунды) перед прыжком —
-  приемлемо, но можно дропать ring при seek
-- ReplayGain: режимы есть, чтение тегов — с Phase 6 (lofty)
+- Seek: старый буфер доигрывает ~1MB перед прыжком
 - Реверб только стерео (моно проходит мимо)
-- Speed + устройство-не-совпало-по-rate: комбинации покрыты тестами,
-  но живых прогонов мало
-- Библиотека/хранение — пустые заглушки
+- ReplayGain: теги читаются и применяются; preamp/clipping-guard —
+  можно улучшить
+- Библиотека: нет watch (изменения папки на лету), нет обложек
+- Плейлисты: нет drag-n-drop переупорядочивания (только порядок
+  сохранения), нет экспорта/импорта

@@ -10,10 +10,13 @@ aurora-core.workspace = true
 aurora-metadata.workspace = true
 aurora-storage.workspace = true
 walkdir.workspace = true
+lofty.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
+hound.workspace = true
 [lints]
 workspace = true

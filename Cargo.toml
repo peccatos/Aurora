@@ -37,6 +37,7 @@ symphonia = { version = "0.6.1", features = ["all"] }
 rubato = "5.0.1"
 ringbuf = "0.6.0"
 lofty = "0.25.5"
+blake3 = "1"
 
 # Runtime / persistence
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }

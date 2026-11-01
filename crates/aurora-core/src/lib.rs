@@ -128,6 +128,42 @@ mod tests {
     }
 
     #[test]
+    fn display_title_prefers_tagged_title_then_file_stem() {
+        let mut tagged = Track::new(TrackId(Uuid::new_v4()), "music/01_song.flac");
+        tagged.title = Some("Real Title".into());
+        assert_eq!(tagged.display_title(), "Real Title");
+
+        let untagged = Track::new(TrackId(Uuid::new_v4()), "music/01_song.flac");
+        assert_eq!(untagged.display_title(), "01_song");
+
+        // Windows separators, no extension, no stem at all: all safe.
+        let win = Track::new(TrackId(Uuid::new_v4()), "C:\\Music\\beep");
+        assert_eq!(win.display_title(), "beep");
+        let dot_hidden = Track::new(TrackId(Uuid::new_v4()), ".hidden");
+        assert_eq!(dot_hidden.display_title(), ".hidden");
+    }
+
+    #[test]
+    fn display_line_joins_artist_and_title() {
+        let mut t = Track::new(TrackId(Uuid::new_v4()), "m/a.mp3");
+        t.title = Some("Song".into());
+        t.artist = Some(Artist {
+            name: "Beth".into(),
+        });
+        assert_eq!(t.display_line(), "Beth — Song");
+    }
+
+    #[test]
+    fn track_replaygain_tags_roundtrip() {
+        let mut t = Track::new(TrackId(Uuid::new_v4()), "m/a.mp3");
+        t.replaygain_track_db = Some(-6.5);
+        t.replaygain_album_db = Some(-3.0);
+        let encoded = serde_json::to_string(&t).unwrap();
+        let decoded: Track = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
     fn audio_format_extension_parsing_is_case_insensitive() {
         assert_eq!(AudioFormat::from_extension("flac"), AudioFormat::Flac);
         assert_eq!(AudioFormat::from_extension("FLAC"), AudioFormat::Flac);

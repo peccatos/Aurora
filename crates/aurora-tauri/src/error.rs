@@ -12,6 +12,11 @@ pub enum CommandError {
     },
     #[serde(rename = "device")]
     Device(String),
+    Library {
+        message: String,
+    },
+    #[serde(rename = "library_not_open")]
+    LibraryNotOpen,
 }
 
 impl std::fmt::Display for CommandError {
@@ -20,6 +25,8 @@ impl std::fmt::Display for CommandError {
             CommandError::Poisoned => write!(f, "internal state is poisoned"),
             CommandError::Engine { message } => write!(f, "engine error: {message}"),
             CommandError::Device(key) => write!(f, "device not found: {key}"),
+            CommandError::Library { message } => write!(f, "library error: {message}"),
+            CommandError::LibraryNotOpen => write!(f, "library is not open"),
         }
     }
 }
@@ -29,6 +36,14 @@ impl std::error::Error for CommandError {}
 impl From<aurora_audio::EngineError> for CommandError {
     fn from(err: aurora_audio::EngineError) -> Self {
         CommandError::Engine {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<aurora_storage::StorageError> for CommandError {
+    fn from(err: aurora_storage::StorageError) -> Self {
+        CommandError::Library {
             message: err.to_string(),
         }
     }
