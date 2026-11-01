@@ -29,3 +29,5 @@ apps/desktop/icons/ios/
 # Dependency audit working files
 audit-cache/
 рефы/
+_refconv/
+_refpng/

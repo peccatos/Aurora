@@ -135,51 +135,98 @@ if (!app) {
 }
 
 app.innerHTML = `
-  <main class="shell">
-    <header class="topbar">
-      <img class="brand-mark" src="/logo-128.png" alt="Aurora" width="44" height="44" />
-      <div>
-        <p class="eyebrow">LOCAL AUDIO PLAYER</p>
-        <h1>Aurora</h1>
-      </div>
-      <span class="status"><i></i> PHASE 6 · LIBRARY</span>
-    </header>
-
-    <section class="player">
-      <div class="player-controls">
-        <button id="pick-file" type="button" class="primary">Open file…</button>
-        <select id="device-select" aria-label="Output device"></select>
-        <button id="btn-prev" type="button" disabled>⏮</button>
-        <button id="btn-play" type="button" disabled>▶ Play</button>
-        <button id="btn-pause" type="button" disabled>⏸ Pause</button>
-        <button id="btn-resume" type="button" disabled>⏵ Resume</button>
-        <button id="btn-stop" type="button" disabled>⏹ Stop</button>
-        <button id="btn-next" type="button" disabled>⏭</button>
-        <button id="btn-shuffle" type="button">🔀</button>
-        <button id="btn-bitperfect" type="button" disabled title="Play through WASAPI exclusive mode — no mixer, no DSP, exact source bytes">◎ Bit-perfect</button>
-        <button id="btn-verify" type="button" disabled title="Physically capture what the endpoint rendered and compare byte-for-byte">✓ Verify</button>
-        <span id="bitperfect-note" class="bitperfect-note"></span>
-        <button id="btn-recover" type="button" class="primary" hidden>↻ Recover & Replay</button>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="brand-mark" src="/logo-128.png" alt="Aurora" width="40" height="40" />
+        <div>
+          <p class="eyebrow">LOCAL AUDIO</p>
+          <h1>Aurora</h1>
+        </div>
       </div>
 
-      <div class="seek-row">
-        <span id="seek-cur">0:00</span>
-        <input id="seek" type="range" min="0" max="100" step="0.1" value="0" disabled />
-        <span id="seek-dur">0:00</span>
+      <nav class="nav" id="nav">
+        <button type="button" class="nav-item active" data-panel="now">▸ Now Playing</button>
+        <button type="button" class="nav-item" data-panel="library-panel">Library</button>
+        <button type="button" class="nav-item" data-panel="queue-panel">Queue</button>
+        <button type="button" class="nav-item" data-panel="eq-panel">EQ</button>
+        <button type="button" class="nav-item" data-panel="reverb-panel">Reverb & Speed</button>
+        <button type="button" class="nav-item" data-panel="vst-panel">VST3</button>
+        <button type="button" class="nav-item" data-panel="settings-panel">Settings</button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <span class="lib-count" id="lib-count"></span>
+        <span class="ver">AURORA 0.1.0</span>
       </div>
+    </aside>
 
-      <dl id="signal-path" class="signal-path">
-        <div><dt>State</dt><dd id="st-state">idle</dd></div>
-        <div><dt>Sample rate</dt><dd id="st-rate">—</dd></div>
-        <div><dt>Channels</dt><dd id="st-channels">—</dd></div>
-        <div><dt>Bit depth</dt><dd id="st-bits">—</dd></div>
-        <div><dt>Transformations</dt><dd id="st-transform">—</dd></div>
-        <div><dt>Integrity</dt><dd id="st-integrity">—</dd></div>
-        <div><dt>Frames played</dt><dd id="st-frames">0</dd></div>
-        <div><dt>Underruns</dt><dd id="st-underruns">0</dd></div>
-      </dl>
+    <main class="main">
+      <!-- NOW PLAYING -->
+      <section class="panel active" id="now">
+        <div class="now-playing">
+          <div class="np-art" id="np-art"><span class="np-art-glyph">♪</span></div>
+          <div class="np-info">
+            <p class="eyebrow">NOW PLAYING</p>
+            <h2 id="np-title">Nothing playing</h2>
+            <p class="np-artist" id="np-artist">Open a file or pick from the library</p>
+            <dl id="signal-path" class="signal-path">
+              <div><dt>State</dt><dd id="st-state">idle</dd></div>
+              <div><dt>Sample rate</dt><dd id="st-rate">—</dd></div>
+              <div><dt>Channels</dt><dd id="st-channels">—</dd></div>
+              <div><dt>Bit depth</dt><dd id="st-bits">—</dd></div>
+              <div><dt>Transformations</dt><dd id="st-transform">—</dd></div>
+              <div><dt>Integrity</dt><dd id="st-integrity">—</dd></div>
+              <div><dt>Frames played</dt><dd id="st-frames">0</dd></div>
+              <div><dt>Underruns</dt><dd id="st-underruns">0</dd></div>
+            </dl>
+          </div>
+        </div>
+        <p id="player-note" role="status"></p>
+      </section>
 
-      <div id="eq-panel" class="eq-panel">
+      <!-- LIBRARY -->
+      <section class="panel library" id="library-panel">
+        <div class="eq-head">
+          <span class="eyebrow">LIBRARY · SQLITE</span>
+          <div class="eq-meta">
+            <button id="lib-open" type="button" class="ghost">Open library…</button>
+            <button id="lib-scan" type="button" class="accent">Scan folder…</button>
+            <button id="lib-refresh" type="button" class="ghost">↻ Rescan</button>
+            <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
+            <button id="lib-play-sel" type="button" class="ghost" disabled>▶ Play selected</button>
+            <button id="lib-queue-sel" type="button" class="ghost" disabled>+ Queue</button>
+          </div>
+        </div>
+        <div class="lib-layout">
+          <div class="lib-playlists">
+            <div class="lib-pl-head">
+              <span>PLAYLISTS</span>
+              <button id="pl-new" type="button" class="ghost" title="New playlist">+</button>
+            </div>
+            <ul id="lib-playlist-list"></ul>
+          </div>
+          <div class="lib-tracks-wrap">
+            <ul id="lib-tracks" class="lib-tracks"></ul>
+            <p id="lib-note" class="lib-note"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- QUEUE -->
+      <section class="panel queue-panel" id="queue-panel">
+        <div class="eq-head">
+          <span class="eyebrow">QUEUE</span>
+          <div class="eq-meta">
+            <span id="queue-count" class="lib-count"></span>
+            <button id="queue-clear" type="button" class="ghost">Clear</button>
+          </div>
+        </div>
+        <ul id="queue-list" class="queue-list"></ul>
+      </section>
+
+      <!-- EQ -->
+      <section class="panel eq-panel" id="eq-panel">
         <div class="eq-head">
           <span class="eyebrow">PARAMETRIC EQ · 10 BAND</span>
           <div class="eq-meta">
@@ -200,9 +247,10 @@ app.innerHTML = `
         </div>
         <div id="eq-bands" class="eq-bands"></div>
         <p class="eq-note" id="eq-note">Flat EQ = bit-exact passthrough.</p>
-      </div>
+      </section>
 
-      <div class="reverb-panel">
+      <!-- REVERB & SPEED -->
+      <section class="panel reverb-panel" id="reverb-panel">
         <div class="eq-head">
           <span class="eyebrow">REVERB · FREEVERB</span>
           <button id="reverb-off" type="button" class="ghost">Off</button>
@@ -216,9 +264,10 @@ app.innerHTML = `
           <button id="fx-slowed" type="button" class="ghost">Slowed</button>
           <button id="fx-speedup" type="button" class="ghost">Speed Up</button>
         </div>
-      </div>
+      </section>
 
-      <div class="vst-panel">
+      <!-- VST3 -->
+      <section class="panel vst-panel" id="vst-panel">
         <div class="eq-head">
           <span class="eyebrow">VST3 · OUT-OF-PROCESS CHAIN</span>
           <div class="eq-meta">
@@ -229,56 +278,50 @@ app.innerHTML = `
         </div>
         <ul id="vst-list" class="vst-list"></ul>
         <p class="eq-note">Plugins load into an isolated helper process — a crashing plugin never takes the player down. Active plugins disable bit-perfect (honest report).</p>
-      </div>
+      </section>
 
-      <p id="player-note" role="status"></p>
-    </section>
-
-    <section class="queue-panel">
-      <div class="eq-head">
-        <span class="eyebrow">QUEUE</span>
-        <div class="eq-meta">
-          <span id="queue-count" class="lib-count"></span>
-          <button id="queue-clear" type="button" class="ghost">Clear</button>
+      <!-- SETTINGS -->
+      <section class="panel settings-panel" id="settings-panel">
+        <div class="eq-head">
+          <span class="eyebrow">OUTPUT · DEVICE</span>
         </div>
-      </div>
-      <ul id="queue-list" class="queue-list"></ul>
-    </section>
-
-    <section class="library">
-      <div class="eq-head">
-        <span class="eyebrow">LIBRARY · SQLITE</span>
-        <div class="eq-meta">
-          <button id="lib-open" type="button">Open library…</button>
-          <button id="lib-scan" type="button" class="primary">Scan folder…</button>
-          <button id="lib-refresh" type="button">↻ Rescan</button>
-          <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
-          <button id="lib-play-sel" type="button" disabled>▶ Play selected</button>
-          <button id="lib-queue-sel" type="button" disabled>+ Queue</button>
-          <span id="lib-count" class="lib-count"></span>
+        <div class="settings-controls">
+          <label>Output device <select id="device-select" aria-label="Output device"></select></label>
+          <button id="pick-file" type="button" class="accent">Open file…</button>
+          <button id="btn-bitperfect" type="button" class="ghost" disabled title="Play through WASAPI exclusive mode — no mixer, no DSP, exact source bytes">◎ Bit-perfect</button>
+          <button id="btn-verify" type="button" class="ghost" disabled title="Physically capture what the endpoint rendered and compare byte-for-byte">✓ Verify</button>
+          <span id="bitperfect-note" class="bitperfect-note"></span>
+          <button id="btn-recover" type="button" class="accent" hidden>↻ Recover & Replay</button>
         </div>
-      </div>
+      </section>
+    </main>
+  </div>
 
-      <div class="lib-layout">
-        <div class="lib-playlists">
-          <div class="lib-pl-head">
-            <span>PLAYLISTS</span>
-            <button id="pl-new" type="button" class="ghost" title="New playlist">+</button>
-          </div>
-          <ul id="lib-playlist-list"></ul>
-        </div>
-        <div class="lib-tracks-wrap">
-          <ul id="lib-tracks" class="lib-tracks"></ul>
-          <p id="lib-note" class="lib-note"></p>
-        </div>
+  <footer class="playbar">
+    <div class="pb-now">
+      <span class="pb-title" id="pb-title">Aurora</span>
+      <span class="pb-artist" id="pb-artist"></span>
+    </div>
+    <div class="pb-center">
+      <div class="pb-controls">
+        <button id="btn-shuffle" type="button" class="pb-btn" title="Shuffle">⇄</button>
+        <button id="btn-prev" type="button" class="pb-btn" disabled title="Previous">⏮</button>
+        <button id="btn-play" type="button" class="pb-btn pb-main" disabled title="Play">▶</button>
+        <button id="btn-pause" type="button" class="pb-btn" disabled title="Pause">⏸</button>
+        <button id="btn-stop" type="button" class="pb-btn" disabled title="Stop">⏹</button>
+        <button id="btn-next" type="button" class="pb-btn" disabled title="Next">⏭</button>
       </div>
-    </section>
-
-    <footer>
-      <span>AURORA 0.1.0</span>
-      <span>PLAYBACK ENGINE</span>
-    </footer>
-  </main>
+      <div class="seek-row">
+        <span id="seek-cur">0:00</span>
+        <input id="seek" type="range" min="0" max="100" step="0.1" value="0" disabled />
+        <span id="seek-dur">0:00</span>
+      </div>
+    </div>
+    <div class="pb-right">
+      <span class="pb-state" id="st-state-mini"></span>
+      <span class="pb-int" id="st-integrity-mini"></span>
+    </div>
+  </footer>
 `;
 
 const $ = <T extends HTMLElement>(id: string) =>
@@ -288,11 +331,35 @@ const deviceSelect = $<HTMLSelectElement>("device-select");
 const pickFile = $<HTMLButtonElement>("pick-file");
 const btnPlay = $<HTMLButtonElement>("btn-play");
 const btnPause = $<HTMLButtonElement>("btn-pause");
-const btnResume = $<HTMLButtonElement>("btn-resume");
+const btnResume: HTMLButtonElement | null = null;
 const btnStop = $<HTMLButtonElement>("btn-stop");
 const note = $<HTMLParagraphElement>("player-note");
 
 let selectedPath: string | null = null;
+
+// Sidebar navigation: one panel visible at a time (refs: sidebar app).
+document.getElementById("nav")?.addEventListener("click", (ev) => {
+  const btn = (ev.target as HTMLElement).closest<HTMLElement>(".nav-item");
+  if (!btn) return;
+  const target = btn.dataset.panel;
+  document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
+  btn.classList.add("active");
+  document.querySelectorAll(".panel").forEach((p) => {
+    p.classList.toggle("active", p.id === target);
+  });
+});
+
+/** Update the now-playing hero + playbar titles. */
+function setNowPlaying(title: string, artist: string) {
+  const t = document.getElementById("np-title");
+  if (t) t.textContent = title;
+  const a = document.getElementById("np-artist");
+  if (a) a.textContent = artist;
+  const pt = document.getElementById("pb-title");
+  if (pt) pt.textContent = title;
+  const pa = document.getElementById("pb-artist");
+  if (pa) pa.textContent = artist;
+}
 
 function setNote(text: string) {
   if (note) note.textContent = text;
@@ -329,6 +396,17 @@ function renderStatus(status: PlaybackStatus) {
   $<HTMLElement>("st-underruns")!.textContent =
     status.underruns.toLocaleString();
 
+  // Playbar mini-indicators (always visible, refs: fixed bottom bar).
+  const stateMini = document.getElementById("st-state-mini");
+  if (stateMini) stateMini.textContent = status.state.toUpperCase();
+  const intMini = document.getElementById("st-integrity-mini");
+  if (intMini) {
+    intMini.textContent = status.integrity.toUpperCase();
+    intMini.className = "pb-int " + (status.integrity === "verified" ? "ok" : "");
+  }
+  const playBtn = document.querySelector<HTMLButtonElement>(".pb-main");
+  if (playBtn) playBtn.textContent = status.state === "paused" ? "⏵" : "▶";
+
   if (status.fault) {
     setNote(`⚠ ${status.fault} — playback recovered safe; use Replay to retry.`);
     const recover = document.querySelector<HTMLButtonElement>("#btn-recover");
@@ -339,8 +417,8 @@ function renderStatus(status: PlaybackStatus) {
   const paused = status.state === "paused";
   btnPlay!.disabled = !selectedPath || playing;
   btnPause!.disabled = !playing;
-  btnResume!.disabled = !paused;
   btnStop!.disabled = status.state === "idle";
+  const _ = paused;
   // Exclusive state resets when playback stops (status may reflect a
   // shared-mode stream started elsewhere, e.g. queue auto-advance).
   if (status.state === "idle") exclusiveActive = false;
@@ -454,6 +532,8 @@ btnPlay?.addEventListener("click", async () => {
         },
       });
       renderStatus(status);
+      const stem = selectedPath.split(/[\\/]/).pop() ?? selectedPath;
+      setNowPlaying(current?.title ?? stem, current?.artist ?? "—");
       setNote("Playing.");
     }
   } catch (e) {
@@ -466,14 +546,6 @@ btnPause?.addEventListener("click", async () => {
     renderStatus(await invoke<PlaybackStatus>("pause_playback"));
   } catch (e) {
     setNote(`Pause failed: ${String(e)}`);
-  }
-});
-
-btnResume?.addEventListener("click", async () => {
-  try {
-    renderStatus(await invoke<PlaybackStatus>("resume_playback"));
-  } catch (e) {
-    setNote(`Resume failed: ${String(e)}`);
   }
 });
 
@@ -650,10 +722,20 @@ async function playIndex(idx: number) {
     queueCurrent = q.current;
     renderQueuePanel();
     const name = q.display[q.current ?? 0] ?? `Track ${idx + 1}`;
+    updateNowPlayingFromQueue(q);
     setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
     setNote(`Queue play failed: ${String(e)}`);
   }
+}
+
+/** Now-playing hero + playbar title from the queue's current entry. */
+function updateNowPlayingFromQueue(q: QueueDto) {
+  const idx = q.current ?? 0;
+  const t = q.tracks[idx];
+  if (!t) return;
+  const stem = t.path.split(/[\\/]/).pop() ?? t.path;
+  setNowPlaying(t.title ?? stem, t.artist ?? "—");
 }
 
 async function nextTrack() {
@@ -663,6 +745,7 @@ async function nextTrack() {
       queueTracks = q.tracks;
       queueCurrent = q.current;
       renderQueuePanel();
+      updateNowPlayingFromQueue(q);
       const name = q.display[q.current ?? 0] ?? "";
       setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
     } else if (queueTracks.length === 1) {
@@ -682,8 +765,8 @@ async function prevTrack() {
     queueTracks = q.tracks;
     queueCurrent = q.current;
     renderQueuePanel();
-    const name = q.display[q.current ?? 0] ?? "";
-    setNote(`${name} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
+    updateNowPlayingFromQueue(q);
+    setNote(`${q.display[q.current ?? 0] ?? ""} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
   } catch (e) {
     setNote(`Prev failed: ${String(e)}`);
   }
@@ -1183,7 +1266,9 @@ async function playNow(tracks: TrackDto[]) {
     refreshQueueButtons();
     renderQueuePanel();
     if (btnPlay) btnPlay.disabled = true;
-    setNote(tracks[0].display);
+    const first = tracks[0];
+    setNowPlaying(first.title ?? first.display, first.artist ?? "—");
+    setNote(first.display);
   } catch (e) {
     setNote(`Play failed: ${String(e)}`);
   }
@@ -1218,7 +1303,7 @@ function renderPlaylists() {
   for (const pl of libPlaylists) {
     const li = document.createElement("li");
     li.dataset.id = pl.id;
-    if (pl.id === libActivePlaylist) li.classList.add("active");
+    li.className = "lib-pl-row" + (pl.id === libActivePlaylist ? " active" : "");
 
     const name = document.createElement("button");
     name.type = "button";
