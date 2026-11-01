@@ -19,6 +19,35 @@ pub struct AppState {
     /// Persisted DSP configuration: the UI edits this and every new
     /// playback picks it up.
     pub dsp: std::sync::Mutex<aurora_dsp::DspConfig>,
+    /// Playback queue with the current index.
+    pub queue: std::sync::Mutex<TrackQueue>,
+}
+
+/// The user's playback queue.
+#[derive(Default)]
+pub struct TrackQueue {
+    pub tracks: Vec<String>,
+    pub current: Option<usize>,
+}
+
+impl TrackQueue {
+    fn next(&mut self) -> Option<String> {
+        let idx = self.current? + 1;
+        if idx >= self.tracks.len() {
+            return None;
+        }
+        self.current = Some(idx);
+        self.tracks.get(idx).cloned()
+    }
+
+    fn prev(&mut self) -> Option<String> {
+        let idx = self.current?;
+        if idx == 0 {
+            return self.tracks.first().cloned();
+        }
+        self.current = Some(idx - 1);
+        self.tracks.get(idx - 1).cloned()
+    }
 }
 
 impl AppState {
@@ -26,6 +55,7 @@ impl AppState {
         Self {
             engine: Mutex::new(PlaybackEngine::new()),
             dsp: std::sync::Mutex::new(aurora_dsp::DspConfig::default()),
+            queue: std::sync::Mutex::new(TrackQueue::default()),
         }
     }
 }
@@ -154,14 +184,136 @@ pub fn get_dsp(state: State<AppState>) -> Result<aurora_dsp::DspConfig, CommandE
     Ok(dsp.clone())
 }
 
+// ---------------------------------------------------------------------------
+// Queue commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct QueueDto {
+    tracks: Vec<String>,
+    current: Option<usize>,
+}
+
+#[tauri::command]
+pub fn set_queue(tracks: Vec<String>, state: State<AppState>) -> Result<QueueDto, CommandError> {
+    let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+    queue.tracks = tracks;
+    queue.current = None;
+    Ok(QueueDto {
+        tracks: queue.tracks.clone(),
+        current: queue.current,
+    })
+}
+
+#[tauri::command]
+pub fn get_queue(state: State<AppState>) -> Result<QueueDto, CommandError> {
+    let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(QueueDto {
+        tracks: queue.tracks.clone(),
+        current: queue.current,
+    })
+}
+
+fn start_track_at(path: &str, state: &State<AppState>) -> Result<PlaybackStatus, CommandError> {
+    let device = aurora_audio::default_output_device()?;
+    let dsp = state
+        .dsp
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .clone();
+    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    engine.stop();
+    engine.play(std::path::PathBuf::from(path), &device, dsp)?;
+    Ok(status_of(&engine))
+}
+
+#[tauri::command]
+pub fn play_queue_index(
+    index: usize,
+    state: State<AppState>,
+) -> Result<PlaybackStatus, CommandError> {
+    let path = {
+        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+        let path = queue
+            .tracks
+            .get(index)
+            .cloned()
+            .ok_or_else(|| CommandError::Device(format!("queue index {index} out of range")))?;
+        queue.current = Some(index);
+        path
+    };
+    start_track_at(&path, &state)
+}
+
+#[tauri::command]
+pub fn next_track(state: State<AppState>) -> Result<Option<QueueDto>, CommandError> {
+    let path = {
+        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+        queue.next()
+    };
+    match path {
+        Some(p) => {
+            start_track_at(&p, &state)?;
+            let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+            Ok(Some(QueueDto {
+                tracks: queue.tracks.clone(),
+                current: queue.current,
+            }))
+        }
+        None => {
+            let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+            engine.stop();
+            Ok(None)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn prev_track(state: State<AppState>) -> Result<QueueDto, CommandError> {
+    let path = {
+        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+        queue.prev()
+    };
+    let path = path.ok_or_else(|| CommandError::Device("empty queue".into()))?;
+    start_track_at(&path, &state)?;
+    let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(QueueDto {
+        tracks: queue.tracks.clone(),
+        current: queue.current,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Seek + live DSP
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn seek(position_s: f64, state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    engine.seek(position_s);
+    Ok(status_of(&engine))
+}
+
+#[tauri::command]
+pub fn playback_position(state: State<AppState>) -> Result<f64, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(engine.position_s())
+}
+
 #[tauri::command]
 pub fn set_dsp(
     config: aurora_dsp::DspConfig,
     state: State<AppState>,
 ) -> Result<aurora_dsp::DspConfig, CommandError> {
-    let mut dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
-    *dsp = config;
-    Ok(dsp.clone())
+    // Persisted for future streams...
+    {
+        let mut dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
+        *dsp = config.clone();
+    }
+    // ...and applied live to the playing stream.
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    engine.set_dsp_config(config.clone());
+    Ok(config)
 }
 
 #[tauri::command]
@@ -195,9 +347,16 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             playback_modes,
             list_output_devices,
             playback_status,
+            playback_position,
             play_track,
             get_dsp,
             set_dsp,
+            seek,
+            set_queue,
+            get_queue,
+            play_queue_index,
+            next_track,
+            prev_track,
             pause_playback,
             resume_playback,
             stop_playback

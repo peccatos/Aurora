@@ -41,6 +41,23 @@ struct Shared {
     running: Arc<AtomicBool>,
     /// True when a natural end-of-source was reached.
     finished: Arc<AtomicBool>,
+    /// Live DSP configuration: the worker recompiles the pipeline when the
+    /// version changes, without interrupting the stream.
+    dsp: Arc<Mutex<LiveDsp>>,
+    /// Pending seek position in seconds; the worker performs the seek and
+    /// clears the slot.
+    seek: Arc<Mutex<Option<f64>>>,
+    /// Auto-advance signal: set by the callback side when the stream ends
+    /// naturally (checked by the app layer for next-track behavior).
+    track_ended: Arc<AtomicBool>,
+}
+
+/// Live DSP state shared with the worker.
+pub struct LiveDsp {
+    pub config: aurora_dsp::DspConfig,
+    /// Bumped by set_dsp; the worker recompiles when it differs from the
+    /// compiled version.
+    pub version: u64,
 }
 
 /// The playback engine. One active stream at a time.
@@ -65,6 +82,12 @@ impl PlaybackEngine {
             shared: Arc::new(Shared {
                 running: Arc::new(AtomicBool::new(false)),
                 finished: Arc::new(AtomicBool::new(false)),
+                dsp: Arc::new(Mutex::new(LiveDsp {
+                    config: aurora_dsp::DspConfig::default(),
+                    version: 0,
+                })),
+                seek: Arc::new(Mutex::new(None)),
+                track_ended: Arc::new(AtomicBool::new(false)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
@@ -136,6 +159,9 @@ impl PlaybackEngine {
         // The worker owns the producer; dropping it (in stop) closes writes.
         let worker_running = Arc::clone(&self.shared.running);
         let worker_finished = Arc::clone(&self.shared.finished);
+        let live_dsp = Arc::clone(&self.shared.dsp);
+        let live_seek = Arc::clone(&self.shared.seek);
+        let track_ended_flag = Arc::clone(&self.shared.track_ended);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -172,10 +198,90 @@ impl PlaybackEngine {
             .spawn(move || {
                 let mut prod = prod;
                 let running = worker_running;
+                // Live pipeline: compiled for the initial config, replaced
+                // in place when the UI bumps the version. Track the
+                // compiled version to detect changes cheaply.
+                let mut compiled_version = 0u64;
+                let mut compiled_pipeline = dsp_pipeline;
                 loop {
                     if !running.load(Ordering::Acquire) {
                         break;
                     }
+
+                    // Live DSP: recompile when the config version advanced.
+                    // Filter states reset; the stream continues seamlessly.
+                    if let Some(pl) = compiled_pipeline.as_ref() {
+                        let _ = pl;
+                    }
+                    let needs_recompile = {
+                        match live_dsp.lock() {
+                            Ok(d) => d.version != compiled_version,
+                            Err(_) => false,
+                        }
+                    };
+                    if needs_recompile && !plays_native {
+                        let new_cfg = live_dsp
+                            .lock()
+                            .ok()
+                            .map(|d| d.config.clone())
+                            .unwrap_or_default();
+                        let rate_target = if negotiated.pcm.sample_rate != source_format.sample_rate
+                        {
+                            Some(negotiated.pcm.sample_rate)
+                        } else {
+                            None
+                        };
+                        match aurora_dsp::DspPipeline::compile(
+                            &new_cfg,
+                            source_format,
+                            rate_target,
+                            None,
+                        ) {
+                            Ok(new_pl) => {
+                                tracing::info!("dsp recompiled live");
+                                compiled_version = {
+                                    let mut d = live_dsp.lock().expect("dsp lock");
+                                    let v = d.version;
+                                    d.config = new_cfg;
+                                    v
+                                };
+                                compiled_pipeline = Some(new_pl);
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "live dsp recompile failed, keeping old");
+                                compiled_version = {
+                                    let d = live_dsp.lock().expect("dsp lock");
+                                    d.version
+                                };
+                            }
+                        }
+                    }
+
+                    // Seek: drain the ring, seek the source, continue.
+                    let pending_seek = live_seek.lock().ok().and_then(|mut s| s.take());
+                    if let Some(position_s) = pending_seek {
+                        let time = symphonia::core::units::Time::try_from_secs_f64(position_s)
+                            .unwrap_or_default();
+                        match source_seek(
+                            &mut source,
+                            symphonia::core::formats::SeekTo::Time {
+                                time,
+                                track_id: None,
+                            },
+                        ) {
+                            Ok(()) => {
+                                // Old buffered audio plays out briefly
+                                // (~90ms at 8MB/44.1k stereo worst case is
+                                // far less: ring drains in one callback).
+                                tracing::info!(position_s, "seeked");
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "seek failed");
+                            }
+                        }
+                        continue;
+                    }
+
                     match source.next_chunk() {
                         Ok(chunk) => {
                             if plays_native {
@@ -199,7 +305,7 @@ impl PlaybackEngine {
                                 // EQ/gain (and any resampling needed to
                                 // reach the device rate); dither + final
                                 // format conversion happen at the boundary.
-                                let Some(pipeline) = dsp_pipeline.as_mut() else {
+                                let Some(pipeline) = compiled_pipeline.as_mut() else {
                                     // Unreachable: compiled above.
                                     continue;
                                 };
@@ -245,6 +351,7 @@ impl PlaybackEngine {
                         }
                         Err(DecodeError::EndOfStream) => {
                             worker_finished.store(true, Ordering::Release);
+                            track_ended_flag.store(true, Ordering::Release);
                             break;
                         }
                         Err(DecodeError::Recoverable(msg)) => {
@@ -327,6 +434,39 @@ impl PlaybackEngine {
         Ok(())
     }
 
+    /// Seek to a position in seconds (worker performs it on the next loop
+    /// iteration; sub-frame precision is the demuxer's).
+    pub fn seek(&self, position_s: f64) {
+        if let Ok(mut slot) = self.shared.seek.lock() {
+            *slot = Some(position_s.clamp(0.0, f64::MAX));
+        }
+    }
+
+    /// Update the DSP configuration live. Takes effect within one chunk
+    /// (~10-40 ms) without interrupting playback.
+    pub fn set_dsp_config(&self, config: aurora_dsp::DspConfig) {
+        if let Ok(mut live) = self.shared.dsp.lock() {
+            live.config = config;
+            live.version = live.version.wrapping_add(1);
+        }
+    }
+
+    /// Whether the current track ended naturally (for next-track
+    /// auto-advance); consumes the flag.
+    pub fn take_track_ended(&self) -> bool {
+        self.shared.track_ended.swap(false, Ordering::AcqRel)
+    }
+
+    /// Approximate playback position in seconds, derived from frames
+    /// played and the output rate.
+    pub fn position_s(&self) -> f64 {
+        let rate = self.negotiated.map(|f| f.sample_rate).unwrap_or(0);
+        if rate == 0 {
+            return 0.0;
+        }
+        self.metrics.frames_played() as f64 / f64::from(rate)
+    }
+
     /// Stop playback and release the stream.
     pub fn stop(&mut self) {
         self.stop_internal();
@@ -342,6 +482,7 @@ impl PlaybackEngine {
         // producer on exit, closing the ring for writes.
         self.stream = None;
         self.shared.finished.store(false, Ordering::Release);
+        self.shared.track_ended.store(false, Ordering::Release);
         self.negotiated = None;
         self.transformations.clear();
         self.device_key = None;
@@ -416,6 +557,14 @@ fn callback(
             metrics.add_underrun((deficit / frame_bytes) as u64);
         }
     }
+}
+
+/// Seek the source to a time position (accurate mode).
+fn source_seek(
+    source: &mut AudioSource,
+    to: symphonia::core::formats::SeekTo,
+) -> Result<(), String> {
+    source.seek(to).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Encode normalized f32 samples into the target format's wire bytes.

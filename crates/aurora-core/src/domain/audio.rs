@@ -96,6 +96,7 @@ pub enum AudioTransformation {
     Gain,
     Equalizer,
     ReplayGain,
+    Reverb,
     Mixing,
     BitDepthTruncation,
 }

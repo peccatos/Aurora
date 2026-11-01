@@ -24,6 +24,8 @@ pub struct DspConfig {
     pub volume_db: f32,
     /// ReplayGain mode.
     pub replaygain: ReplayGainModeDef,
+    /// Reverb (Freeverb) settings.
+    pub reverb: crate::reverb::ReverbParams,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -42,6 +44,7 @@ impl Default for DspConfig {
             eq: Equalizer::ten_band_flat(),
             volume_db: 0.0,
             replaygain: ReplayGainModeDef::Off,
+            reverb: crate::reverb::ReverbParams::default(),
         }
     }
 }
@@ -58,6 +61,7 @@ impl DspConfig {
         self.eq.is_bypassed()
             && self.volume_db.abs() < 1e-9
             && self.replaygain == ReplayGainModeDef::Off
+            && self.reverb.is_bypassed()
     }
 
     /// All transformations this configuration reports when active.
@@ -68,6 +72,9 @@ impl DspConfig {
         }
         if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
             out.push(AudioTransformation::Gain);
+        }
+        if !self.reverb.is_bypassed() {
+            out.push(AudioTransformation::Reverb);
         }
         out
     }
@@ -80,6 +87,7 @@ impl DspConfig {
 /// in stream order on the worker thread.
 pub struct DspPipeline {
     eq_chain: Option<crate::eq::EqChain>,
+    reverb: Option<crate::reverb::Reverb>,
     volume: Gain,
     /// ReplayGain tag value for the current track (dB), if a mode uses it.
     replaygain_db: Option<f32>,
@@ -112,6 +120,16 @@ impl DspPipeline {
             )
         };
 
+        // Reverb is stereo-only: mono streams pass it through.
+        let reverb = if config.reverb.is_bypassed() || source_format.channels != 2 {
+            None
+        } else {
+            Some(crate::reverb::Reverb::new(
+                config.reverb,
+                source_format.sample_rate,
+            ))
+        };
+
         let needs_resample = target_rate
             .map(|t| t != source_format.sample_rate)
             .unwrap_or(false);
@@ -133,6 +151,7 @@ impl DspPipeline {
 
         Ok(Self {
             eq_chain,
+            reverb,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
             resampler,
@@ -150,6 +169,10 @@ impl DspPipeline {
     pub fn process(&mut self, interleaved: &mut Vec<f32>) -> Vec<f32> {
         if let Some(eq) = self.eq_chain.as_mut() {
             self.clipped |= eq.process_interleaved(interleaved);
+        }
+
+        if let Some(rv) = self.reverb.as_mut() {
+            rv.process_interleaved(interleaved);
         }
 
         // ReplayGain before volume: the tag sets loudness, volume trims it.
@@ -187,6 +210,9 @@ impl DspPipeline {
         if self.eq_chain.is_some() {
             out.push(AudioTransformation::Equalizer);
         }
+        if self.reverb.is_some() {
+            out.push(AudioTransformation::Reverb);
+        }
         if !self.volume.is_unity() || self.replaygain_db.is_some() {
             out.push(AudioTransformation::Gain);
         }
@@ -210,6 +236,7 @@ impl DspPipeline {
 
     pub fn is_passthrough(&self) -> bool {
         self.eq_chain.is_none()
+            && self.reverb.is_none()
             && self.volume.is_unity()
             && self.replaygain_db.is_none()
             && self.resampler.is_none()

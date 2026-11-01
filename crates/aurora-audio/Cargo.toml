@@ -12,6 +12,7 @@ aurora-dsp.workspace = true
 cpal.workspace = true
 ringbuf.workspace = true
 serde.workspace = true
+symphonia.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing.workspace = true

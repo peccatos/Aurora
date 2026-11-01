@@ -211,6 +211,29 @@ impl AudioSource {
         }
     }
 
+    /// Seek to an absolute position (seconds) in the stream.
+    ///
+    /// Accurate mode: symphonia seeks to the packet at or before the
+    /// position. The decoded-format probe state is unaffected; the first
+    /// decoded chunk after the seek continues from the new position.
+    /// The buffered first_chunk (already consumed in normal playback) is
+    /// dropped by construction: seek is only valid after playback began.
+    pub fn seek(
+        &mut self,
+        to: symphonia::core::formats::SeekTo,
+    ) -> Result<symphonia::core::formats::SeekedTo, symphonia::core::errors::Error> {
+        // Drop any pending probe chunk: after a seek it is stale.
+        self.first_chunk = None;
+        self.format
+            .seek(symphonia::core::formats::SeekMode::Accurate, to)
+    }
+
+    /// Whether the first (probe) chunk is still pending — true before any
+    /// next_chunk call, false after.
+    pub fn has_pending_first_chunk(&self) -> bool {
+        self.first_chunk.is_some()
+    }
+
     /// Decode the whole source into a buffer (bounded by `limit_bytes`).
     ///
     /// For tests and offline analysis; the playback path streams via
