@@ -26,6 +26,12 @@ pub struct DspConfig {
     pub replaygain: ReplayGainModeDef,
     /// Reverb (Freeverb) settings.
     pub reverb: crate::reverb::ReverbParams,
+    /// Playback speed multiplier: 1.0 = normal, 0.8 = slowed (the
+    /// classic slowed+reverb aesthetic), 1.25 = sped up nightcore-style.
+    /// Implemented through the pipeline resampler: audio at rate r played
+    /// as if it were at r*speed.
+    #[serde(default = "default_speed")]
+    pub speed: f32,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -38,6 +44,10 @@ pub enum ReplayGainModeDef {
     Album,
 }
 
+fn default_speed() -> f32 {
+    1.0
+}
+
 impl Default for DspConfig {
     fn default() -> Self {
         Self {
@@ -45,6 +55,7 @@ impl Default for DspConfig {
             volume_db: 0.0,
             replaygain: ReplayGainModeDef::Off,
             reverb: crate::reverb::ReverbParams::default(),
+            speed: 1.0,
         }
     }
 }
@@ -62,6 +73,7 @@ impl DspConfig {
             && self.volume_db.abs() < 1e-9
             && self.replaygain == ReplayGainModeDef::Off
             && self.reverb.is_bypassed()
+            && (self.speed - 1.0).abs() < 1e-6
     }
 
     /// All transformations this configuration reports when active.
@@ -76,6 +88,9 @@ impl DspConfig {
         if !self.reverb.is_bypassed() {
             out.push(AudioTransformation::Reverb);
         }
+        if (self.speed - 1.0).abs() > 1e-6 {
+            out.push(AudioTransformation::Resampling);
+        }
         out
     }
 }
@@ -88,6 +103,7 @@ impl DspConfig {
 pub struct DspPipeline {
     eq_chain: Option<crate::eq::EqChain>,
     reverb: Option<crate::reverb::Reverb>,
+    speed_active: bool,
     volume: Gain,
     /// ReplayGain tag value for the current track (dB), if a mode uses it.
     replaygain_db: Option<f32>,
@@ -130,16 +146,68 @@ impl DspPipeline {
             ))
         };
 
+        // Speed: audio at rate r played at r/speed clocks faster or
+        // slower. Slowed (0.8) resamples as if the source were 25%
+        // faster; sped up (1.25) as if 20% slower.
+        let speed = config.speed.clamp(0.5, 2.0);
+        let speed_active = (speed - 1.0).abs() > 1e-6;
+
         let needs_resample = target_rate
             .map(|t| t != source_format.sample_rate)
             .unwrap_or(false);
+        // Speed = resampling ratio manipulation: to play at speed s, the
+        // stream must reach the device as if the source had been recorded
+        // at rate/s. With a fixed device rate t, resample source -> t
+        // while treating the source as rate/s (ratio = s * t/source).
         let resampler = if needs_resample {
-            let t = target_rate.expect("checked");
-            Some(Resampler::new(
-                source_format.sample_rate,
-                t,
-                source_format.channels,
-            )?)
+            // Fixed device rate: resample from the real source rate to the
+            // device rate (speed changes the ratio interpretation: the
+            // callback clock stays at the device rate, and the content
+            // was produced at rate/s, so it plays at speed s).
+            if let Some(t) = target_rate {
+                if t != source_format.sample_rate {
+                    Some(Resampler::new(
+                        source_format.sample_rate,
+                        t,
+                        source_format.channels,
+                    )?)
+                } else if speed_active {
+                    // Device rate equals the source rate; to play at
+                    // speed s the stream must be resampled by ratio s:
+                    // treat the source as rate/s and resample back to
+                    // source rate (output length scales by s).
+                    let effective_source =
+                        ((f64::from(source_format.sample_rate) / f64::from(speed)).round() as u32)
+                            .max(1);
+                    if effective_source != source_format.sample_rate {
+                        Some(Resampler::new(
+                            source_format.sample_rate,
+                            effective_source,
+                            source_format.channels,
+                        )?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if speed_active {
+                // No device constraint: resample to the speed-scaled rate.
+                let scaled = ((f64::from(source_format.sample_rate) * f64::from(speed)).round()
+                    as u32)
+                    .max(1);
+                if scaled != source_format.sample_rate {
+                    Some(Resampler::new(
+                        source_format.sample_rate,
+                        scaled,
+                        source_format.channels,
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -152,6 +220,7 @@ impl DspPipeline {
         Ok(Self {
             eq_chain,
             reverb,
+            speed_active,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
             resampler,
@@ -236,6 +305,7 @@ impl DspPipeline {
 
     pub fn is_passthrough(&self) -> bool {
         self.eq_chain.is_none()
+            && !self.speed_active
             && self.reverb.is_none()
             && self.volume.is_unity()
             && self.replaygain_db.is_none()

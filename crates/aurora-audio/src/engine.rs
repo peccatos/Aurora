@@ -23,8 +23,12 @@ use crate::metrics::PlaybackMetrics;
 
 /// Target ring capacity in bytes (~2s at 192kHz/32-bit/stereo worst case,
 /// sized for 44.1k/16/2 comfortably; tuned by Phase 3 soak tests).
-const RING_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+const RING_CAPACITY_BYTES: usize = 1024 * 1024;
 
+/// Live-DSP latency budget: with a 1MB ring the old audio drains in
+/// ~5.4s at f32/48k/stereo — still audible delay for preset changes.
+/// The worker therefore drains the ring on DSP recompile (see the
+/// pending-drain flag) so a new preset is heard within one chunk.
 /// Engine status shared with the app layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +55,10 @@ struct Shared {
     /// (which would otherwise block in back-pressure forever) and keeps
     /// servicing live-DSP/seek requests instead.
     paused: Arc<AtomicBool>,
+    /// True after a live DSP recompile: the worker drains stale buffered
+    /// audio (produced by the OLD config) so the new preset is heard
+    /// immediately instead of after the ring's worth of audio.
+    drain: Arc<AtomicBool>,
     /// Auto-advance signal: set by the callback side when the stream ends
     /// naturally (checked by the app layer for next-track behavior).
     track_ended: Arc<AtomicBool>,
@@ -97,6 +105,7 @@ impl PlaybackEngine {
                 })),
                 seek: Arc::new(Mutex::new(None)),
                 paused: Arc::new(AtomicBool::new(false)),
+                drain: Arc::new(AtomicBool::new(false)),
                 track_ended: Arc::new(AtomicBool::new(false)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
@@ -194,6 +203,7 @@ impl PlaybackEngine {
         let live_dsp = Arc::clone(&self.shared.dsp);
         let live_seek = Arc::clone(&self.shared.seek);
         let live_paused = Arc::clone(&self.shared.paused);
+        let live_drain = Arc::clone(&self.shared.drain);
         let track_ended_flag = Arc::clone(&self.shared.track_ended);
 
         // The wire format the fallback path converts into (the negotiated
@@ -242,6 +252,19 @@ impl PlaybackEngine {
                 loop {
                     if !running.load(Ordering::Acquire) {
                         break;
+                    }
+
+                    // Drain: wait for the callback to consume the stale
+                    // buffered audio (produced by the old DSP config).
+                    // The callback drains ~10ms of audio per call; 1MB
+                    // clears in well under a second.
+                    if live_drain.load(Ordering::Acquire) && !live_paused.load(Ordering::Acquire) {
+                        if prod_len(&prod) == 0 {
+                            live_drain.store(false, Ordering::Release);
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
                     }
 
                     // Paused: do not decode (the ring cannot drain while
@@ -298,6 +321,10 @@ impl PlaybackEngine {
                                     v
                                 };
                                 compiled_pipeline = Some(new_pl);
+                                // Drop audio buffered under the old config:
+                                // a preset must be audible now, not after
+                                // the ring plays out.
+                                live_drain.store(true, Ordering::Release);
                             }
                             Err(e) => {
                                 tracing::warn!(%e, "live dsp recompile failed, keeping old");
@@ -504,6 +531,7 @@ impl PlaybackEngine {
     /// Resume a paused stream.
     pub fn resume(&mut self) -> Result<(), EngineError> {
         self.shared.paused.store(false, Ordering::Release);
+        self.shared.drain.store(false, Ordering::Release);
         if let Some(stream) = &self.stream {
             stream
                 .play()
@@ -564,6 +592,7 @@ impl PlaybackEngine {
         self.shared.finished.store(false, Ordering::Release);
         self.shared.track_ended.store(false, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
+        self.shared.drain.store(false, Ordering::Release);
         self.negotiated = None;
         self.transformations.clear();
         self.device_key = None;
@@ -640,6 +669,13 @@ fn callback(
             metrics.add_underrun((deficit / frame_bytes) as u64);
         }
     }
+}
+
+/// Occupied bytes in the producer's ring (cached view; slight
+/// underestimation is fine for drain logic).
+fn prod_len(prod: &ringbuf::wrap::caching::CachingProd<Arc<HeapRb<u8>>>) -> usize {
+    use ringbuf::traits::Observer;
+    prod.occupied_len()
 }
 
 /// Seek the source to a time position (accurate mode).

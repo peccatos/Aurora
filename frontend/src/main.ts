@@ -28,6 +28,7 @@ interface DspConfig {
   volume_db: number;
   replaygain: "off" | "track" | "album";
   reverb: ReverbParams;
+  speed: number;
 }
 
 interface QueueDto {
@@ -127,6 +128,9 @@ app.innerHTML = `
           <label>Room <input id="rv-room" type="range" min="0" max="1" step="0.01" value="0.5" /><b id="rv-room-v">0.50</b></label>
           <label>Damp <input id="rv-damp" type="range" min="0" max="1" step="0.01" value="0.3" /><b id="rv-damp-v">0.30</b></label>
           <label>Width <input id="rv-width" type="range" min="0" max="1" step="0.01" value="1" /><b id="rv-width-v">1.00</b></label>
+          <label>Speed <input id="fx-speed" type="range" min="0.5" max="2" step="0.05" value="1" /><b id="fx-speed-v">1.00x</b></label>
+          <button id="fx-slowed" type="button" class="ghost">Slowed</button>
+          <button id="fx-speedup" type="button" class="ghost">Speed Up</button>
         </div>
       </div>
 
@@ -322,6 +326,7 @@ let dspConfig: DspConfig = {
   volume_db: 0,
   replaygain: "off",
   reverb: { room_size: 0.5, damping: 0.3, wet: 0.0, width: 1.0, input_lowpass: 0.0 },
+  speed: 1.0,
 };
 
 async function loadDsp() {
@@ -415,7 +420,9 @@ function updateEqNote() {
   const active =
     dspConfig.eq.bands.some((b) => b.gain_db !== 0) ||
     dspConfig.eq.preamp_db !== 0 ||
-    dspConfig.volume_db !== 0;
+    dspConfig.volume_db !== 0 ||
+    dspConfig.reverb.wet > 0 ||
+    Math.abs(dspConfig.speed - 1) > 0.01;
   note.textContent = active
     ? "DSP active — transformations reported in the signal path."
     : "Flat EQ = bit-exact passthrough.";
@@ -582,6 +589,31 @@ function setupReverbPanel() {
   bind("rv-room", "rv-room-v", "room_size", (v) => v.toFixed(2));
   bind("rv-damp", "rv-damp-v", "damping", (v) => v.toFixed(2));
   bind("rv-width", "rv-width-v", "width", (v) => v.toFixed(2));
+
+  // Speed slider.
+  const speedEl = $id<HTMLInputElement>("fx-speed");
+  const speedV = $id<HTMLElement>("fx-speed-v");
+  speedEl?.addEventListener("input", () => {
+    const v = Number.parseFloat(speedEl.value);
+    dspConfig.speed = v;
+    if (speedV) speedV.textContent = `${v.toFixed(2)}x`;
+    updateEqNote();
+    saveDsp();
+  });
+  $id<HTMLButtonElement>("fx-slowed")?.addEventListener("click", () => {
+    dspConfig.speed = 0.8;
+    if (speedEl) speedEl.value = "0.8";
+    if (speedV) speedV.textContent = "0.80x";
+    updateEqNote();
+    saveDsp();
+  });
+  $id<HTMLButtonElement>("fx-speedup")?.addEventListener("click", () => {
+    dspConfig.speed = 1.25;
+    if (speedEl) speedEl.value = "1.25";
+    if (speedV) speedV.textContent = "1.25x";
+    updateEqNote();
+    saveDsp();
+  });
 
   $id<HTMLButtonElement>("reverb-off")?.addEventListener("click", () => {
     dspConfig.reverb.wet = 0;
