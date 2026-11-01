@@ -42,6 +42,7 @@ interface PlaybackStatus {
   bits_per_sample: number | null;
   transformations: string[];
   integrity: "verified" | "transformed" | "unverified";
+  duration_s: number | null;
   frames_played: number;
   underruns: number;
 }
@@ -97,6 +98,16 @@ app.innerHTML = `
         <div class="eq-head">
           <span class="eyebrow">PARAMETRIC EQ · 10 BAND</span>
           <div class="eq-meta">
+            <select id="eq-preset" aria-label="Preset">
+              <option value="flat">Flat</option>
+              <option value="bass">Bass Boost</option>
+              <option value="vocal">Vocal</option>
+              <option value="rock">Rock</option>
+              <option value="jazz">Jazz</option>
+              <option value="electronic">Electronic</option>
+              <option value="classical">Classical</option>
+              <option value="night">Late Night</option>
+            </select>
             <label>Preamp <input id="eq-preamp" type="range" min="-12" max="12" step="0.5" value="0" /> <span id="eq-preamp-v">0.0 dB</span></label>
             <label>Volume <input id="eq-volume" type="range" min="-40" max="12" step="0.5" value="0" /> <span id="eq-volume-v">0.0 dB</span></label>
             <button id="eq-flat" type="button" class="ghost">Flat</button>
@@ -146,7 +157,10 @@ function setNote(text: string) {
   if (note) note.textContent = text;
 }
 
+let lastStatus: PlaybackStatus | null = null;
+
 function renderStatus(status: PlaybackStatus) {
+  lastStatus = status;
   $<HTMLElement>("st-state")!.textContent = status.state;
   $<HTMLElement>("st-rate")!.textContent =
     status.sample_rate ? `${(status.sample_rate / 1000).toFixed(1)} kHz` : "—";
@@ -156,6 +170,9 @@ function renderStatus(status: PlaybackStatus) {
     status.bits_per_sample ? `${status.bits_per_sample}-bit` : "—";
   $<HTMLElement>("st-transform")!.textContent =
     status.transformations.length ? status.transformations.join(", ") : "none";
+  if (status.duration_s && status.duration_s > 0) {
+    currentDurationS = status.duration_s;
+  }
   const integrityEl = $<HTMLElement>("st-integrity");
   if (integrityEl) {
     integrityEl.textContent =
@@ -240,6 +257,12 @@ pickFile?.addEventListener("click", async () => {
 btnPlay?.addEventListener("click", async () => {
   if (!selectedPath) return;
   try {
+    // Play while paused = resume from the same position, NOT a restart.
+    if (lastStatus?.state === "paused") {
+      renderStatus(await invoke<PlaybackStatus>("resume_playback"));
+      setNote("Resumed.");
+      return;
+    }
     if (queueTracks.length > 1) {
       await playIndex(queueCurrent ?? 0);
     } else {
@@ -247,7 +270,6 @@ btnPlay?.addEventListener("click", async () => {
         request: { path: selectedPath, device: deviceSelect?.value || null },
       });
       renderStatus(status);
-      currentDurationS = (status.sample_rate ?? 44100) > 0 ? 0 : 0;
       setNote("Playing.");
     }
   } catch (e) {
@@ -435,6 +457,9 @@ async function nextTrack() {
       queueTracks = q.tracks;
       queueCurrent = q.current;
       setNote(`Track ${(q.current ?? 0) + 1}/${q.tracks.length}`);
+    } else if (queueTracks.length === 1) {
+      // Single track: replay from the top.
+      await playIndex(0);
     } else {
       setNote("End of queue");
     }
@@ -487,6 +512,7 @@ function refreshQueueButtons() {
   const next = $id<HTMLButtonElement>("btn-next");
   if (prev) prev.disabled = !has;
   if (next) next.disabled = !has;
+  // Single track: next restarts it, prev rewinds — both meaningful.
 }
 
 // Seek: click-drag sends the position; polling updates the bar.
@@ -571,3 +597,33 @@ function setupReverbPanel() {
 wireQueueControls();
 setupSeek();
 setupReverbPanel();
+
+// ---------------------------------------------------------------------------
+// EQ presets (gain_db per band index: 31..16k)
+// ---------------------------------------------------------------------------
+
+const EQ_PRESETS: Record<string, number[]> = {
+  flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  bass: [6, 5, 3.5, 1.5, 0, 0, 0, 0, 0, 0],
+  vocal: [-2, -1, 0, 2, 4, 4.5, 3.5, 1.5, 0, -1],
+  rock: [4.5, 3.5, 1.5, -1, -2, 1, 3, 4.5, 4, 3.5],
+  jazz: [3, 2, 1, 1.5, -1, -1, 0, 1.5, 2.5, 3],
+  electronic: [5, 4, 1, 0, -1.5, -1, 1.5, 3, 4.5, 5],
+  classical: [3.5, 2.5, 1, 0, 0, 0, 0, 1, 2, 3],
+  night: [-3, -1.5, 0, 1.5, 3, 3.5, 3, 2, 1, 0],
+};
+
+function applyPreset(name: string) {
+  const gains = EQ_PRESETS[name];
+  if (!gains) return;
+  dspConfig.eq.bands.forEach((b, i) => (b.gain_db = gains[i] ?? 0));
+  dspConfig.eq.preamp_db = name === "night" ? -2 : 0;
+  renderEq();
+  saveDsp();
+}
+
+document
+  .querySelector<HTMLSelectElement>("#eq-preset")
+  ?.addEventListener("change", (e) => {
+    applyPreset((e.target as HTMLSelectElement).value);
+  });

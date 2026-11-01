@@ -360,3 +360,14 @@ button.ghost:hover { border-color: #57536b; color: #eceaf2; }
   min-width: 34px;
   text-align: right;
 }
+
+.eq-meta select {
+  border: 1px solid #33313d;
+  border-radius: 7px;
+  background: #1d1c24;
+  color: #e8e6ef;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}

@@ -119,6 +119,8 @@ pub struct PlaybackStatus {
     pub transformations: Vec<aurora_core::AudioTransformation>,
     /// ADR 0002 output path integrity classification.
     pub integrity: aurora_core::OutputIntegrity,
+    /// Total track duration in seconds, when the container declares it.
+    pub duration_s: Option<f64>,
     pub frames_played: u64,
     pub underruns: u64,
 }
@@ -132,6 +134,7 @@ fn status_of(engine: &PlaybackEngine) -> PlaybackStatus {
         bits_per_sample: format.map(|f| f.bits_per_sample),
         transformations: engine.transformations().to_vec(),
         integrity: engine.integrity(),
+        duration_s: engine.duration_s(),
         frames_played: engine.metrics().frames_played(),
         underruns: engine.metrics().underruns(),
     }

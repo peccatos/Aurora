@@ -47,6 +47,10 @@ struct Shared {
     /// Pending seek position in seconds; the worker performs the seek and
     /// clears the slot.
     seek: Arc<Mutex<Option<f64>>>,
+    /// True while the stream is paused: the worker stops filling the ring
+    /// (which would otherwise block in back-pressure forever) and keeps
+    /// servicing live-DSP/seek requests instead.
+    paused: Arc<AtomicBool>,
     /// Auto-advance signal: set by the callback side when the stream ends
     /// naturally (checked by the app layer for next-track behavior).
     track_ended: Arc<AtomicBool>,
@@ -74,6 +78,8 @@ pub struct PlaybackEngine {
     device_key: Option<String>,
     /// Source PCM (what the decoder produces).
     source_format: Option<PcmFormat>,
+    /// Track duration from the container (ms), for the seek bar.
+    source_duration_ms: Option<u64>,
     /// ADR 0002 integrity classification of the current path: honest,
     /// computed from the transformation chain, never assumed.
     integrity: aurora_core::OutputIntegrity,
@@ -90,6 +96,7 @@ impl PlaybackEngine {
                     version: 0,
                 })),
                 seek: Arc::new(Mutex::new(None)),
+                paused: Arc::new(AtomicBool::new(false)),
                 track_ended: Arc::new(AtomicBool::new(false)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
@@ -100,6 +107,7 @@ impl PlaybackEngine {
             transformations: Vec::new(),
             device_key: None,
             source_format: None,
+            source_duration_ms: None,
             integrity: aurora_core::OutputIntegrity::Unverified,
         }
     }
@@ -142,6 +150,11 @@ impl PlaybackEngine {
         self.device_key.clone()
     }
 
+    /// Track duration in seconds from the container, for the seek bar.
+    pub fn duration_s(&self) -> Option<f64> {
+        self.source_duration_ms.map(|ms| ms as f64 / 1000.0)
+    }
+
     /// Start playing a file on a device with a DSP configuration.
     ///
     /// When the config is bypassed AND the device wire format matches the
@@ -180,6 +193,7 @@ impl PlaybackEngine {
         let worker_finished = Arc::clone(&self.shared.finished);
         let live_dsp = Arc::clone(&self.shared.dsp);
         let live_seek = Arc::clone(&self.shared.seek);
+        let live_paused = Arc::clone(&self.shared.paused);
         let track_ended_flag = Arc::clone(&self.shared.track_ended);
 
         // The wire format the fallback path converts into (the negotiated
@@ -209,6 +223,9 @@ impl PlaybackEngine {
             )
         };
 
+        // Duration captured before the worker takes ownership of the source.
+        let source_duration_ms = source.info().duration_ms;
+
         // Seeded dither for the float->int boundary (stable across runs).
         let mut ditherer = aurora_dsp::TpdfDither::new(0xA10CA);
 
@@ -225,6 +242,22 @@ impl PlaybackEngine {
                 loop {
                     if !running.load(Ordering::Acquire) {
                         break;
+                    }
+
+                    // Paused: do not decode (the ring cannot drain while
+                    // the callback is paused), but keep servicing live
+                    // recompiles and seek requests below. Sleep briefly
+                    // instead of spinning.
+                    if live_paused.load(Ordering::Acquire) {
+                        // DSP/seek still need servicing while paused.
+                        if live_dsp.lock().map(|d| d.version).unwrap_or(0) != compiled_version
+                            || live_seek.lock().map(|s| s.is_some()).unwrap_or(false)
+                        {
+                            // fall through to the handling below
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        }
                     }
 
                     // Live DSP: recompile when the config version advanced.
@@ -310,12 +343,18 @@ impl PlaybackEngine {
                                     let n = prod.push_slice(&bytes[written..]);
                                     written += n;
                                     if n == 0 {
-                                        // Buffer full: back-pressure by
-                                        // yielding; the callback drains us.
-                                        if !running.load(Ordering::Acquire) {
+                                        // Buffer full: back-pressure with
+                                        // bounded wait; pause/seek/DSP
+                                        // updates must stay serviced.
+                                        if !running.load(Ordering::Acquire)
+                                            || live_paused.load(Ordering::Acquire)
+                                        {
                                             break;
                                         }
-                                        std::thread::yield_now();
+                                        if live_seek.lock().map(|s| s.is_some()).unwrap_or(false) {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
                                     }
                                 }
                             } else {
@@ -360,10 +399,15 @@ impl PlaybackEngine {
                                     let n = prod.push_slice(&bytes[written..]);
                                     written += n;
                                     if n == 0 {
-                                        if !running.load(Ordering::Acquire) {
+                                        if !running.load(Ordering::Acquire)
+                                            || live_paused.load(Ordering::Acquire)
+                                        {
                                             break;
                                         }
-                                        std::thread::yield_now();
+                                        if live_seek.lock().map(|s| s.is_some()).unwrap_or(false) {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
                                     }
                                 }
                             }
@@ -407,6 +451,7 @@ impl PlaybackEngine {
         self.metrics.reset();
         self.stream = Some(stream);
         self.worker = Some(worker);
+        self.source_duration_ms = source_duration_ms;
         self.negotiated = Some(negotiated.pcm);
         // Report the full honest chain: forced conversions (negotiation)
         // plus the user-configured DSP stages (ADR 0002).
@@ -440,7 +485,12 @@ impl PlaybackEngine {
     }
 
     /// Pause the stream (callback keeps running, emitting silence).
+    ///
+    /// The worker also stops decoding: with the callback not draining the
+    /// ring, back-pressure would pin the worker in its fill loop and
+    /// starve live-DSP updates and seek.
     pub fn pause(&mut self) -> Result<(), EngineError> {
+        self.shared.paused.store(true, Ordering::Release);
         if let Some(stream) = &self.stream {
             stream
                 .pause()
@@ -453,6 +503,7 @@ impl PlaybackEngine {
 
     /// Resume a paused stream.
     pub fn resume(&mut self) -> Result<(), EngineError> {
+        self.shared.paused.store(false, Ordering::Release);
         if let Some(stream) = &self.stream {
             stream
                 .play()
@@ -512,10 +563,12 @@ impl PlaybackEngine {
         self.stream = None;
         self.shared.finished.store(false, Ordering::Release);
         self.shared.track_ended.store(false, Ordering::Release);
+        self.shared.paused.store(false, Ordering::Release);
         self.negotiated = None;
         self.transformations.clear();
         self.device_key = None;
         self.source_format = None;
+        self.source_duration_ms = None;
         self.integrity = aurora_core::OutputIntegrity::Unverified;
     }
 }
