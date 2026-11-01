@@ -41,6 +41,7 @@ interface PlaybackStatus {
   channels: number | null;
   bits_per_sample: number | null;
   transformations: string[];
+  integrity: "verified" | "transformed" | "unverified";
   frames_played: number;
   underruns: number;
 }
@@ -87,6 +88,7 @@ app.innerHTML = `
         <div><dt>Channels</dt><dd id="st-channels">—</dd></div>
         <div><dt>Bit depth</dt><dd id="st-bits">—</dd></div>
         <div><dt>Transformations</dt><dd id="st-transform">—</dd></div>
+        <div><dt>Integrity</dt><dd id="st-integrity">—</dd></div>
         <div><dt>Frames played</dt><dd id="st-frames">0</dd></div>
         <div><dt>Underruns</dt><dd id="st-underruns">0</dd></div>
       </dl>
@@ -154,6 +156,16 @@ function renderStatus(status: PlaybackStatus) {
     status.bits_per_sample ? `${status.bits_per_sample}-bit` : "—";
   $<HTMLElement>("st-transform")!.textContent =
     status.transformations.length ? status.transformations.join(", ") : "none";
+  const integrityEl = $<HTMLElement>("st-integrity");
+  if (integrityEl) {
+    integrityEl.textContent =
+      status.integrity === "verified"
+        ? "VERIFIED ✓"
+        : status.integrity === "transformed"
+          ? "transformed"
+          : "unverified";
+    integrityEl.className = status.integrity === "verified" ? "int-verified" : "";
+  }
   $<HTMLElement>("st-frames")!.textContent =
     status.frames_played.toLocaleString();
   $<HTMLElement>("st-underruns")!.textContent =

@@ -117,6 +117,8 @@ pub struct PlaybackStatus {
     pub bits_per_sample: Option<u16>,
     /// Active transformations, reported per ADR 0002.
     pub transformations: Vec<aurora_core::AudioTransformation>,
+    /// ADR 0002 output path integrity classification.
+    pub integrity: aurora_core::OutputIntegrity,
     pub frames_played: u64,
     pub underruns: u64,
 }
@@ -129,6 +131,7 @@ fn status_of(engine: &PlaybackEngine) -> PlaybackStatus {
         channels: format.map(|f| f.channels),
         bits_per_sample: format.map(|f| f.bits_per_sample),
         transformations: engine.transformations().to_vec(),
+        integrity: engine.integrity(),
         frames_played: engine.metrics().frames_played(),
         underruns: engine.metrics().underruns(),
     }
@@ -316,6 +319,54 @@ pub fn set_dsp(
     Ok(config)
 }
 
+/// Phase 5: probe WASAPI exclusive-mode support for the playing format.
+///
+/// Returns the honest ADR 0002 classification: what the device's
+/// exclusive path can do for this exact stream.
+#[tauri::command]
+pub fn probe_exclusive(state: State<AppState>) -> Result<ExclusiveProbe, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    let (Some(source), Some(device_key)) =
+        (engine.source_format_clone(), engine.device_key_clone())
+    else {
+        return Ok(ExclusiveProbe {
+            playing: false,
+            exclusive_capable: None,
+            integrity: "unverified".into(),
+            note: "nothing playing".into(),
+        });
+    };
+    let transformations = engine.transformations().to_vec();
+    let integrity = aurora_audio::exclusive_integrity(&device_key, source, &transformations)?;
+    Ok(ExclusiveProbe {
+        playing: true,
+        exclusive_capable: Some(matches!(
+            integrity,
+            aurora_core::OutputIntegrity::Unverified
+        )),
+        integrity: match integrity {
+            aurora_core::OutputIntegrity::Verified => "verified",
+            aurora_core::OutputIntegrity::Transformed => "transformed",
+            aurora_core::OutputIntegrity::Unverified => "unverified",
+        }
+        .into(),
+        note: if transformations.is_empty() {
+            "no transformations; software chain is bit-exact".into()
+        } else {
+            "active transformations make the path non-identical".into()
+        },
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExclusiveProbe {
+    pub playing: bool,
+    /// Some(true): the device accepts the format in exclusive mode.
+    pub exclusive_capable: Option<bool>,
+    pub integrity: String,
+    pub note: String,
+}
+
 #[tauri::command]
 pub fn pause_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
     let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
@@ -352,6 +403,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             get_dsp,
             set_dsp,
             seek,
+            probe_exclusive,
             set_queue,
             get_queue,
             play_queue_index,

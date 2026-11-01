@@ -203,13 +203,13 @@ impl Reverb {
     /// Only handles 2-channel buffers; other channel counts are passed
     /// through untouched (the pipeline guards this).
     pub fn process_interleaved(&mut self, buf: &mut [f32]) {
-        if buf.len() % 2 != 0 {
+        if !buf.len().is_multiple_of(2) {
             return;
         }
         let lp_amount = self.params.input_lowpass;
         let dry = 1.0 - self.params.wet.min(1.0);
 
-        for pair in buf.chunks_exact_mut(2) {
+        for pair in buf.as_chunks_mut::<2>().0 {
             // Pre-tank lowpass on input.
             let mut in_l = pair[0];
             let mut in_r = pair[1];
@@ -271,7 +271,7 @@ mod tests {
             },
             44_100,
         );
-        let mut buf: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.02).sin() * 0.5).collect();
+        let buf: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.02).sin() * 0.5).collect();
         // Stereo interleave from mono: L=R.
         let stereo: Vec<f32> = buf.iter().flat_map(|&s| [s, s]).collect();
         let mut stereo = stereo;
@@ -334,7 +334,7 @@ mod tests {
             .collect();
         rv.process_interleaved(&mut buf);
         let mut diff = 0.0f32;
-        for pair in buf.chunks_exact(2) {
+        for pair in buf.as_chunks::<2>().0 {
             diff += (pair[0] - pair[1]).abs();
         }
         assert!(diff > 0.1, "expected stereo decorrelation, diff={diff}");

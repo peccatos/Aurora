@@ -74,6 +74,9 @@ pub struct PlaybackEngine {
     device_key: Option<String>,
     /// Source PCM (what the decoder produces).
     source_format: Option<PcmFormat>,
+    /// ADR 0002 integrity classification of the current path: honest,
+    /// computed from the transformation chain, never assumed.
+    integrity: aurora_core::OutputIntegrity,
 }
 
 impl PlaybackEngine {
@@ -97,6 +100,7 @@ impl PlaybackEngine {
             transformations: Vec::new(),
             device_key: None,
             source_format: None,
+            integrity: aurora_core::OutputIntegrity::Unverified,
         }
     }
 
@@ -121,6 +125,21 @@ impl PlaybackEngine {
     /// Active transformations (e.g. forced format conversion).
     pub fn transformations(&self) -> &[aurora_core::AudioTransformation] {
         &self.transformations
+    }
+
+    /// The honest ADR 0002 classification of the current output path.
+    pub fn integrity(&self) -> aurora_core::OutputIntegrity {
+        self.integrity
+    }
+
+    /// Current stream's source PCM format (for diagnostics commands).
+    pub fn source_format_clone(&self) -> Option<PcmFormat> {
+        self.source_format
+    }
+
+    /// Current output device key (for diagnostics commands).
+    pub fn device_key_clone(&self) -> Option<String> {
+        self.device_key.clone()
     }
 
     /// Start playing a file on a device with a DSP configuration.
@@ -395,6 +414,16 @@ impl PlaybackEngine {
         if !dsp.is_bypassed() {
             transformations.extend(dsp.transformations());
         }
+        // Integrity classification (ADR 0002): with zero transformations
+        // and a byte-exact wire match the path is bit-identical up to the
+        // OS boundary. Whether the OS mixer preserves it beyond that is
+        // what exclusive mode + loopback verification (Phase 5) prove;
+        // shared mode cannot be verified -> Unverified, never claimed.
+        self.integrity = if transformations.is_empty() && plays_native {
+            aurora_core::OutputIntegrity::Unverified // honest: shared mode unverifiable
+        } else {
+            aurora_core::OutputIntegrity::Transformed
+        };
         self.transformations = transformations;
         self.device_key = Some(device.key().to_string());
         self.source_format = Some(source_format);
@@ -487,6 +516,7 @@ impl PlaybackEngine {
         self.transformations.clear();
         self.device_key = None;
         self.source_format = None;
+        self.integrity = aurora_core::OutputIntegrity::Unverified;
     }
 }
 
