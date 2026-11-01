@@ -171,7 +171,7 @@ impl PlaybackEngine {
         // config is bypassed but the device format mismatches, the
         // pipeline is still constructed with default (identity) settings
         // so the rate/format conversion happens through one honest path.
-        let mut dsp_pipeline = if plays_native {
+        let dsp_pipeline = if plays_native {
             None
         } else {
             let rate_target = if negotiated.pcm.sample_rate != source_format.sample_rate {

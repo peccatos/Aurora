@@ -301,3 +301,62 @@ button.ghost:hover { border-color: #57536b; color: #eceaf2; }
   color: #777582;
   font-size: 11px;
 }
+
+/* --- queue / seek / reverb --- */
+
+.player-controls button {
+  min-width: 44px;
+}
+
+.seek-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.seek-row input[type="range"] {
+  flex: 1;
+}
+
+.seek-row span {
+  color: #a5a3af;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 38px;
+  text-align: center;
+}
+
+.reverb-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 18px;
+  border-top: 1px solid #26242e;
+}
+
+.reverb-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.reverb-controls label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #a5a3af;
+  font-size: 12px;
+}
+
+.reverb-controls input[type="range"] {
+  flex: 1;
+  min-width: 80px;
+}
+
+.reverb-controls b {
+  color: #eceaf2;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: right;
+}

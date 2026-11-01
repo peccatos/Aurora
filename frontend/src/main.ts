@@ -15,10 +15,24 @@ interface EqBand {
   enabled: boolean;
 }
 
+interface ReverbParams {
+  room_size: number;
+  damping: number;
+  wet: number;
+  width: number;
+  input_lowpass: number;
+}
+
 interface DspConfig {
   eq: { bands: EqBand[]; preamp_db: number };
   volume_db: number;
   replaygain: "off" | "track" | "album";
+  reverb: ReverbParams;
+}
+
+interface QueueDto {
+  tracks: string[];
+  current: number | null;
 }
 
 interface PlaybackStatus {
@@ -52,10 +66,19 @@ app.innerHTML = `
       <div class="player-controls">
         <button id="pick-file" type="button" class="primary">Open file…</button>
         <select id="device-select" aria-label="Output device"></select>
+        <button id="btn-prev" type="button" disabled>⏮</button>
         <button id="btn-play" type="button" disabled>▶ Play</button>
         <button id="btn-pause" type="button" disabled>⏸ Pause</button>
         <button id="btn-resume" type="button" disabled>⏵ Resume</button>
         <button id="btn-stop" type="button" disabled>⏹ Stop</button>
+        <button id="btn-next" type="button" disabled>⏭</button>
+        <button id="btn-shuffle" type="button">🔀</button>
+      </div>
+
+      <div class="seek-row">
+        <span id="seek-cur">0:00</span>
+        <input id="seek" type="range" min="0" max="100" step="0.1" value="0" disabled />
+        <span id="seek-dur">0:00</span>
       </div>
 
       <dl id="signal-path" class="signal-path">
@@ -79,6 +102,19 @@ app.innerHTML = `
         </div>
         <div id="eq-bands" class="eq-bands"></div>
         <p class="eq-note" id="eq-note">Flat EQ = bit-exact passthrough.</p>
+      </div>
+
+      <div class="reverb-panel">
+        <div class="eq-head">
+          <span class="eyebrow">REVERB · FREEVERB</span>
+          <button id="reverb-off" type="button" class="ghost">Off</button>
+        </div>
+        <div class="reverb-controls">
+          <label>Wet <input id="rv-wet" type="range" min="0" max="1" step="0.01" value="0" /><b id="rv-wet-v">0%</b></label>
+          <label>Room <input id="rv-room" type="range" min="0" max="1" step="0.01" value="0.5" /><b id="rv-room-v">0.50</b></label>
+          <label>Damp <input id="rv-damp" type="range" min="0" max="1" step="0.01" value="0.3" /><b id="rv-damp-v">0.30</b></label>
+          <label>Width <input id="rv-width" type="range" min="0" max="1" step="0.01" value="1" /><b id="rv-width-v">1.00</b></label>
+        </div>
       </div>
 
       <p id="player-note" role="status"></p>
@@ -165,7 +201,7 @@ setInterval(() => {
 
 pickFile?.addEventListener("click", async () => {
   const picked = await open({
-    multiple: false,
+    multiple: true,
     filters: [
       {
         name: "Audio",
@@ -176,10 +212,15 @@ pickFile?.addEventListener("click", async () => {
       },
     ],
   });
-  if (typeof picked === "string") {
-    selectedPath = picked;
-    const name = picked.split(/[\\/]/).pop();
-    setNote(`Loaded: ${name}`);
+  const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+  if (paths.length > 0) {
+    selectedPath = paths[0];
+    queueTracks = paths;
+    queueCurrent = 0;
+    await invoke("set_queue", { tracks: paths });
+    refreshQueueButtons();
+    const name = paths[0].split(/[\\/]/).pop();
+    setNote(paths.length > 1 ? `Queue: ${paths.length} tracks` : `Loaded: ${name}`);
     if (btnPlay) btnPlay.disabled = false;
   }
 });
@@ -187,11 +228,16 @@ pickFile?.addEventListener("click", async () => {
 btnPlay?.addEventListener("click", async () => {
   if (!selectedPath) return;
   try {
-    const status = await invoke<PlaybackStatus>("play_track", {
-      request: { path: selectedPath, device: deviceSelect?.value || null },
-    });
-    renderStatus(status);
-    setNote("Playing.");
+    if (queueTracks.length > 1) {
+      await playIndex(queueCurrent ?? 0);
+    } else {
+      const status = await invoke<PlaybackStatus>("play_track", {
+        request: { path: selectedPath, device: deviceSelect?.value || null },
+      });
+      renderStatus(status);
+      currentDurationS = (status.sample_rate ?? 44100) > 0 ? 0 : 0;
+      setNote("Playing.");
+    }
   } catch (e) {
     setNote(`Play failed: ${String(e)}`);
   }
@@ -241,6 +287,7 @@ let dspConfig: DspConfig = {
   },
   volume_db: 0,
   replaygain: "off",
+  reverb: { room_size: 0.5, damping: 0.3, wet: 0.0, width: 1.0, input_lowpass: 0.0 },
 };
 
 async function loadDsp() {
@@ -341,3 +388,174 @@ function updateEqNote() {
 }
 
 loadDsp();
+
+// ---------------------------------------------------------------------------
+// Queue / seek / reverb / shuffle
+// ---------------------------------------------------------------------------
+
+const $id = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`);
+
+let currentDurationS = 0;
+let queueTracks: string[] = [];
+let queueCurrent: number | null = null;
+let shuffleMode = false;
+
+function fmtTime(s: number): string {
+  if (!Number.isFinite(s) || s < 0) return "0:00";
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+async function playIndex(idx: number) {
+  try {
+    await invoke("play_queue_index", { index: idx });
+    setNote(`Track ${idx + 1}/${queueTracks.length}`);
+  } catch (e) {
+    setNote(`Queue play failed: ${String(e)}`);
+  }
+}
+
+async function nextTrack() {
+  try {
+    const q = await invoke<QueueDto | null>("next_track");
+    if (q) {
+      queueTracks = q.tracks;
+      queueCurrent = q.current;
+      setNote(`Track ${(q.current ?? 0) + 1}/${q.tracks.length}`);
+    } else {
+      setNote("End of queue");
+    }
+  } catch (e) {
+    setNote(`Next failed: ${String(e)}`);
+  }
+}
+
+async function prevTrack() {
+  try {
+    const q = await invoke<QueueDto>("prev_track");
+    queueTracks = q.tracks;
+    queueCurrent = q.current;
+    setNote(`Track ${(q.current ?? 0) + 1}/${q.tracks.length}`);
+  } catch (e) {
+    setNote(`Prev failed: ${String(e)}`);
+  }
+}
+
+async function toggleShuffle() {
+  shuffleMode = !shuffleMode;
+  if (shuffleMode && queueTracks.length > 1) {
+    // Fisher-Yates: keep current track first.
+    const cur = queueCurrent ?? 0;
+    const head = queueTracks[cur];
+    const rest = queueTracks.filter((_, i) => i !== cur);
+    for (let i = rest.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    queueTracks = [head, ...rest];
+    queueCurrent = 0;
+    await invoke("set_queue", { tracks: queueTracks });
+    setNote("Shuffled queue");
+  } else {
+    setNote("Shuffle off");
+  }
+}
+
+function wireQueueControls() {
+  $id<HTMLButtonElement>("btn-prev")?.addEventListener("click", prevTrack);
+  $id<HTMLButtonElement>("btn-next")?.addEventListener("click", nextTrack);
+  $id<HTMLButtonElement>("btn-shuffle")?.addEventListener("click", toggleShuffle);
+  refreshQueueButtons();
+}
+
+function refreshQueueButtons() {
+  const has = queueTracks.length > 0;
+  const prev = $id<HTMLButtonElement>("btn-prev");
+  const next = $id<HTMLButtonElement>("btn-next");
+  if (prev) prev.disabled = !has;
+  if (next) next.disabled = !has;
+}
+
+// Seek: click-drag sends the position; polling updates the bar.
+let seeking = false;
+async function setupSeek() {
+  const bar = $id<HTMLInputElement>("seek");
+  const cur = $id<HTMLElement>("seek-cur");
+  const dur = $id<HTMLElement>("seek-dur");
+  if (!bar) return;
+
+  bar.addEventListener("pointerdown", () => (seeking = true));
+  bar.addEventListener("pointerup", async () => {
+    seeking = false;
+    const pos = (Number.parseFloat(bar.value) / 100) * currentDurationS;
+    try {
+      await invoke("seek", { positionS: pos });
+    } catch (e) {
+      setNote(`Seek failed: ${String(e)}`);
+    }
+  });
+
+  setInterval(async () => {
+    try {
+      const pos = await invoke<number>("playback_position");
+      if (!seeking && bar && currentDurationS > 0) {
+        bar.disabled = false;
+        bar.value = String((pos / currentDurationS) * 100);
+      }
+      if (cur) cur.textContent = fmtTime(pos);
+      if (dur && currentDurationS > 0) dur.textContent = fmtTime(currentDurationS);
+      // Auto-advance at natural end.
+      if (pos >= currentDurationS - 0.3 && currentDurationS > 0) {
+        await nextTrack();
+      }
+    } catch {
+      /* not playing */
+    }
+  }, 400);
+}
+
+function trackDurationHint(path: string) {
+  // Duration comes from the backend on play; approximate until then.
+  currentDurationS = 0;
+}
+
+// Reverb panel.
+function setupReverbPanel() {
+  const bind = (
+    id: string,
+    label: string,
+    key: keyof ReverbParams,
+    fmt: (v: number) => string,
+  ) => {
+    const el = $id<HTMLInputElement>(id);
+    const out = $id<HTMLElement>(label);
+    if (!el) return;
+    el.addEventListener("input", () => {
+      const v = Number.parseFloat(el.value);
+      dspConfig.reverb[key] = v;
+      if (out) out.textContent = fmt(v);
+      updateEqNote();
+      saveDsp();
+    });
+  };
+
+  bind("rv-wet", "rv-wet-v", "wet", (v) => `${Math.round(v * 100)}%`);
+  bind("rv-room", "rv-room-v", "room_size", (v) => v.toFixed(2));
+  bind("rv-damp", "rv-damp-v", "damping", (v) => v.toFixed(2));
+  bind("rv-width", "rv-width-v", "width", (v) => v.toFixed(2));
+
+  $id<HTMLButtonElement>("reverb-off")?.addEventListener("click", () => {
+    dspConfig.reverb.wet = 0;
+    const el = $id<HTMLInputElement>("rv-wet");
+    const out = $id<HTMLElement>("rv-wet-v");
+    if (el) el.value = "0";
+    if (out) out.textContent = "0%";
+    updateEqNote();
+    saveDsp();
+  });
+}
+
+wireQueueControls();
+setupSeek();
+setupReverbPanel();
