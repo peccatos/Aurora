@@ -1030,6 +1030,80 @@ pub fn verify_bit_perfect(
     }
 }
 
+// ---------------------------------------------------------------------------
+// VST3 plugin hosting (ADR 0004, Phase 9)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct VstPluginDto {
+    pub path: String,
+    pub name: String,
+    pub vendor: String,
+    pub version: String,
+    pub category: String,
+    pub class_id: String,
+    pub input_channels: i32,
+    pub output_channels: i32,
+}
+
+/// Scan standard VST3 directories (plus an optional extra folder) with the
+/// crash-resistant out-of-process probe. Blocking — run from a thread.
+#[tauri::command]
+pub fn scan_vst_plugins(extra_folder: Option<String>) -> Result<Vec<VstPluginDto>, CommandError> {
+    let extra = extra_folder
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(std::path::Path::new);
+    let found = aurora_vst::scan_available_plugins(extra);
+    Ok(found
+        .into_iter()
+        .map(|d| VstPluginDto {
+            path: d.path,
+            name: d.name,
+            vendor: d.vendor,
+            version: d.version,
+            category: d.category,
+            class_id: d.class_id,
+            input_channels: d.input_channels,
+            output_channels: d.output_channels,
+        })
+        .collect())
+}
+
+/// Set the active VST3 plugin chain (live: reloads without interrupting
+/// playback). Empty slots = chain off. Plugins run out-of-process; the
+/// transformation list reports them honestly (ADR 0002/0004).
+#[tauri::command]
+pub fn set_vst_chain(
+    slots: Vec<VstSlotDto>,
+    state: State<AppState>,
+) -> Result<PlaybackStatus, CommandError> {
+    let list = aurora_vst::VstPluginList {
+        slots: slots.into_iter().map(|s| (s.path, s.class_id)).collect(),
+    };
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    engine.set_vst(list);
+    Ok(status_of(&engine))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VstSlotDto {
+    pub path: String,
+    pub class_id: String,
+}
+
+/// The currently-configured VST3 chain (path + class id per slot).
+#[tauri::command]
+pub fn get_vst_chain(state: State<AppState>) -> Result<Vec<VstSlotDto>, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    let list = engine.vst_chain();
+    Ok(list
+        .slots
+        .into_iter()
+        .map(|(path, class_id)| VstSlotDto { path, class_id })
+        .collect())
+}
+
 #[tauri::command]
 pub fn pause_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
     let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
@@ -1092,6 +1166,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             recover_playback,
             play_exclusive_track,
             verify_bit_perfect,
+            scan_vst_plugins,
+            set_vst_chain,
+            get_vst_chain,
             pause_playback,
             resume_playback,
             stop_playback

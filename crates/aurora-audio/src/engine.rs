@@ -83,6 +83,17 @@ struct Shared {
     /// Auto-advance signal: set by the callback side when the stream ends
     /// naturally (checked by the app layer for next-track behavior).
     track_ended: Arc<AtomicBool>,
+    /// VST3 plugin chain config (ADR 0004): (path, class_id) slots. The
+    /// worker rebuilds the chain when the version changes; plugins run
+    /// out-of-process, inline on this worker thread — never the callback.
+    vst: Arc<Mutex<LiveVst>>,
+}
+
+/// Live VST chain state shared with the worker.
+pub struct LiveVst {
+    pub list: aurora_vst::VstPluginList,
+    /// Bumped by set_vst; the worker reloads when it differs.
+    pub version: u64,
 }
 
 /// Live DSP state shared with the worker.
@@ -138,6 +149,10 @@ impl PlaybackEngine {
                 stream_error: Arc::new(AtomicBool::new(false)),
                 seek_rebase: Arc::new(Mutex::new(None)),
                 worker_panicked: Arc::new(AtomicBool::new(false)),
+                vst: Arc::new(Mutex::new(LiveVst {
+                    list: aurora_vst::VstPluginList::default(),
+                    version: 0,
+                })),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
@@ -241,8 +256,16 @@ impl PlaybackEngine {
         let negotiated = negotiate(&cpal_device, source_format)?;
 
         // The native (untouched) path requires: DSP fully bypassed AND a
-        // byte-exact device format match.
-        let plays_native = negotiated.transformations.is_empty() && dsp.is_bypassed();
+        // byte-exact device format match AND no VST3 plugin chain (an
+        // active plugin is an honest transformation, ADR 0004).
+        let vst_configured = !self
+            .shared
+            .vst
+            .lock()
+            .map(|v| v.list.is_empty())
+            .unwrap_or(true);
+        let plays_native =
+            negotiated.transformations.is_empty() && dsp.is_bypassed() && !vst_configured;
 
         let ring = Arc::new(HeapRb::<u8>::new(RING_CAPACITY_BYTES));
         let (prod, cons) = ring.split();
@@ -259,6 +282,7 @@ impl PlaybackEngine {
         let self_worker_panicked = Arc::clone(&self.shared.worker_panicked);
         let live_seek_rebase = Arc::clone(&self.shared.seek_rebase);
         let worker_frames_played = Arc::clone(&self.metrics);
+        let live_vst = Arc::clone(&self.shared.vst);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -290,6 +314,35 @@ impl PlaybackEngine {
         // Duration captured before the worker takes ownership of the source.
         let source_duration_ms = source.info().duration_ms;
 
+        // VST3 chain (ADR 0004): loaded for this stream when slots are
+        // configured. Plugins force the DSP path (the native path stays
+        // bit-exact), and exclusive mode refuses while a chain is
+        // configured (honest, per ADR 0002).
+        let vst_list = live_vst.lock().map(|v| v.list.clone()).unwrap_or_default();
+        let vst_chain_transformations = if vst_list.is_empty() {
+            Vec::new()
+        } else {
+            vec![aurora_core::AudioTransformation::ExternalPlugin]
+        };
+        let vst_chain = if vst_list.is_empty() {
+            None
+        } else {
+            match aurora_vst::VstPluginChain::load(&vst_list, &source_format) {
+                Ok(chain) if !chain.is_passthrough() => {
+                    tracing::info!(plugins = ?chain.active_plugin_names(), "vst3 chain attached");
+                    Some(chain)
+                }
+                Ok(_) => {
+                    tracing::warn!("vst3 chain loaded no plugins; passthrough");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "vst3 chain load failed; playing without plugins");
+                    None
+                }
+            }
+        };
+
         // Seeded dither for the float->int boundary (stable across runs).
         let mut ditherer = aurora_dsp::TpdfDither::new(0xA10CA);
 
@@ -309,6 +362,8 @@ impl PlaybackEngine {
                     // compiled version to detect changes cheaply.
                     let mut compiled_version = 0u64;
                     let mut compiled_pipeline = dsp_pipeline;
+                    let mut compiled_vst_version = 0u64;
+                    let mut live_vst_chain = vst_chain;
                     loop {
                         if !running.load(Ordering::Acquire) {
                             break;
@@ -398,6 +453,46 @@ impl PlaybackEngine {
                             }
                         }
 
+                        // Live VST: reload the chain when the plugin list
+                        // version advanced (ADR 0004). The old chain is
+                        // dropped (its isolated processes shut down); the
+                        // stream continues seamlessly.
+                        let needs_vst_reload = match live_vst.lock() {
+                            Ok(v) => v.version != compiled_vst_version,
+                            Err(_) => false,
+                        };
+                        if needs_vst_reload {
+                            let new_list = live_vst
+                                .lock()
+                                .ok()
+                                .map(|v| v.list.clone())
+                                .unwrap_or_default();
+                            let new_chain =
+                                if new_list.is_empty() || plays_native && compiled_pipeline.as_ref().is_none() {
+                                    None
+                                } else {
+                                    match aurora_vst::VstPluginChain::load(&new_list, &source_format)
+                                    {
+                                        Ok(c) if !c.is_passthrough() => Some(c),
+                                        Ok(_) => None,
+                                        Err(e) => {
+                                            tracing::warn!(%e, "live vst reload failed, dropping plugins");
+                                            None
+                                        }
+                                    }
+                                };
+                            tracing::info!(
+                                count = new_chain.as_ref().map(|c| c.active_plugin_names().len()).unwrap_or(0),
+                                "vst3 chain reloaded live"
+                            );
+                            compiled_vst_version = live_vst
+                                .lock()
+                                .map(|v| v.version)
+                                .unwrap_or(compiled_vst_version);
+                            live_vst_chain = new_chain;
+                            live_drain.store(true, Ordering::Release);
+                        }
+
                         // Seek: drain the ring, seek the source, continue.
                         let pending_seek = live_seek.lock().ok().and_then(|mut s| s.take());
                         if let Some(position_s) = pending_seek {
@@ -466,16 +561,24 @@ impl PlaybackEngine {
                                         written += n;
                                     }
                                 } else {
-                                    // DSP path: f32 -> pipeline -> device wire
-                                    // format. The pipeline applies the user's
-                                    // EQ/gain (and any resampling needed to
-                                    // reach the device rate); dither + final
-                                    // format conversion happen at the boundary.
+                                    // DSP path: f32 -> [VST3 chain] -> pipeline
+                                    // -> device wire format. The pipeline
+                                    // applies the user's EQ/gain (and any
+                                    // resampling needed to reach the device
+                                    // rate); dither + final format conversion
+                                    // happen at the boundary. Plugins run
+                                    // inline here (the worker is non-RT) —
+                                    // never in the audio callback.
                                     let Some(pipeline) = compiled_pipeline.as_mut() else {
                                         // Unreachable: compiled above.
                                         continue;
                                     };
-                                    let mut samples = chunk.to_f32_interleaved();
+                                    let samples = chunk.to_f32_interleaved();
+                                    let after_vst = match live_vst_chain.as_mut() {
+                                        Some(chain) => chain.process(&samples),
+                                        None => samples,
+                                    };
+                                    let mut samples = after_vst;
                                     let processed = pipeline.process(&mut samples);
 
                                     // Dither only when converting to integer
@@ -530,9 +633,41 @@ impl PlaybackEngine {
                                 }
                             }
                             Err(DecodeError::EndOfStream) => {
-                                // Drain the pipeline tail (resampler FIFO
-                                // + delay line) so the last ~90ms of the
-                                // track actually plays.
+                                // Drain the pipeline tail (VST block FIFO +
+                                // resampler FIFO + delay line) so the last
+                                // ~90ms of the track actually plays.
+                                let vst_tail = live_vst_chain
+                                    .as_mut()
+                                    .map(|c| c.flush())
+                                    .unwrap_or_default();
+                                if !vst_tail.is_empty() {
+                                    let mut samples = vst_tail;
+                                    if let Some(pipeline) =
+                                        compiled_pipeline.as_mut().filter(|_| !plays_native)
+                                    {
+                                        let _ = pipeline.process(&mut samples);
+                                    }
+                                    let bytes = aurora_decoder::PcmChunk::from_bytes(
+                                        target_format,
+                                        f32s_to_wire(&samples, target_format),
+                                    )
+                                    .map(|c| c.as_bytes().to_vec());
+                                    if let Some(bytes) = bytes {
+                                        let mut written = 0;
+                                        while written < bytes.len() {
+                                            let n = prod.push_slice(&bytes[written..]);
+                                            written += n;
+                                            if n == 0 {
+                                                if !running.load(Ordering::Acquire) {
+                                                    break;
+                                                }
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(5),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(pipeline) =
                                     compiled_pipeline.as_mut().filter(|_| !plays_native)
                                 {
@@ -615,6 +750,9 @@ impl PlaybackEngine {
         if !dsp.is_bypassed() {
             transformations.extend(dsp.transformations());
         }
+        if !vst_chain_transformations.is_empty() {
+            transformations.extend(vst_chain_transformations);
+        }
         // Integrity classification (ADR 0002): with zero transformations
         // and a byte-exact wire match the path is bit-identical up to the
         // OS boundary. Whether the OS mixer preserves it beyond that is
@@ -657,6 +795,19 @@ impl PlaybackEngine {
         // Mode switch, not an error: clicking "Bit-perfect" while a
         // shared-mode stream plays restarts the current track in
         // exclusive mode (stop_internal joins the old worker/stream).
+        // ADR 0002/0004: exclusive mode is bit-perfect-eligible only with
+        // no plugins — refuse honestly (the caller falls back to shared).
+        if !self
+            .shared
+            .vst
+            .lock()
+            .map(|v| v.list.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(EngineError::FormatUnsupported(
+                "exclusive mode: a VST3 plugin chain is active (ADR 0004)".into(),
+            ));
+        }
         self.stop_internal();
 
         let mut source = AudioSource::open(&path)?;
@@ -816,6 +967,27 @@ impl PlaybackEngine {
             live.config = config;
             live.version = live.version.wrapping_add(1);
         }
+    }
+
+    /// Update the VST3 plugin chain live (ADR 0004). The worker reloads
+    /// the chain without interrupting playback; plugins load into
+    /// isolated helper processes, so a crashing plugin never touches the
+    /// player. Takes effect on the DSP path; exclusive mode refuses while
+    /// a chain is configured.
+    pub fn set_vst(&self, list: aurora_vst::VstPluginList) {
+        if let Ok(mut live) = self.shared.vst.lock() {
+            live.list = list;
+            live.version = live.version.wrapping_add(1);
+        }
+    }
+
+    /// The currently-configured VST3 plugin chain (paths + class ids).
+    pub fn vst_chain(&self) -> aurora_vst::VstPluginList {
+        self.shared
+            .vst
+            .lock()
+            .map(|v| v.list.clone())
+            .unwrap_or_default()
     }
 
     /// Whether the current track ended naturally (for next-track

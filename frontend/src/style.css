@@ -694,3 +694,28 @@ button.ghost:hover { border-color: #57536b; color: #eceaf2; }
 
 .bitperfect-note.bp-verified { color: #8bcca8; }
 .bitperfect-note.bp-fallback { color: #d8b08a; }
+
+/* --- VST3 plugin chain panel (Phase 9) --- */
+
+.vst-panel {
+  width: min(1100px, 100%);
+  margin: 16px auto 0;
+  padding: 18px 24px;
+  border: 1px solid #26242e;
+  border-radius: 16px;
+  background: #16151b;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vst-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px;
+  max-height: 140px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}

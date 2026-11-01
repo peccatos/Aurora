@@ -4,6 +4,7 @@ members = [
     "crates/aurora-core",
     "crates/aurora-decoder",
     "crates/aurora-dsp",
+    "crates/aurora-vst",
     "crates/aurora-audio",
     "crates/aurora-metadata",
     "crates/aurora-storage",
@@ -24,6 +25,7 @@ license = "MIT OR Apache-2.0"
 aurora-core = { path = "crates/aurora-core" }
 aurora-decoder = { path = "crates/aurora-decoder" }
 aurora-dsp = { path = "crates/aurora-dsp" }
+aurora-vst = { path = "crates/aurora-vst" }
 aurora-audio = { path = "crates/aurora-audio" }
 aurora-metadata = { path = "crates/aurora-metadata" }
 aurora-storage = { path = "crates/aurora-storage" }
@@ -33,6 +35,7 @@ aurora-app = { path = "crates/aurora-app" }
 
 # Audio stack
 cpal = "0.18.2"
+vst3-host = { version = "0.10", default-features = false, features = ["process-isolation"] }
 symphonia = { version = "0.6.1", features = ["all"] }
 rubato = "5.0.1"
 ringbuf = "0.6.0"

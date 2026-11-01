@@ -112,6 +112,22 @@ interface BitPerfectVerdict {
   note: string;
 }
 
+interface VstPluginDto {
+  path: string;
+  name: string;
+  vendor: string;
+  version: string;
+  category: string;
+  class_id: string;
+  input_channels: number;
+  output_channels: number;
+}
+
+interface VstSlot {
+  path: string;
+  class_id: string;
+}
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -200,6 +216,19 @@ app.innerHTML = `
           <button id="fx-slowed" type="button" class="ghost">Slowed</button>
           <button id="fx-speedup" type="button" class="ghost">Speed Up</button>
         </div>
+      </div>
+
+      <div class="vst-panel">
+        <div class="eq-head">
+          <span class="eyebrow">VST3 · OUT-OF-PROCESS CHAIN</span>
+          <div class="eq-meta">
+            <button id="vst-scan" type="button" class="ghost">Scan plugins…</button>
+            <button id="vst-clear" type="button" class="ghost">Chain off</button>
+            <span id="vst-note" class="lib-count"></span>
+          </div>
+        </div>
+        <ul id="vst-list" class="vst-list"></ul>
+        <p class="eq-note">Plugins load into an isolated helper process — a crashing plugin never takes the player down. Active plugins disable bit-perfect (honest report).</p>
       </div>
 
       <p id="player-note" role="status"></p>
@@ -685,6 +714,7 @@ function wireQueueControls() {
   $id<HTMLButtonElement>("btn-next")?.addEventListener("click", nextTrack);
   $id<HTMLButtonElement>("btn-shuffle")?.addEventListener("click", toggleShuffle);
   wireBitPerfectControls();
+  wireVstPanel();
   refreshQueueButtons();
 }
 
@@ -777,6 +807,89 @@ async function runBitPerfectVerify() {
     if (btn) { btn.disabled = false; btn.textContent = "✓ Verify"; }
     refreshBitPerfectButtons();
   }
+}
+
+// ---------------------------------------------------------------------------
+// VST3 plugin chain (ADR 0004: out-of-process, honest transformations)
+// ---------------------------------------------------------------------------
+
+let vstSlots: VstSlot[] = [];
+
+function vstNote(text: string) {
+  const el = $id<HTMLElement>("vst-note");
+  if (el) el.textContent = text;
+}
+
+function renderVstList() {
+  const ul = $id<HTMLUListElement>("vst-list");
+  if (!ul) return;
+  ul.innerHTML = "";
+  if (!vstSlots.length) {
+    vstNote("chain off");
+    return;
+  }
+  vstSlots.forEach((slot, idx) => {
+    const li = document.createElement("li");
+    li.className = "queue-row current";
+    const name = document.createElement("span");
+    name.className = "queue-name";
+    const stem = slot.path.split(/[\\/]/).pop() ?? slot.path;
+    name.textContent = `${idx + 1}. ${stem}`;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "lib-pl-del";
+    del.textContent = "×";
+    del.title = "Remove from chain";
+    del.addEventListener("click", async () => {
+      vstSlots.splice(idx, 1);
+      await applyVstChain();
+    });
+    li.append(name, del);
+    ul.appendChild(li);
+  });
+  vstNote(`${vstSlots.length} plugin${vstSlots.length > 1 ? "s" : ""} active`);
+}
+
+async function applyVstChain() {
+  try {
+    renderVstList();
+    await invoke("set_vst_chain", { slots: vstSlots });
+  } catch (e) {
+    vstNote(`chain failed: ${String(e)}`);
+  }
+}
+
+async function scanVstPlugins() {
+  const btn = $id<HTMLButtonElement>("vst-scan");
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = "Scanning…"; }
+    vstNote("scanning system VST3 folders (crash-safe probe)…");
+    const found = await invoke<VstPluginDto[]>("scan_vst_plugins", {
+      extraFolder: null,
+    });
+    if (!found.length) {
+      vstNote("no VST3 plugins found in system folders");
+      return;
+    }
+    // Add every found effect to the chain (simple Phase 9 surface; the
+    // user removes slots with ×).
+    vstSlots = found.map((p) => ({ path: p.path, class_id: p.class_id }));
+    await applyVstChain();
+    setNote(`VST3: ${found.length} plugin(s) attached (out-of-process)`);
+  } catch (e) {
+    vstNote(`scan failed: ${String(e)}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Scan plugins…"; }
+  }
+}
+
+function wireVstPanel() {
+  $id<HTMLButtonElement>("vst-scan")?.addEventListener("click", scanVstPlugins);
+  $id<HTMLButtonElement>("vst-clear")?.addEventListener("click", async () => {
+    vstSlots = [];
+    await applyVstChain();
+  });
+  renderVstList();
 }
 
 function refreshQueueButtons() {

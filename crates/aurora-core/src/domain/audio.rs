@@ -99,6 +99,9 @@ pub enum AudioTransformation {
     Reverb,
     Mixing,
     BitDepthTruncation,
+    /// A third-party VST3 plugin is processing the signal (ADR 0004).
+    /// Reported with the plugin's display name in diagnostics.
+    ExternalPlugin,
 }
 
 // ---------------------------------------------------------------------------

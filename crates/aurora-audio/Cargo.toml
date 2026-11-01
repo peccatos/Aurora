@@ -9,6 +9,7 @@ license.workspace = true
 aurora-core.workspace = true
 aurora-decoder.workspace = true
 aurora-dsp.workspace = true
+aurora-vst.workspace = true
 cpal.workspace = true
 ringbuf.workspace = true
 serde.workspace = true

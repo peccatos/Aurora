@@ -20,6 +20,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog = "2.8.4"
 aurora-dsp.workspace = true
+aurora-vst.workspace = true
 aurora-metadata.workspace = true
 walkdir.workspace = true
 
