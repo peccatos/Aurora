@@ -1150,16 +1150,29 @@ pub fn open_vst_editor(
         // shared mutex, so the borrow is read-only and synchronized.
         unsafe { &*ptr }
     };
+    // Which chain slot this editor drives: the index of (path, class_id)
+    // in the configured chain — multi-slot GUI support. Slot indices
+    // count attached plugins on the audio side (skipped slots shift), so
+    // a missing plugin file simply leaves the editor without a target.
+    let slot = state
+        .engine
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .vst_chain()
+        .slots
+        .iter()
+        .position(|(p, c)| p == &path && c == &class_id)
+        .unwrap_or(0);
     let gui = aurora_vst::open_gui(
         &path,
         &class_id,
         Box::new(move |params| {
-            engine.set_vst_params(params.into_iter().collect());
+            engine.set_vst_params(slot, params.into_iter().collect());
         }),
     )
     .map_err(|reason| CommandError::Engine { message: reason })?;
     *gui_slot = Some(gui);
-    tracing::info!(%path, "vst editor window opened");
+    tracing::info!(%path, slot, "vst editor window opened");
     Ok(())
 }
 
@@ -1171,6 +1184,116 @@ pub fn close_vst_editor(state: State<AppState>) -> Result<(), CommandError> {
         gui.close();
     }
     Ok(())
+}
+
+/// One automatable plugin parameter (normalized 0..1 value).
+#[derive(Debug, Serialize)]
+pub struct VstParamDto {
+    pub id: u32,
+    pub title: String,
+    pub value: f64,
+}
+
+/// List a chain slot's parameters without opening the native editor —
+/// the generic parameter panel (works for every plugin, even ones whose
+/// editor refuses to open). Loads a throwaway isolated instance; the
+/// playing chain is untouched.
+#[tauri::command]
+pub fn list_vst_params(path: String, class_id: String) -> Result<Vec<VstParamDto>, CommandError> {
+    let params = aurora_vst::probe_params(&path, &class_id)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(params
+        .into_iter()
+        .map(|p| VstParamDto {
+            id: p.id,
+            title: p.title,
+            value: p.value,
+        })
+        .collect())
+}
+
+/// Set one parameter on a chain slot from the generic panel (normalized
+/// 0..1). Rides the worker's between-chunks param path — no restart.
+#[tauri::command]
+pub fn set_vst_param(
+    path: String,
+    class_id: String,
+    id: u32,
+    value: f64,
+    state: State<AppState>,
+) -> Result<(), CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    let slot = engine
+        .vst_chain()
+        .slots
+        .iter()
+        .position(|(p, c)| p == &path && c == &class_id)
+        .unwrap_or(0);
+    // Merge into the live param map: the worker applies the whole map on
+    // its next pass; other slots' editor sessions are untouched (each
+    // editor session replaces the map only when the slot matches).
+    engine.set_vst_param_value(slot, id, value);
+    Ok(())
+}
+
+/// Save a chain slot's current state as a preset file (JSON, next to the
+/// library in app data). Returns the file path for the UI to show.
+#[tauri::command]
+pub fn save_vst_preset(
+    path: String,
+    class_id: String,
+    name: String,
+) -> Result<String, CommandError> {
+    let file = aurora_vst::save_preset_file(&path, &class_id, &name)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(file.display().to_string())
+}
+
+/// Apply a preset file to a chain slot (loads an isolated instance,
+/// applies the state, and pushes the resulting parameter values into the
+/// live chain so playback hears it without a restart).
+#[tauri::command]
+pub fn load_vst_preset(
+    path: String,
+    class_id: String,
+    preset_path: String,
+    state: State<AppState>,
+) -> Result<(), CommandError> {
+    let params = aurora_vst::load_preset_and_params(&path, &class_id, &preset_path)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    let slot = engine
+        .vst_chain()
+        .slots
+        .iter()
+        .position(|(p, c)| p == &path && c == &class_id)
+        .unwrap_or(0);
+    let mut map = engine.vst_param_map(slot);
+    for p in params {
+        map.insert(p.id, p.value);
+    }
+    engine.set_vst_params(slot, map);
+    Ok(())
+}
+
+/// List saved preset files for a plugin (name, path).
+#[derive(Debug, Serialize)]
+pub struct VstPresetDto {
+    pub name: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub fn list_vst_presets(path: String) -> Result<Vec<VstPresetDto>, CommandError> {
+    let presets = aurora_vst::list_preset_files(&path)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(presets
+        .into_iter()
+        .map(|(name, file)| VstPresetDto {
+            name,
+            path: file.display().to_string(),
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1447,11 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             test_vst_plugin,
             open_vst_editor,
             close_vst_editor,
+            list_vst_params,
+            set_vst_param,
+            save_vst_preset,
+            load_vst_preset,
+            list_vst_presets,
             get_track_artwork,
             pause_playback,
             resume_playback,

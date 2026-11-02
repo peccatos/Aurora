@@ -128,6 +128,17 @@ interface VstSlot {
   class_id: string;
 }
 
+interface VstParamDto {
+  id: number;
+  title: string;
+  value: number;
+}
+
+interface VstPresetDto {
+  name: string;
+  path: string;
+}
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -977,6 +988,10 @@ function vstNote(text: string, isError = false) {
 /** Scan results: found plugins, not yet attached. */
 let vstFound: VstPluginDto[] = [];
 
+/** Generic parameter panel state: which plugin's params are shown. */
+let vstParamsFor: { path: string; class_id: string } | null = null;
+let vstParamsList: VstParamDto[] = [];
+
 function renderVstList() {
   const ul = $id<HTMLUListElement>("vst-list");
   if (!ul) return;
@@ -1026,13 +1041,14 @@ function renderVstList() {
     ul.appendChild(li);
   }
 
-  // Section 1b: attached plugins get an "Open editor" button (the
-  // plugin's own GUI window, native, with its own message pump).
+  // Section 1b: attached plugins — editor, generic params, presets.
   for (const p of vstFound) {
     const attached = vstSlots.some(
       (s) => s.path === p.path && s.class_id === p.class_id,
     );
     if (!attached) continue;
+
+    // Editor row (the plugin's own native GUI window).
     const li = document.createElement("li");
     li.className = "queue-row";
     const name = document.createElement("span");
@@ -1061,6 +1077,142 @@ function renderVstList() {
     });
     li.append(name, open);
     ul.appendChild(li);
+
+    // Generic params row (works even when a plugin has no GUI).
+    const liP = document.createElement("li");
+    liP.className = "queue-row";
+    const nameP = document.createElement("span");
+    nameP.className = "queue-name";
+    nameP.textContent = `${p.name} parameters`;
+    const btnP = document.createElement("button");
+    btnP.type = "button";
+    btnP.className = "ghost";
+    btnP.textContent =
+      vstParamsFor && vstParamsFor.path === p.path && vstParamsFor.class_id === p.class_id
+        ? "✕ Hide"
+        : "☰ Params";
+    btnP.title = "List the plugin's parameters with live sliders";
+    btnP.addEventListener("click", async () => {
+      const same =
+        vstParamsFor && vstParamsFor.path === p.path && vstParamsFor.class_id === p.class_id;
+      if (same) {
+        vstParamsFor = null;
+        vstParamsList = [];
+        renderVstList();
+        return;
+      }
+      try {
+        btnP.disabled = true;
+        btnP.textContent = "…";
+        vstParamsList = await invoke<VstParamDto[]>("list_vst_params", {
+          path: p.path,
+          classId: p.class_id,
+        });
+        vstParamsFor = { path: p.path, class_id: p.class_id };
+      } catch (e) {
+        vstNote(`${p.name} params: ${String(e)}`, true);
+      } finally {
+        renderVstList();
+      }
+    });
+    liP.append(nameP, btnP);
+    ul.appendChild(liP);
+
+    // Presets row: save current / load saved.
+    const liR = document.createElement("li");
+    liR.className = "queue-row";
+    const nameR = document.createElement("span");
+    nameR.className = "queue-name";
+    nameR.textContent = `${p.name} presets`;
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "ghost";
+    saveBtn.textContent = "＋ Save";
+    saveBtn.title = "Save the plugin's current parameter state as a preset";
+    saveBtn.addEventListener("click", async () => {
+      const nm = prompt(`Preset name for ${p.name}`);
+      if (!nm) return;
+      try {
+        saveBtn.disabled = true;
+        const file = await invoke<string>("save_vst_preset", {
+          path: p.path,
+          classId: p.class_id,
+          name: nm,
+        });
+        vstNote(`Preset saved: ${file}`);
+      } catch (e) {
+        vstNote(`Preset save failed: ${String(e)}`, true);
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+    liR.append(nameR, saveBtn);
+    ul.appendChild(liR);
+  }
+
+  // Section 1c: preset list + generic parameter sliders for the selected
+  // plugin (shown under the plugin's rows).
+  if (vstParamsFor) {
+    const wrap = document.createElement("li");
+    wrap.className = "vst-params-panel";
+    const head = document.createElement("div");
+    head.className = "vst-params-head";
+    const label = document.createElement("span");
+    label.className = "eyebrow";
+    label.textContent = "PARAMETERS";
+    head.appendChild(label);
+    wrap.appendChild(head);
+
+    // Saved presets (load on click).
+    invoke<VstPresetDto[]>("list_vst_presets", { path: vstParamsFor.path })
+      .then((presets) => {
+        if (!presets.length) return;
+        const pl = document.createElement("div");
+        pl.className = "vst-preset-row";
+        const plLabel = document.createElement("span");
+        plLabel.className = "vst-preset-label";
+        plLabel.textContent = "PRESETS";
+        pl.appendChild(plLabel);
+        for (const preset of presets) {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "ghost";
+          b.textContent = preset.name;
+          b.addEventListener("click", async () => {
+            try {
+              b.disabled = true;
+              await invoke("load_vst_preset", {
+                path: vstParamsFor!.path,
+                classId: vstParamsFor!.class_id,
+                presetPath: preset.path,
+              });
+              // Refresh the visible sliders with the preset's values.
+              vstParamsList = await invoke<VstParamDto[]>("list_vst_params", {
+                path: vstParamsFor!.path,
+                classId: vstParamsFor!.class_id,
+              });
+              renderVstList();
+              vstNote(`Preset loaded: ${preset.name}`);
+            } catch (e) {
+              vstNote(`Preset load failed: ${String(e)}`, true);
+            } finally {
+              b.disabled = false;
+            }
+          });
+          pl.appendChild(b);
+        }
+        wrap.appendChild(pl);
+        renderVstParamSliders(wrap);
+      })
+      .catch(() => renderVstParamSliders(wrap));
+
+    if (!vstParamsList.length) {
+      const empty = document.createElement("p");
+      empty.className = "eq-note";
+      empty.textContent = "No parameters reported.";
+      wrap.appendChild(empty);
+    }
+    ul.appendChild(wrap);
   }
 
   // Section 2: active chain (remove with ×).
@@ -1091,6 +1243,51 @@ function renderVstList() {
         ? "found plugins above; attach one to enable"
         : "chain off",
   );
+}
+
+/** Sliders for the generic parameter panel — values pushed live into the
+ *  chain slot (no editor window needed). */
+function renderVstParamSliders(wrap: HTMLElement) {
+  if (!vstParamsFor || !vstParamsList.length) return;
+  const grid = document.createElement("div");
+  grid.className = "vst-params-grid";
+  const { path, class_id } = vstParamsFor;
+  for (const prm of vstParamsList.slice(0, 24)) {
+    const cell = document.createElement("label");
+    cell.className = "ctl vst-ctl";
+    const title = document.createElement("span");
+    title.className = "vst-ctl-title";
+    title.textContent = prm.title;
+    title.title = prm.title;
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = "1";
+    slider.step = "0.001";
+    slider.value = String(prm.value);
+    const out = document.createElement("b");
+    out.textContent = prm.value.toFixed(3);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    slider.addEventListener("input", () => {
+      const v = Number.parseFloat(slider.value);
+      out.textContent = v.toFixed(3);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        invoke("set_vst_param", { path, classId: class_id, id: prm.id, value: v }).catch(
+          (e) => vstNote(`param set failed: ${String(e)}`, true),
+        );
+      }, 60);
+    });
+    cell.append(title, slider, out);
+    grid.appendChild(cell);
+  }
+  wrap.appendChild(grid);
+  if (vstParamsList.length > 24) {
+    const more = document.createElement("p");
+    more.className = "eq-note";
+    more.textContent = `+${vstParamsList.length - 24} more parameters (use the plugin editor)`;
+    wrap.appendChild(more);
+  }
 }
 
 async function applyVstChain() {
@@ -1389,6 +1586,16 @@ function renderQueuePanel() {
   queueTracks.forEach((t, idx) => {
     const li = document.createElement("li");
     li.className = "queue-row" + (idx === queueCurrent ? " current" : "");
+    li.dataset.idx = String(idx);
+
+    // Drag handle: reorders the queue (pointer-based, works with mouse
+    // and touch; the whole row is draggable via the handle only).
+    const handle = document.createElement("span");
+    handle.className = "drag-handle";
+    handle.title = "Drag to reorder";
+    handle.textContent = "⋮⋮";
+    li.appendChild(handle);
+
     const name = document.createElement("button");
     name.type = "button";
     name.className = "queue-name";
@@ -1413,6 +1620,85 @@ function renderQueuePanel() {
     });
     li.append(name, del);
     ul.appendChild(li);
+  });
+  attachQueueDragReorder(ul);
+}
+
+/** Pointer-based drag reorder for the queue list. Dragging the handle of
+ *  row A onto row B moves A to B's position; the current-track index is
+ *  kept pointing at the same track, then the whole queue syncs to the
+ *  backend. Auto-advance keeps working because the backend gets the
+ *  reordered list via set_queue (current is positional there, but the
+ *  playing stream is untouched by set_queue). */
+function attachQueueDragReorder(ul: HTMLUListElement) {
+  let dragFrom: number | null = null;
+  let dragOverIdx: number | null = null;
+
+  const rowAt = (y: number): HTMLElement | null => {
+    const rows = Array.from(ul.querySelectorAll<HTMLElement>(".queue-row"));
+    return (
+      rows.find((r) => {
+        const rect = r.getBoundingClientRect();
+        return y >= rect.top && y <= rect.bottom;
+      }) ?? null
+    );
+  };
+
+  ul.querySelectorAll<HTMLElement>(".drag-handle").forEach((handle) => {
+    handle.addEventListener("pointerdown", (ev) => {
+      const row = handle.closest<HTMLElement>(".queue-row");
+      if (!row) return;
+      dragFrom = Number(row.dataset.idx);
+      handle.setPointerCapture(ev.pointerId);
+      row.style.opacity = "0.45";
+      ev.preventDefault();
+    });
+    handle.addEventListener("pointermove", (ev) => {
+      if (dragFrom == null) return;
+      const target = rowAt(ev.clientY);
+      ul.querySelectorAll<HTMLElement>(".queue-row").forEach((r) => {
+        r.classList.remove("drag-over");
+      });
+      if (target) {
+        dragOverIdx = Number(target.dataset.idx);
+        target.classList.add("drag-over");
+      } else {
+        dragOverIdx = null;
+      }
+    });
+    const finish = async (ev: PointerEvent) => {
+      const row = handle.closest<HTMLElement>(".queue-row");
+      if (row) row.style.opacity = "";
+      handle.releasePointerCapture?.(ev.pointerId);
+      ul.querySelectorAll<HTMLElement>(".queue-row").forEach((r) => {
+        r.classList.remove("drag-over");
+      });
+      if (dragFrom == null) return;
+      const from = dragFrom;
+      const to = dragOverIdx;
+      dragFrom = null;
+      dragOverIdx = null;
+      if (to == null || to === from) return;
+      // Move the track; keep queueCurrent on the same TRACK.
+      const currentTrack = queueCurrent != null ? queueTracks[queueCurrent] : null;
+      const [moved] = queueTracks.splice(from, 1);
+      queueTracks.splice(to, 0, moved);
+      if (currentTrack) {
+        queueCurrent = queueTracks.findIndex(
+          (t) => t.path === currentTrack.path && t.title === currentTrack.title,
+        );
+        if (queueCurrent < 0) queueCurrent = null;
+      }
+      try {
+        await invoke("set_queue", { tracks: queueTracks });
+        setNote(`Moved to position ${to + 1}.`);
+      } catch (e) {
+        setNote(`Reorder failed: ${String(e)}`);
+      }
+      renderQueuePanel();
+    };
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
   });
 }
 

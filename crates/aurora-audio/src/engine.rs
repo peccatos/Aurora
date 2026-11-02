@@ -535,16 +535,23 @@ impl PlaybackEngine {
 
                         // Editor-GUI parameter updates: applied between
                         // chunks; they ride the next block's IPC to the
-                        // isolated plugin.
-                        if let (Some(updates), Some(chain)) = (
+                        // isolated plugin. Which chain slot they target is
+                        // decided by the GUI session (param_slot), so any
+                        // slot's editor drives its own plugin — not just
+                        // slot 0.
+                        if let (Some((updates, slot)), Some(chain)) = (
                             live_vst
                                 .lock()
                                 .ok()
-                                .map(|v| v.param_updates.clone())
-                                .filter(|u| !u.is_empty()),
+                                .map(|v| (v.param_updates.clone(), v.param_slot))
+                                .filter(|(u, _)| !u.is_empty()),
                             live_vst_chain.as_mut(),
                         ) {
-                            chain.apply_params(&updates);
+                            if let Some(slot) = slot {
+                                chain.apply_params_to(slot, &updates);
+                            } else {
+                                chain.apply_params(&updates);
+                            }
                         }
 
                         // Seek: drain the ring, seek the source, continue.
@@ -1050,10 +1057,35 @@ impl PlaybackEngine {
     /// Apply parameter values (id -> normalized) to the chain slot the
     /// editor GUI is editing. The worker picks these up between chunks
     /// and pushes them into the out-of-process plugin.
-    pub fn set_vst_params(&self, params: std::collections::HashMap<u32, f64>) {
+    pub fn set_vst_params(&self, slot: usize, params: std::collections::HashMap<u32, f64>) {
         if let Ok(mut live) = self.shared.vst.lock() {
             live.param_updates = params;
+            live.param_slot = Some(slot);
         }
+    }
+
+    /// Set ONE parameter value on a chain slot from the generic panel:
+    /// merges into the live param map when it targets the same slot the
+    /// map belongs to, otherwise starts a fresh map for that slot.
+    pub fn set_vst_param_value(&self, slot: usize, id: u32, value: f64) {
+        if let Ok(mut live) = self.shared.vst.lock() {
+            if live.param_slot != Some(slot) {
+                live.param_updates.clear();
+                live.param_slot = Some(slot);
+            }
+            live.param_updates.insert(id, value);
+        }
+    }
+
+    /// The live param map for a chain slot (empty when none).
+    pub fn vst_param_map(&self, slot: usize) -> std::collections::HashMap<u32, f64> {
+        self.shared
+            .vst
+            .lock()
+            .ok()
+            .filter(|v| v.param_slot == Some(slot))
+            .map(|v| v.param_updates.clone())
+            .unwrap_or_default()
     }
 
     /// Whether the current track ended naturally (for next-track

@@ -20,6 +20,7 @@ mod host;
 pub use error::VstError;
 pub use gui::{PluginGui, open_gui};
 pub use host::{
-    PluginDescriptor, VstPluginChain, VstPluginHandle, VstPluginList, scan_available_plugins,
-    test_plugin_load,
+    PluginDescriptor, PluginParam, VstPluginChain, VstPluginHandle, VstPluginList,
+    list_preset_files, load_preset_and_params, probe_params, save_preset_file,
+    scan_available_plugins, test_plugin_load,
 };

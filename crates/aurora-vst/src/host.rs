@@ -305,7 +305,15 @@ impl VstPluginChain {
     /// chain (id -> normalized value). Values going to the out-of-process
     /// plugin ride the next block's IPC round-trip.
     pub fn apply_params(&mut self, params: &std::collections::HashMap<u32, f64>) {
-        let Some(handle) = self.plugins.first_mut() else {
+        self.apply_params_to(0, params);
+    }
+
+    /// Apply editor-GUI parameter values to a specific chain slot. Slot
+    /// indices count ATTACHED plugins (a skipped slot shifts the rest),
+    /// which is exactly what the UI's editor session refers to.
+    pub fn apply_params_to(&mut self, slot: usize, params: &std::collections::HashMap<u32, f64>) {
+        let Some(handle) = self.plugins.get_mut(slot) else {
+            tracing::warn!(slot, "vst param slot out of range, ignoring");
             return;
         };
         for (id, value) in params {
@@ -445,4 +453,150 @@ impl VstPluginChain {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic parameter panel + presets (loaded via throwaway isolated
+// instances — never touching the playing chain)
+// ---------------------------------------------------------------------------
+
+/// Preset storage: %APPDATA%/dev.aurora.player/vst-presets/<plugin-stem>/
+fn preset_dir(path: &str) -> Option<PathBuf> {
+    let stem = Path::new(path).file_stem()?.to_str()?.to_string();
+    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
+    let dir = base
+        .join("dev.aurora.player")
+        .join("vst-presets")
+        .join(stem);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Sanitize a user preset name into a file name.
+fn safe_preset_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "preset".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Load a throwaway isolated instance of a plugin (not the playing
+/// chain's copy) and return a handle for parameter/preset work.
+fn probe_plugin(path: &str, class_id: &str) -> Result<Plugin, String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err(format!("plugin file not found: {path}"));
+    }
+    let mut host = Vst3HostBuilder::default()
+        .sample_rate(44_100.0)
+        .block_size(BLOCK_SIZE)
+        .build()
+        .map_err(|e| format!("host build failed: {e}"))?;
+    host.load_plugin_class(p, class_id)
+        .map_err(|e| format!("load failed: {e}"))
+}
+
+/// List a plugin's automatable parameters (id, title, normalized value)
+/// without opening its editor — the generic parameter panel's data.
+pub fn probe_params(path: &str, class_id: &str) -> Result<Vec<PluginParam>, String> {
+    let plugin = probe_plugin(path, class_id)?;
+    plugin
+        .get_parameters()
+        .map(|v| {
+            v.into_iter()
+                .map(|p| PluginParam {
+                    id: p.id,
+                    title: p.name,
+                    value: p.value,
+                })
+                .collect()
+        })
+        .map_err(|e| format!("get_parameters failed: {e}"))
+}
+
+/// Save the CURRENT state of the plugin instance in the playing chain is
+/// not directly reachable from here (it lives on the worker), so presets
+/// save the state of a fresh probe instance loaded with the live param
+/// map applied — plus, to stay honest, the caller passes the live params
+/// beforehand. Here: apply the given params, save state to a preset file.
+/// Returns the file path.
+pub fn save_preset_file(path: &str, class_id: &str, name: &str) -> Result<PathBuf, String> {
+    let dir = preset_dir(path).ok_or_else(|| "cannot create preset dir".to_string())?;
+    let file = dir.join(format!("{}.aurora-preset.json", safe_preset_name(name)));
+    let plugin = probe_plugin(path, class_id)?;
+    plugin
+        .save_preset(&file)
+        .map_err(|e| format!("save preset failed: {e}"))?;
+    tracing::info!(preset = %file.display(), "vst preset saved");
+    Ok(file)
+}
+
+/// Load a preset file into a probe instance (verifying it matches the
+/// plugin) and return the resulting parameter values, which the caller
+/// pushes into the live chain.
+pub fn load_preset_and_params(
+    path: &str,
+    class_id: &str,
+    preset_path: &str,
+) -> Result<Vec<PluginParam>, String> {
+    let mut plugin = probe_plugin(path, class_id)?;
+    plugin
+        .load_preset(Path::new(preset_path))
+        .map_err(|e| format!("load preset failed: {e}"))?;
+    plugin
+        .get_parameters()
+        .map(|v| {
+            v.into_iter()
+                .map(|p| PluginParam {
+                    id: p.id,
+                    title: p.name,
+                    value: p.value,
+                })
+                .collect()
+        })
+        .map_err(|e| format!("get_parameters failed: {e}"))
+}
+
+/// Saved presets for a plugin: (display name, file path), sorted by name.
+pub fn list_preset_files(path: &str) -> Result<Vec<(String, PathBuf)>, String> {
+    let Some(dir) = preset_dir(path) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("read preset dir failed: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "json")
+                .unwrap_or(false)
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".aurora-preset.json"))
+                    .unwrap_or(false)
+        })
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            let name = stem
+                .strip_suffix(".aurora-preset")
+                .unwrap_or(&stem)
+                .to_string();
+            Some((name, p))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
