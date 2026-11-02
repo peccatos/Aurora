@@ -1,34 +1,46 @@
-//! Plugin editor GUI windows.
+//! Plugin editor GUI windows — **out-of-process** (ADR 0004 amendment).
 //!
-//! ADR 0004 amendment: the audio chain stays out-of-process (crash-safe),
-//! but a plugin *editor window* is a GUI-thread concern: the isolated
-//! helper on Windows does not host GUIs, so the editor runs as a second
-//! in-process instance in a dedicated GUI thread with its own Win32
-//! message pump. Parameter changes the user makes in the editor are
-//! forwarded to the audio chain through a callback (honest trade-off:
-//! the GUI instance shares parameters, not DSP state).
+//! The first in-process attempt crashed the whole player when a plugin's
+//! editor initialization faulted (thread isolation does not protect from
+//! a segfault). Now the editor runs in the `vst-gui-helper` binary: it
+//! loads the plugin, opens the native window, pumps messages, and prints
+//! parameter snapshots (JSON lines) on stdout. A crashing editor kills
+//! the helper window — never the player.
+//!
+//! The helper lives next to the executable (cargo builds it into
+//! `target/<profile>/`, same tree as the app in dev; deployment ships it
+//! beside the binary).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::io::{BufRead, Write};
+use std::process::{Child, Command, Stdio};
 
-/// Parameter-change callback: full (id, normalized value) snapshot from
-/// the editor GUI.
-pub type ParamSnapshot = Box<dyn Fn(Vec<(u32, f64)>) + Send + 'static>;
-
-/// A running plugin editor window. Dropping it closes the window.
+/// A running plugin editor window. `Drop` closes it (kills the helper).
 pub struct PluginGui {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    child: Option<Child>,
 }
 
 impl PluginGui {
-    /// Signal the GUI thread to close and wait for it.
+    /// Ask the helper to close (its window teardown runs in the helper)
+    /// and wait for a clean exit, then force-kill.
     pub fn close(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Some(mut child) = self.child.take() {
+            // Best-effort graceful: the helper's stdin thread reads this.
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = writeln!(stdin, "close");
+                let _ = stdin.flush();
+            }
+            let _ = child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
         }
+    }
+
+    /// Whether the helper process is still alive (editor window open).
+    pub fn is_alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .map(|c| matches!(c.try_wait(), Ok(None)))
+            .unwrap_or(false)
     }
 }
 
@@ -38,114 +50,100 @@ impl Drop for PluginGui {
     }
 }
 
-/// Open a plugin's editor window. `on_params` fires (on a GUI thread)
-/// whenever the user changes a parameter in the editor, with the full
-/// (id, normalized value) list — the host forwards these to the audio
-/// chain.
-#[cfg(target_os = "windows")]
+/// Parameter-change callback: full (id, normalized value) snapshot from
+/// the editor.
+pub type ParamSnapshot = Box<dyn Fn(Vec<(u32, f64)>) + Send + 'static>;
+
+/// Open a plugin's editor window in a helper process. `on_params` fires
+/// (on a reader thread) whenever the user changes parameters in the
+/// editor; the host forwards these to the audio chain.
 pub fn open_gui(path: &str, class_id: &str, on_params: ParamSnapshot) -> Result<PluginGui, String> {
-    use vst3_host::{PluginWindow, Vst3HostBuilder};
+    let helper = find_helper_binary()
+        .ok_or_else(|| "vst-gui-helper not found (build it beside the application)".to_string())?;
 
-    let path = path.to_string();
-    let class_id = class_id.to_string();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = Arc::clone(&stop);
+    let mut child = Command::new(helper)
+        .arg(path)
+        .arg(class_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn vst-gui-helper: {e}"))?;
 
-    // Everything plugin-related happens inside this thread: COM pointers
-    // and the native window must not cross a thread boundary.
-    let thread = std::thread::Builder::new()
-        .name("aurora-vst-gui".into())
+    let stdout = child.stdout.take().ok_or("helper stdout unavailable")?;
+    std::thread::Builder::new()
+        .name("aurora-vst-gui-reader".into())
         .spawn(move || {
-            let mut host = match Vst3HostBuilder::default()
-                .with_process_isolation(false)
-                .sample_rate(44_100.0)
-                .block_size(crate::host::BLOCK_SIZE)
-                .build()
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(%e, "vst gui: host build failed");
-                    return;
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if let Some(params) = parse_params_line(&line) {
+                    on_params(params);
                 }
-            };
-            let plugin = match host.load_plugin_class(&path, &class_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(%e, %path, "vst gui: plugin load failed");
-                    return;
-                }
-            };
-            let plugin = Arc::new(std::sync::Mutex::new(plugin));
-            let mut window = PluginWindow::new(Arc::clone(&plugin));
-            if let Err(e) = window.open() {
-                tracing::warn!(%e, "vst gui: editor open failed");
-                return;
             }
-            tracing::info!(%path, "vst gui: editor window open");
-
-            let mut last_report = Instant::now() - Duration::from_secs(1);
-            let mut last_params: Vec<(u32, f64)> = Vec::new();
-            while !stop_thread.load(Ordering::Acquire) {
-                pump_windows_messages();
-                let _ = window.service_platform_events();
-                if window.closed_by_user() || !window.is_open() {
-                    break;
-                }
-                // Parameter sync: poll the editor's values ~5x/sec; the
-                // plugin reports its own parameter state, so any control
-                // the user moved shows up here.
-                if last_report.elapsed() >= Duration::from_millis(200) {
-                    last_report = Instant::now();
-                    let params: Vec<(u32, f64)> = plugin
-                        .lock()
-                        .ok()
-                        .and_then(|p| {
-                            p.get_parameters()
-                                .ok()
-                                .map(|v| v.into_iter().map(|x| (x.id, x.value)).collect())
-                        })
-                        .unwrap_or_default();
-                    if params != last_params {
-                        on_params(params.clone());
-                        last_params = params;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            window.close();
-            tracing::info!(%path, "vst gui: editor window closed");
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("reader thread spawn failed: {e}"))?;
 
-    Ok(PluginGui {
-        stop,
-        thread: Some(thread),
-    })
+    Ok(PluginGui { child: Some(child) })
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn open_gui(
-    _path: &str,
-    _class_id: &str,
-    _on_params: Box<dyn Fn(Vec<(u32, f64)>) + Send + 'static>,
-) -> Result<PluginGui, String> {
-    Err("plugin editor windows are only supported on Windows in this build".into())
+/// Parse `{"params":[{"id":0,"value":0.5},...]}` (the helper's output
+/// format). Hand-rolled to keep the helper/JSON surface minimal.
+fn parse_params_line(line: &str) -> Option<Vec<(u32, f64)>> {
+    let start = line.find("\"params\":")?;
+    let mut rest = &line[start + 9..];
+    let mut out = Vec::new();
+    while let Some(id_pos) = rest.find("\"id\":") {
+        rest = &rest[id_pos + 5..];
+        let id_end = rest.find(|c: char| !c.is_ascii_digit())?;
+        let id: u32 = rest[..id_end].parse().ok()?;
+        let val_pos = rest.find("\"value\":")?;
+        rest = &rest[val_pos + 8..];
+        let val_end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))?;
+        let value: f64 = rest[..val_end].parse().ok()?;
+        out.push((id, value));
+    }
+    Some(out)
 }
 
-/// Non-blocking Win32 message pump: dispatch everything queued for this
-/// thread's windows. The editor's window was created on this thread, so
-/// its messages (paint, input, DPI) are served here.
-#[cfg(target_os = "windows")]
-fn pump_windows_messages() {
-    use std::mem;
-    use std::ptr;
-    use winapi::um::winuser::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
-
-    unsafe {
-        let mut msg: MSG = mem::zeroed();
-        while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+/// Locate `vst-gui-helper(.exe)`: beside the current executable first
+/// (deployed layout), then the cargo target tree (dev layout).
+fn find_helper_binary() -> Option<std::path::PathBuf> {
+    let name = format!("vst-gui-helper{}", std::env::consts::EXE_SUFFIX);
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    let beside = dir.join(&name);
+    if beside.exists() {
+        return Some(beside);
+    }
+    // Dev: the app lives in target/debug/ (or deps/); helpers build
+    // into the same tree.
+    for ancestor in dir.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+            for profile in ["debug", "release"] {
+                let p = ancestor.join(profile).join(&name);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
         }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_helper_param_lines() {
+        let line = r#"{"params":[{"id":0,"value":0.5},{"id":12,"value":0.75}]}"#;
+        let params = parse_params_line(line).expect("parse");
+        assert_eq!(params, vec![(0, 0.5), (12, 0.75)]);
+    }
+
+    #[test]
+    fn empty_params_line() {
+        assert_eq!(parse_params_line(r#"{"params":[]}"#), Some(Vec::new()));
     }
 }
