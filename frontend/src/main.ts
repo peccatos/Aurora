@@ -187,16 +187,16 @@ app.innerHTML = `
 
       <!-- LIBRARY -->
       <section class="panel library" id="library-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">LIBRARY · SQLITE</span>
-          <div class="eq-meta">
-            <button id="lib-open" type="button" class="ghost">Open library…</button>
-            <button id="lib-scan" type="button" class="accent">Scan folder…</button>
-            <button id="lib-refresh" type="button" class="ghost">↻ Rescan</button>
-            <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
-            <button id="lib-play-sel" type="button" class="ghost" disabled>▶ Play selected</button>
-            <button id="lib-queue-sel" type="button" class="ghost" disabled>+ Queue</button>
-          </div>
+        </div>
+        <div class="panel-toolbar">
+          <input id="lib-search" type="search" placeholder="Search title, artist, album…" aria-label="Search" />
+          <button id="lib-open" type="button" class="ghost">Open library…</button>
+          <button id="lib-scan" type="button" class="accent">Scan folder…</button>
+          <button id="lib-refresh" type="button" class="ghost">↻ Rescan</button>
+          <button id="lib-play-sel" type="button" class="ghost" disabled>▶ Play selected</button>
+          <button id="lib-queue-sel" type="button" class="ghost" disabled>+ Queue</button>
         </div>
         <div class="lib-layout">
           <div class="lib-playlists">
@@ -215,9 +215,9 @@ app.innerHTML = `
 
       <!-- QUEUE -->
       <section class="panel queue-panel" id="queue-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">QUEUE</span>
-          <div class="eq-meta">
+          <div class="panel-toolbar">
             <span id="queue-count" class="lib-count"></span>
             <button id="queue-clear" type="button" class="ghost">Clear</button>
           </div>
@@ -227,40 +227,47 @@ app.innerHTML = `
 
       <!-- EQ -->
       <section class="panel eq-panel" id="eq-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">PARAMETRIC EQ · 10 BAND</span>
-          <div class="eq-meta">
-            <select id="eq-preset" aria-label="Preset">
-              <option value="flat">Flat</option>
-              <option value="bass">Bass Boost</option>
-              <option value="vocal">Vocal</option>
-              <option value="rock">Rock</option>
-              <option value="jazz">Jazz</option>
-              <option value="electronic">Electronic</option>
-              <option value="classical">Classical</option>
-              <option value="night">Late Night</option>
-            </select>
-            <label>Preamp <input id="eq-preamp" type="range" min="-12" max="12" step="0.5" value="0" /> <span id="eq-preamp-v">0.0 dB</span></label>
-            <label>Volume <input id="eq-volume" type="range" min="-40" max="12" step="0.5" value="0" /> <span id="eq-volume-v">0.0 dB</span></label>
-            <button id="eq-flat" type="button" class="ghost">Flat</button>
-          </div>
+        </div>
+        <div class="panel-toolbar">
+          <select id="eq-preset" aria-label="Preset">
+            <option value="flat">Flat</option>
+            <option value="bass">Bass Boost</option>
+            <option value="vocal">Vocal</option>
+            <option value="rock">Rock</option>
+            <option value="jazz">Jazz</option>
+            <option value="electronic">Electronic</option>
+            <option value="classical">Classical</option>
+            <option value="night">Late Night</option>
+          </select>
+          <button id="eq-flat" type="button" class="ghost">Flat</button>
         </div>
         <div id="eq-bands" class="eq-bands"></div>
+        <div class="panel-row">
+          <label class="ctl">Preamp <input id="eq-preamp" type="range" min="-12" max="12" step="0.5" value="0" /> <span id="eq-preamp-v">0.0 dB</span></label>
+          <label class="ctl">Volume <input id="eq-volume" type="range" min="-40" max="12" step="0.5" value="0" /> <span id="eq-volume-v">0.0 dB</span></label>
+        </div>
         <p class="eq-note" id="eq-note">Flat EQ = bit-exact passthrough.</p>
       </section>
 
       <!-- REVERB & SPEED -->
       <section class="panel reverb-panel" id="reverb-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">REVERB · FREEVERB</span>
           <button id="reverb-off" type="button" class="ghost">Off</button>
         </div>
         <div class="reverb-controls">
-          <label>Wet <input id="rv-wet" type="range" min="0" max="1" step="0.01" value="0" /><b id="rv-wet-v">0%</b></label>
-          <label>Room <input id="rv-room" type="range" min="0" max="1" step="0.01" value="0.5" /><b id="rv-room-v">0.50</b></label>
-          <label>Damp <input id="rv-damp" type="range" min="0" max="1" step="0.01" value="0.3" /><b id="rv-damp-v">0.30</b></label>
-          <label>Width <input id="rv-width" type="range" min="0" max="1" step="0.01" value="1" /><b id="rv-width-v">1.00</b></label>
-          <label>Speed <input id="fx-speed" type="range" min="0.5" max="2" step="0.05" value="1" /><b id="fx-speed-v">1.00x</b></label>
+          <label class="ctl">Wet <input id="rv-wet" type="range" min="0" max="1" step="0.01" value="0" /><b id="rv-wet-v">0%</b></label>
+          <label class="ctl">Room <input id="rv-room" type="range" min="0" max="1" step="0.01" value="0.5" /><b id="rv-room-v">0.50</b></label>
+          <label class="ctl">Damp <input id="rv-damp" type="range" min="0" max="1" step="0.01" value="0.3" /><b id="rv-damp-v">0.30</b></label>
+          <label class="ctl">Width <input id="rv-width" type="range" min="0" max="1" step="0.01" value="1" /><b id="rv-width-v">1.00</b></label>
+        </div>
+        <div class="panel-head" style="margin-top: 4px;">
+          <span class="eyebrow">SPEED</span>
+        </div>
+        <div class="panel-row">
+          <label class="ctl">Speed <input id="fx-speed" type="range" min="0.5" max="2" step="0.05" value="1" /><b id="fx-speed-v">1.00x</b></label>
           <button id="fx-slowed" type="button" class="ghost">Slowed</button>
           <button id="fx-speedup" type="button" class="ghost">Speed Up</button>
         </div>
@@ -268,31 +275,36 @@ app.innerHTML = `
 
       <!-- VST3 -->
       <section class="panel vst-panel" id="vst-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">VST3 · OUT-OF-PROCESS CHAIN</span>
-          <div class="eq-meta">
-            <button id="vst-scan" type="button" class="ghost">Scan plugins…</button>
-            <button id="vst-clear" type="button" class="ghost">Chain off</button>
-            <span id="vst-note" class="lib-count"></span>
-          </div>
+        </div>
+        <div class="panel-toolbar">
+          <button id="vst-scan" type="button" class="ghost">Scan plugins…</button>
+          <button id="vst-clear" type="button" class="ghost">Chain off</button>
         </div>
         <ul id="vst-list" class="vst-list"></ul>
+        <p id="vst-note" class="eq-note vst-note-line"></p>
         <p class="eq-note">Plugins load into an isolated helper process — a crashing plugin never takes the player down. Active plugins disable bit-perfect (honest report).</p>
       </section>
 
       <!-- SETTINGS -->
       <section class="panel settings-panel" id="settings-panel">
-        <div class="eq-head">
+        <div class="panel-head">
           <span class="eyebrow">OUTPUT · DEVICE</span>
         </div>
         <div class="settings-controls">
-          <label>Output device <select id="device-select" aria-label="Output device"></select></label>
+          <label class="ctl">Output device <select id="device-select" aria-label="Output device"></select></label>
+        </div>
+        <div class="panel-head" style="margin-top: 4px;">
+          <span class="eyebrow">FILE · BIT-PERFECT</span>
+        </div>
+        <div class="settings-controls">
           <button id="pick-file" type="button" class="accent">Open file…</button>
           <button id="btn-bitperfect" type="button" class="ghost" disabled title="Play through WASAPI exclusive mode — no mixer, no DSP, exact source bytes">◎ Bit-perfect</button>
           <button id="btn-verify" type="button" class="ghost" disabled title="Physically capture what the endpoint rendered and compare byte-for-byte">✓ Verify</button>
-          <span id="bitperfect-note" class="bitperfect-note"></span>
           <button id="btn-recover" type="button" class="accent" hidden>↻ Recover & Replay</button>
         </div>
+        <p id="bitperfect-note" class="bitperfect-note"></p>
       </section>
     </main>
   </div>
