@@ -12,11 +12,51 @@ use tauri::Manager;
 use aurora_tauri::commands;
 
 /// Initialize process-wide observability (tracing).
+///
+/// Logs go to stderr AND a daily-rotating file in the app-data log dir:
+/// when a crash kills the console window, the file still holds the last
+/// lines before the death (the "app falls over, no trace" debugging gap).
 pub fn initialize_observability() {
+    use tracing_subscriber::layer::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter.clone());
+
+    let file_layer = log_dir().map(|dir| {
+        let appender = tracing_appender::rolling::daily(dir, "aurora.log");
+        let (writer, _guard) = tracing_appender::non_blocking(appender);
+        // Leak the guard: the writer must outlive any scope we could tie
+        // it to; the process end flushes.
+        std::mem::forget(_guard);
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(filter)
+    });
+
+    let result = if let Some(file_layer) = file_layer {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(file_layer)
+            .try_init()
+    } else {
+        tracing_subscriber::registry().with(fmt_layer).try_init()
+    };
+    let _ = result;
+}
+
+/// The log dir: `<app-data>/logs` (Roaming profile next to library.db).
+fn log_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)?
+        .join("dev.aurora.player")
+        .join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 /// Install platform-appropriate termination handling.

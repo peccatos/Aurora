@@ -76,6 +76,13 @@ struct Shared {
     /// `take_stream_error`, stops the dead stream and can re-play on
     /// another device. Never panics the process (invariant 8).
     stream_error: Arc<AtomicBool>,
+    /// Native->DSP transition request: the worker sets it when the user
+    /// activates DSP on a native (bit-exact) stream — the native path has
+    /// no pipeline, so the stream must restart through the DSP path. The
+    /// app layer polls `take_dsp_transition` and re-plays the track.
+    needs_dsp_restart: Arc<AtomicBool>,
+    /// The path of the track currently playing (for the restart re-play).
+    current_path: Arc<Mutex<Option<PathBuf>>>,
     /// Worker panic signal (Phase 8): the decode worker is caught with
     /// catch_unwind; a panicking worker sets this, the stream drains out
     /// (silence), and the app layer reports the failure instead of dying.
@@ -154,6 +161,8 @@ impl PlaybackEngine {
                 drain: Arc::new(AtomicBool::new(false)),
                 track_ended: Arc::new(AtomicBool::new(false)),
                 stream_error: Arc::new(AtomicBool::new(false)),
+                needs_dsp_restart: Arc::new(AtomicBool::new(false)),
+                current_path: Arc::new(Mutex::new(None)),
                 seek_rebase: Arc::new(Mutex::new(None)),
                 worker_panicked: Arc::new(AtomicBool::new(false)),
                 vst: Arc::new(Mutex::new(LiveVst {
@@ -292,6 +301,7 @@ impl PlaybackEngine {
         let live_seek_rebase = Arc::clone(&self.shared.seek_rebase);
         let worker_frames_played = Arc::clone(&self.metrics);
         let live_vst = Arc::clone(&self.shared.vst);
+        let worker_restart_flag = Arc::clone(&self.shared.needs_dsp_restart);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -420,6 +430,27 @@ impl PlaybackEngine {
                                 Err(_) => false,
                             }
                         };
+                        if needs_recompile && plays_native {
+                            // The stream started on the native (bit-exact)
+                            // path because the DSP was bypassed; the user
+                            // has now activated EQ/reverb/speed. The native
+                            // path has no pipeline, so the stream must
+                            // restart through the DSP path: flag it for the
+                            // app layer (which re-plays the track).
+                            let now_active = live_dsp
+                                .lock()
+                                .ok()
+                                .map(|d| !d.config.is_bypassed())
+                                .unwrap_or(false);
+                            if now_active {
+                                tracing::info!("dsp activated on native stream; restart requested");
+                                worker_restart_flag.store(true, Ordering::Release);
+                            }
+                            compiled_version = live_dsp
+                                .lock()
+                                .map(|d| d.version)
+                                .unwrap_or(compiled_version);
+                        }
                         if needs_recompile && !plays_native {
                             let new_cfg = live_dsp
                                 .lock()
@@ -789,6 +820,9 @@ impl PlaybackEngine {
         self.transformations = transformations;
         self.device_key = Some(device.key().to_string());
         self.source_format = Some(source_format);
+        if let Ok(mut slot) = self.shared.current_path.lock() {
+            *slot = Some(path);
+        }
         *self.state.lock().expect("state mutex") = EngineState::Playing;
 
         tracing::info!(
@@ -1026,6 +1060,48 @@ impl PlaybackEngine {
     /// auto-advance); consumes the flag.
     pub fn take_track_ended(&self) -> bool {
         self.shared.track_ended.swap(false, Ordering::AcqRel)
+    }
+
+    /// True when DSP was activated on a native-path stream since the last
+    /// check: the caller should restart the track (`restart_for_dsp`).
+    /// Consumes the flag.
+    pub fn take_dsp_transition(&self) -> bool {
+        self.shared.needs_dsp_restart.swap(false, Ordering::AcqRel)
+    }
+
+    /// Restart the current track through the DSP path (native -> DSP
+    /// transition: the native stream has no pipeline, so the track must
+    /// re-play). Returns false when nothing is playing.
+    pub fn restart_for_dsp(&mut self) -> bool {
+        let path = self
+            .shared
+            .current_path
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take());
+        let Some(path) = path else {
+            return false;
+        };
+        let device = self
+            .device_key
+            .as_deref()
+            .and_then(|key| {
+                crate::device::output_devices()
+                    .ok()
+                    .and_then(|ds| ds.into_iter().find(|d| d.key() == key))
+            })
+            .or_else(|| crate::device::default_output_device().ok());
+        let Some(device) = device else {
+            return false;
+        };
+        let dsp = self
+            .shared
+            .dsp
+            .lock()
+            .ok()
+            .map(|d| d.config.clone())
+            .unwrap_or_default();
+        self.play_with_replaygain(path, &device, dsp, None).is_ok()
     }
 
     /// True when the output stream reported an error since the last check

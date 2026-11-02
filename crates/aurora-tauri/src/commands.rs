@@ -843,9 +843,16 @@ pub fn set_dsp(
         let mut dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
         *dsp = config.clone();
     }
-    // ...and applied live to the playing stream.
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    // ...and applied live to the playing stream. When the stream runs on
+    // the native (bit-exact) path and DSP just became active, the worker
+    // flags a restart: the native path has no pipeline, the track re-plays
+    // through the DSP path.
+    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
     engine.set_dsp_config(config.clone());
+    if engine.take_dsp_transition() {
+        tracing::info!("restarting stream through the DSP path");
+        let _ = engine.restart_for_dsp();
+    }
     Ok(config)
 }
 

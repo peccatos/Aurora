@@ -466,8 +466,15 @@ function renderStatus(status: PlaybackStatus) {
     intMini.textContent = status.integrity.toUpperCase();
     intMini.className = "pb-int " + (status.integrity === "verified" ? "ok" : "");
   }
+  // Main button shows the ACTION (what clicking does): pause while
+  // playing (⏸), resume while paused (⏵), play from idle (▶).
   const playBtn = document.querySelector<HTMLButtonElement>(".pb-main");
-  if (playBtn) playBtn.textContent = status.state === "paused" ? "⏵" : "▶";
+  if (playBtn) {
+    playBtn.textContent =
+      status.state === "playing" ? "⏸"
+      : status.state === "paused" ? "⏵"
+      : "▶";
+  }
 
   if (status.fault) {
     setNote(`⚠ ${status.fault} — playback recovered safe; use Replay to retry.`);
