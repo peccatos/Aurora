@@ -14,9 +14,11 @@
 //!   plugin is active (ADR 0002).
 
 mod error;
+mod gui;
 mod host;
 
 pub use error::VstError;
+pub use gui::{PluginGui, open_gui};
 pub use host::{
     PluginDescriptor, VstPluginChain, VstPluginHandle, VstPluginList, scan_available_plugins,
     test_plugin_load,

@@ -301,6 +301,20 @@ impl VstPluginChain {
         self.plugins.is_empty()
     }
 
+    /// Apply editor-GUI parameter values to the first plugin in the
+    /// chain (id -> normalized value). Values going to the out-of-process
+    /// plugin ride the next block's IPC round-trip.
+    pub fn apply_params(&mut self, params: &std::collections::HashMap<u32, f64>) {
+        let Some(handle) = self.plugins.first_mut() else {
+            return;
+        };
+        for (id, value) in params {
+            if let Err(e) = handle.plugin.set_parameter(*id, *value) {
+                tracing::warn!(%e, id, "vst param apply failed");
+            }
+        }
+    }
+
     /// The honest transformation list (ADR 0002).
     pub fn transformations(&self) -> Vec<AudioTransformation> {
         if self.plugins.is_empty() {

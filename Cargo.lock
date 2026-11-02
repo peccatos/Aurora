@@ -312,6 +312,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "vst3-host",
+ "winapi",
 ]
 
 [[package]]

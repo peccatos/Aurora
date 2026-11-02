@@ -1016,6 +1016,43 @@ function renderVstList() {
     ul.appendChild(li);
   }
 
+  // Section 1b: attached plugins get an "Open editor" button (the
+  // plugin's own GUI window, native, with its own message pump).
+  for (const p of vstFound) {
+    const attached = vstSlots.some(
+      (s) => s.path === p.path && s.class_id === p.class_id,
+    );
+    if (!attached) continue;
+    const li = document.createElement("li");
+    li.className = "queue-row";
+    const name = document.createElement("span");
+    name.className = "queue-name";
+    name.textContent = `${p.name} editor`;
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "ghost";
+    open.textContent = "⚙ Open editor";
+    open.title = "Open the plugin's own GUI window (parameters sync live into the chain)";
+    open.addEventListener("click", async () => {
+      try {
+        open.disabled = true;
+        open.textContent = "Opening…";
+        await invoke("open_vst_editor", { path: p.path, classId: p.class_id });
+        vstNote(`${p.name} editor window open — tweak knobs there; the chain hears it.`);
+      } catch (e) {
+        const msg = typeof e === "object" && e && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+        vstNote(`${p.name} editor: ${msg}`, true);
+      } finally {
+        open.disabled = false;
+        open.textContent = "⚙ Open editor";
+      }
+    });
+    li.append(name, open);
+    ul.appendChild(li);
+  }
+
   // Section 2: active chain (remove with ×).
   vstSlots.forEach((slot, idx) => {
     const li = document.createElement("li");

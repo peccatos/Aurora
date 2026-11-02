@@ -29,6 +29,9 @@ pub struct AppState {
     pub library_path_slot: std::sync::Mutex<Option<PathBuf>>,
     /// Selected output device key ("" = default). Persisted to settings.
     pub device_key: std::sync::Mutex<Option<String>>,
+    /// Open plugin editor GUI session (one at a time; the window owns
+    /// its own GUI thread with a Win32 message pump).
+    pub vst_gui: std::sync::Mutex<Option<aurora_vst::PluginGui>>,
 }
 
 /// One queue entry: the path plus what the engine needs from the library
@@ -103,6 +106,7 @@ impl AppState {
             library: tokio::sync::Mutex::new(None),
             library_path_slot: std::sync::Mutex::new(None),
             device_key: std::sync::Mutex::new(None),
+            vst_gui: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1113,6 +1117,55 @@ pub fn test_vst_plugin(path: String, class_id: String) -> Result<String, Command
         .map_err(|reason| CommandError::Engine { message: reason })
 }
 
+/// Open the plugin's editor window (its own GUI thread + Win32 message
+/// pump; the audio chain stays out-of-process). Parameter changes made
+/// in the editor flow into the chain live. One editor at a time.
+#[tauri::command]
+pub fn open_vst_editor(
+    path: String,
+    class_id: String,
+    state: State<AppState>,
+) -> Result<(), CommandError> {
+    let mut gui_slot = state.vst_gui.lock().map_err(|_| CommandError::Poisoned)?;
+    // One editor at a time: close the previous session first.
+    if let Some(mut old) = gui_slot.take() {
+        old.close();
+    }
+    // The GUI thread forwards editor parameter snapshots into the
+    // engine's live param slot; the worker applies them to the chain
+    // between chunks.
+    let engine = {
+        let guard = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+        let ptr: *const PlaybackEngine = &*guard;
+        // SAFETY: the engine lives in AppState for the whole app
+        // lifetime (managed state is never dropped before commands end);
+        // the GUI thread only calls set_vst_params, which locks the
+        // shared mutex, so the borrow is read-only and synchronized.
+        unsafe { &*ptr }
+    };
+    let gui = aurora_vst::open_gui(
+        &path,
+        &class_id,
+        Box::new(move |params| {
+            engine.set_vst_params(params.into_iter().collect());
+        }),
+    )
+    .map_err(|reason| CommandError::Engine { message: reason })?;
+    *gui_slot = Some(gui);
+    tracing::info!(%path, "vst editor window opened");
+    Ok(())
+}
+
+/// Close the open plugin editor window, if any.
+#[tauri::command]
+pub fn close_vst_editor(state: State<AppState>) -> Result<(), CommandError> {
+    let mut gui_slot = state.vst_gui.lock().map_err(|_| CommandError::Poisoned)?;
+    if let Some(mut gui) = gui_slot.take() {
+        gui.close();
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Artwork (embedded cover art from tags, cache in app temp)
 // ---------------------------------------------------------------------------
@@ -1262,6 +1315,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             set_vst_chain,
             get_vst_chain,
             test_vst_plugin,
+            open_vst_editor,
+            close_vst_editor,
             get_track_artwork,
             pause_playback,
             resume_playback,

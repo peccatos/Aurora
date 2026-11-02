@@ -94,6 +94,13 @@ pub struct LiveVst {
     pub list: aurora_vst::VstPluginList,
     /// Bumped by set_vst; the worker reloads when it differs.
     pub version: u64,
+    /// Parameter updates from the editor GUI (id -> normalized value),
+    /// applied to the active chain by the worker between chunks. The GUI
+    /// replaces the whole map on every poll, so the last write wins.
+    pub param_updates: std::collections::HashMap<u32, f64>,
+    /// Which chain slot the param_updates belong to (editor GUI instance
+    /// index in the chain). None = no GUI session yet.
+    pub param_slot: Option<usize>,
 }
 
 /// Live DSP state shared with the worker.
@@ -152,6 +159,8 @@ impl PlaybackEngine {
                 vst: Arc::new(Mutex::new(LiveVst {
                     list: aurora_vst::VstPluginList::default(),
                     version: 0,
+                    param_updates: std::collections::HashMap::new(),
+                    param_slot: None,
                 })),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
@@ -491,6 +500,20 @@ impl PlaybackEngine {
                                 .unwrap_or(compiled_vst_version);
                             live_vst_chain = new_chain;
                             live_drain.store(true, Ordering::Release);
+                        }
+
+                        // Editor-GUI parameter updates: applied between
+                        // chunks; they ride the next block's IPC to the
+                        // isolated plugin.
+                        if let (Some(updates), Some(chain)) = (
+                            live_vst
+                                .lock()
+                                .ok()
+                                .map(|v| v.param_updates.clone())
+                                .filter(|u| !u.is_empty()),
+                            live_vst_chain.as_mut(),
+                        ) {
+                            chain.apply_params(&updates);
                         }
 
                         // Seek: drain the ring, seek the source, continue.
@@ -988,6 +1011,15 @@ impl PlaybackEngine {
             .lock()
             .map(|v| v.list.clone())
             .unwrap_or_default()
+    }
+
+    /// Apply parameter values (id -> normalized) to the chain slot the
+    /// editor GUI is editing. The worker picks these up between chunks
+    /// and pushes them into the out-of-process plugin.
+    pub fn set_vst_params(&self, params: std::collections::HashMap<u32, f64>) {
+        if let Ok(mut live) = self.shared.vst.lock() {
+            live.param_updates = params;
+        }
     }
 
     /// Whether the current track ended naturally (for next-track
