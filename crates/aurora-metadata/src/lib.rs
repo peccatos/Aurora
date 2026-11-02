@@ -51,6 +51,21 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata, MetadataError> {
     ))
 }
 
+/// Read the front-cover artwork bytes from an audio file, when the tag
+/// carries one (JPEG/PNG/BMP). `None` = no embedded artwork.
+pub fn read_cover_art(path: &Path) -> Result<Option<Vec<u8>>, MetadataError> {
+    let tagged = lofty::probe::read_from_path(path)?;
+    let Some(tag) = tagged.first_tag() else {
+        return Ok(None);
+    };
+    Ok(tag
+        .pictures()
+        .iter()
+        .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
+        .or_else(|| tag.pictures().first())
+        .map(|p| p.data().to_vec()))
+}
+
 /// Pure mapping from lofty results to the metadata struct.
 ///
 /// Exposed for tests: the lofty glue is trivial, the value is in the

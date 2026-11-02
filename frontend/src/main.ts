@@ -349,8 +349,8 @@ document.getElementById("nav")?.addEventListener("click", (ev) => {
   });
 });
 
-/** Update the now-playing hero + playbar titles. */
-function setNowPlaying(title: string, artist: string) {
+/** Update the now-playing hero + playbar titles + cover art. */
+function setNowPlaying(title: string, artist: string, path?: string | null) {
   const t = document.getElementById("np-title");
   if (t) t.textContent = title;
   const a = document.getElementById("np-artist");
@@ -359,6 +359,44 @@ function setNowPlaying(title: string, artist: string) {
   if (pt) pt.textContent = title;
   const pa = document.getElementById("pb-artist");
   if (pa) pa.textContent = artist;
+  if (path) loadArtwork(path);
+}
+
+/** Artwork memory cache: path -> data URL (or null = no art, cached). */
+const artworkCache = new Map<string, string | null>();
+
+/** Show embedded cover art on the now-playing hero (data URL). */
+async function loadArtwork(path: string) {
+  const art = document.getElementById("np-art");
+  if (!art) return;
+  if (artworkCache.has(path)) {
+    applyArtwork(art, artworkCache.get(path) ?? null);
+    return;
+  }
+  try {
+    const url = await invoke<string | null>("get_track_artwork", { path });
+    artworkCache.set(path, url);
+    applyArtwork(art, url);
+  } catch {
+    artworkCache.set(path, null);
+    applyArtwork(art, null);
+  }
+}
+
+function applyArtwork(art: HTMLElement, url: string | null) {
+  // Remove a previous art image; the placeholder glyph stays behind.
+  art.querySelectorAll("img").forEach((n) => n.remove());
+  const glyph = art.querySelector(".np-art-glyph");
+  if (!url) {
+    if (glyph) (glyph as HTMLElement).style.display = "";
+    return;
+  }
+  if (glyph) (glyph as HTMLElement).style.display = "none";
+  const img = document.createElement("img");
+  img.src = url;
+  img.alt = "Cover art";
+  img.className = "np-art-img";
+  art.appendChild(img);
 }
 
 function setNote(text: string) {
@@ -368,7 +406,24 @@ function setNote(text: string) {
 let lastStatus: PlaybackStatus | null = null;
 
 function renderStatus(status: PlaybackStatus) {
+  const prev = lastStatus;
   lastStatus = status;
+  // Track change detection: the previous track's diagnostics (rate/bits/
+  // duration) must not bleed into the new track's first render, and the
+  // seek bar must reset — but only ONCE per track change, not every poll.
+  const trackChanged =
+    prev != null &&
+    (prev.state === "idle" || prev.state === "draining") &&
+    status.state === "playing";
+  if (trackChanged) {
+    currentDurationS = status.duration_s ?? 0;
+    const bar = document.querySelector<HTMLInputElement>("#seek");
+    if (bar) bar.value = "0";
+    const cur = document.getElementById("seek-cur");
+    if (cur) cur.textContent = "0:00";
+  } else if (status.duration_s && status.duration_s > 0) {
+    currentDurationS = status.duration_s;
+  }
   $<HTMLElement>("st-state")!.textContent = status.state;
   $<HTMLElement>("st-rate")!.textContent =
     status.sample_rate ? `${(status.sample_rate / 1000).toFixed(1)} kHz` : "—";
@@ -378,9 +433,6 @@ function renderStatus(status: PlaybackStatus) {
     status.bits_per_sample ? `${status.bits_per_sample}-bit` : "—";
   $<HTMLElement>("st-transform")!.textContent =
     status.transformations.length ? status.transformations.join(", ") : "none";
-  if (status.duration_s && status.duration_s > 0) {
-    currentDurationS = status.duration_s;
-  }
   const integrityEl = $<HTMLElement>("st-integrity");
   if (integrityEl) {
     integrityEl.textContent =
@@ -533,7 +585,7 @@ btnPlay?.addEventListener("click", async () => {
       });
       renderStatus(status);
       const stem = selectedPath.split(/[\\/]/).pop() ?? selectedPath;
-      setNowPlaying(current?.title ?? stem, current?.artist ?? "—");
+      setNowPlaying(current?.title ?? stem, current?.artist ?? "—", selectedPath);
       setNote("Playing.");
     }
   } catch (e) {
@@ -735,7 +787,7 @@ function updateNowPlayingFromQueue(q: QueueDto) {
   const t = q.tracks[idx];
   if (!t) return;
   const stem = t.path.split(/[\\/]/).pop() ?? t.path;
-  setNowPlaying(t.title ?? stem, t.artist ?? "—");
+  setNowPlaying(t.title ?? stem, t.artist ?? "—", t.path);
 }
 
 async function nextTrack() {
@@ -1267,7 +1319,7 @@ async function playNow(tracks: TrackDto[]) {
     renderQueuePanel();
     if (btnPlay) btnPlay.disabled = true;
     const first = tracks[0];
-    setNowPlaying(first.title ?? first.display, first.artist ?? "—");
+    setNowPlaying(first.title ?? first.display, first.artist ?? "—", first.path);
     setNote(first.display);
   } catch (e) {
     setNote(`Play failed: ${String(e)}`);

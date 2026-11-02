@@ -17,6 +17,9 @@ pub enum CommandError {
     },
     #[serde(rename = "library_not_open")]
     LibraryNotOpen,
+    Metadata {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for CommandError {
@@ -27,6 +30,7 @@ impl std::fmt::Display for CommandError {
             CommandError::Device(key) => write!(f, "device not found: {key}"),
             CommandError::Library { message } => write!(f, "library error: {message}"),
             CommandError::LibraryNotOpen => write!(f, "library is not open"),
+            CommandError::Metadata { message } => write!(f, "metadata error: {message}"),
         }
     }
 }
@@ -44,6 +48,14 @@ impl From<aurora_audio::EngineError> for CommandError {
 impl From<aurora_storage::StorageError> for CommandError {
     fn from(err: aurora_storage::StorageError) -> Self {
         CommandError::Library {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<aurora_metadata::MetadataError> for CommandError {
+    fn from(err: aurora_metadata::MetadataError) -> Self {
+        CommandError::Metadata {
             message: err.to_string(),
         }
     }
