@@ -36,6 +36,22 @@ pub struct PluginDescriptor {
 /// crash or hang the probe are skipped, not fatal.
 pub fn scan_available_plugins(extra_folder: Option<&Path>) -> Vec<PluginDescriptor> {
     let mut builder = Vst3HostBuilder::default().scan_default_paths();
+    // Per-user plugin folder (VST3 spec location on Windows; the library's
+    // default scan only covers Program Files).
+    #[cfg(target_os = "windows")]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let user_vst = PathBuf::from(local).join("VST3");
+        if user_vst.is_dir() {
+            builder = builder.add_scan_path(user_vst);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_vst = PathBuf::from(home).join(".vst3");
+        if user_vst.is_dir() {
+            builder = builder.add_scan_path(user_vst);
+        }
+    }
     if let Some(dir) = extra_folder {
         let dir = PathBuf::from(dir);
         if dir.is_dir() {

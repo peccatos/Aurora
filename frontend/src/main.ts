@@ -306,8 +306,7 @@ app.innerHTML = `
       <div class="pb-controls">
         <button id="btn-shuffle" type="button" class="pb-btn" title="Shuffle">⇄</button>
         <button id="btn-prev" type="button" class="pb-btn" disabled title="Previous">⏮</button>
-        <button id="btn-play" type="button" class="pb-btn pb-main" disabled title="Play">▶</button>
-        <button id="btn-pause" type="button" class="pb-btn" disabled title="Pause">⏸</button>
+        <button id="btn-play" type="button" class="pb-btn pb-main" disabled title="Play / Pause">▶</button>
         <button id="btn-stop" type="button" class="pb-btn" disabled title="Stop">⏹</button>
         <button id="btn-next" type="button" class="pb-btn" disabled title="Next">⏭</button>
       </div>
@@ -330,7 +329,6 @@ const $ = <T extends HTMLElement>(id: string) =>
 const deviceSelect = $<HTMLSelectElement>("device-select");
 const pickFile = $<HTMLButtonElement>("pick-file");
 const btnPlay = $<HTMLButtonElement>("btn-play");
-const btnPause = $<HTMLButtonElement>("btn-pause");
 const btnResume: HTMLButtonElement | null = null;
 const btnStop = $<HTMLButtonElement>("btn-stop");
 const note = $<HTMLParagraphElement>("player-note");
@@ -465,12 +463,10 @@ function renderStatus(status: PlaybackStatus) {
     if (recover) recover.hidden = false;
   }
 
-  const playing = status.state === "playing";
-  const paused = status.state === "paused";
-  btnPlay!.disabled = !selectedPath || playing;
-  btnPause!.disabled = !playing;
+  // One play/pause button: enabled whenever a track is loaded (it pauses
+  // while playing, resumes while paused, plays from idle).
+  btnPlay!.disabled = !selectedPath;
   btnStop!.disabled = status.state === "idle";
-  const _ = paused;
   // Exclusive state resets when playback stops (status may reflect a
   // shared-mode stream started elsewhere, e.g. queue auto-advance).
   if (status.state === "idle") exclusiveActive = false;
@@ -565,7 +561,13 @@ pickFile?.addEventListener("click", async () => {
 btnPlay?.addEventListener("click", async () => {
   if (!selectedPath) return;
   try {
-    // Play while paused = resume from the same position, NOT a restart.
+    // Playing = pause; paused = resume (same position, NOT a restart);
+    // idle = play. One button, three states.
+    if (lastStatus?.state === "playing") {
+      renderStatus(await invoke<PlaybackStatus>("pause_playback"));
+      setNote("Paused.");
+      return;
+    }
     if (lastStatus?.state === "paused") {
       renderStatus(await invoke<PlaybackStatus>("resume_playback"));
       setNote("Resumed.");
@@ -590,14 +592,6 @@ btnPlay?.addEventListener("click", async () => {
     }
   } catch (e) {
     setNote(`Play failed: ${String(e)}`);
-  }
-});
-
-btnPause?.addEventListener("click", async () => {
-  try {
-    renderStatus(await invoke<PlaybackStatus>("pause_playback"));
-  } catch (e) {
-    setNote(`Pause failed: ${String(e)}`);
   }
 });
 
