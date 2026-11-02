@@ -944,26 +944,74 @@ async function runBitPerfectVerify() {
 
 let vstSlots: VstSlot[] = [];
 
-function vstNote(text: string) {
+function vstNote(text: string, isError = false) {
   const el = $id<HTMLElement>("vst-note");
-  if (el) el.textContent = text;
+  if (el) {
+    el.textContent = text;
+    el.classList.toggle("vst-error", isError);
+  }
 }
+
+/** Scan results: found plugins, not yet attached. */
+let vstFound: VstPluginDto[] = [];
 
 function renderVstList() {
   const ul = $id<HTMLUListElement>("vst-list");
   if (!ul) return;
   ul.innerHTML = "";
-  if (!vstSlots.length) {
-    vstNote("chain off");
-    return;
+
+  // Section 1: found plugins (attach with ▶).
+  for (const p of vstFound) {
+    const attached = vstSlots.some(
+      (s) => s.path === p.path && s.class_id === p.class_id,
+    );
+    const li = document.createElement("li");
+    li.className = "queue-row";
+    const name = document.createElement("span");
+    name.className = "queue-name";
+    const stem = p.path.split(/[\\/]/).pop() ?? p.path;
+    name.textContent = `${p.name} · ${p.vendor} ${p.version} — ${stem}`;
+    name.title = p.path;
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "ghost";
+    add.textContent = attached ? "✓ in chain" : "▶ Attach";
+    add.disabled = attached;
+    add.title = "Load out-of-process and add to the chain";
+    add.addEventListener("click", async () => {
+      add.disabled = true;
+      add.textContent = "Testing…";
+      vstNote(`loading ${p.name} in an isolated process…`);
+      try {
+        // Honest check: does this plugin actually load and process here?
+        const verdict = await invoke<string>("test_vst_plugin", {
+          path: p.path,
+          classId: p.class_id,
+        });
+        vstSlots.push({ path: p.path, class_id: p.class_id });
+        await applyVstChain();
+        vstNote(verdict);
+      } catch (e) {
+        const msg = typeof e === "object" && e && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+        vstNote(`${p.name}: ${msg}`, true);
+      } finally {
+        renderVstList();
+      }
+    });
+    li.append(name, add);
+    ul.appendChild(li);
   }
+
+  // Section 2: active chain (remove with ×).
   vstSlots.forEach((slot, idx) => {
     const li = document.createElement("li");
     li.className = "queue-row current";
     const name = document.createElement("span");
     name.className = "queue-name";
     const stem = slot.path.split(/[\\/]/).pop() ?? slot.path;
-    name.textContent = `${idx + 1}. ${stem}`;
+    name.textContent = `CHAIN ${idx + 1}: ${stem}`;
     const del = document.createElement("button");
     del.type = "button";
     del.className = "lib-pl-del";
@@ -976,7 +1024,14 @@ function renderVstList() {
     li.append(name, del);
     ul.appendChild(li);
   });
-  vstNote(`${vstSlots.length} plugin${vstSlots.length > 1 ? "s" : ""} active`);
+
+  vstNote(
+    vstSlots.length
+      ? `${vstSlots.length} plugin${vstSlots.length > 1 ? "s" : ""} in chain — active while a track plays`
+      : vstFound.length
+        ? "found plugins above; attach one to enable"
+        : "chain off",
+  );
 }
 
 async function applyVstChain() {
@@ -992,19 +1047,15 @@ async function scanVstPlugins() {
   const btn = $id<HTMLButtonElement>("vst-scan");
   try {
     if (btn) { btn.disabled = true; btn.textContent = "Scanning…"; }
-    vstNote("scanning system VST3 folders (crash-safe probe)…");
-    const found = await invoke<VstPluginDto[]>("scan_vst_plugins", {
+    vstNote("scanning VST3 folders (crash-safe out-of-process probe)…");
+    vstFound = await invoke<VstPluginDto[]>("scan_vst_plugins", {
       extraFolder: null,
     });
-    if (!found.length) {
-      vstNote("no VST3 plugins found in system folders");
+    if (!vstFound.length) {
+      vstNote("no VST3 plugins found — install one into %LOCALAPPDATA%\\VST3");
       return;
     }
-    // Add every found effect to the chain (simple Phase 9 surface; the
-    // user removes slots with ×).
-    vstSlots = found.map((p) => ({ path: p.path, class_id: p.class_id }));
-    await applyVstChain();
-    setNote(`VST3: ${found.length} plugin(s) attached (out-of-process)`);
+    renderVstList();
   } catch (e) {
     vstNote(`scan failed: ${String(e)}`);
   } finally {

@@ -19,4 +19,5 @@ mod host;
 pub use error::VstError;
 pub use host::{
     PluginDescriptor, VstPluginChain, VstPluginHandle, VstPluginList, scan_available_plugins,
+    test_plugin_load,
 };

@@ -176,6 +176,42 @@ impl VstPluginList {
     }
 }
 
+/// Load a single plugin out-of-process and verify it starts processing.
+/// Returns the plugin's display name on success or the honest reason it
+/// refused. This is the "does it actually work on this machine" check the
+/// UI runs when the user attaches a plugin — before playback depends on
+/// it and failures go silent.
+pub fn test_plugin_load(path: &str, class_id: &str) -> Result<String, String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err(format!("plugin file not found: {path}"));
+    }
+    let mut host = match Vst3HostBuilder::default()
+        .sample_rate(44_100.0)
+        .block_size(BLOCK_SIZE)
+        .build()
+    {
+        Ok(h) => h,
+        Err(e) => return Err(format!("host build failed: {e}")),
+    };
+    let mut plugin = match host.load_plugin_class(p, class_id) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("load failed: {e}")),
+    };
+    if let Err(e) = plugin.start_processing() {
+        return Err(format!("start_processing failed: {e}"));
+    }
+    let name = plugin.info().name.clone();
+    let latency = plugin.latency_samples();
+    // One silent block through the plugin: exercises the real IPC path
+    // (helper process round-trip) so "loads" is not confused with "works".
+    let mut buffers = AudioBuffers::new(2, 2, BLOCK_SIZE, 44_100.0);
+    match plugin.process_audio(&mut buffers) {
+        Ok(()) => Ok(format!("{name} — OK (latency {latency} samples)")),
+        Err(e) => Err(format!("{name} loaded, but processing failed: {e}")),
+    }
+}
+
 /// A compiled, live VST3 processing chain for one playback stream.
 ///
 /// Built for a specific `PcmFormat`; processes interleaved f32 samples

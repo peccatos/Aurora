@@ -1104,6 +1104,15 @@ pub fn get_vst_chain(state: State<AppState>) -> Result<Vec<VstSlotDto>, CommandE
         .collect())
 }
 
+/// Load one plugin out-of-process and run a silent block through it:
+/// the honest "does this plugin actually work here" verdict, surfaced to
+/// the UI instead of a silent skip when playback starts.
+#[tauri::command]
+pub fn test_vst_plugin(path: String, class_id: String) -> Result<String, CommandError> {
+    aurora_vst::test_plugin_load(&path, &class_id)
+        .map_err(|reason| CommandError::Engine { message: reason })
+}
+
 // ---------------------------------------------------------------------------
 // Artwork (embedded cover art from tags, cache in app temp)
 // ---------------------------------------------------------------------------
@@ -1252,6 +1261,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             scan_vst_plugins,
             set_vst_chain,
             get_vst_chain,
+            test_vst_plugin,
             get_track_artwork,
             pause_playback,
             resume_playback,
