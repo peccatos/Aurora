@@ -1,0 +1,221 @@
+/* Aurora — global player bar + Now Playing page. */
+
+.playerbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 76px;
+  display: grid;
+  grid-template-columns: 220px 1fr 200px;
+  align-items: center;
+  gap: 20px;
+  padding: 0 clamp(20px, 4vw, 56px);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-bar);
+  z-index: 10;
+}
+
+.pb-now {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pb-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pb-artist {
+  color: var(--text-3);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pb-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pb-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pb-btn {
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  font-size: 16px;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.pb-btn:hover:not(:disabled) { color: var(--text); background: var(--surface); }
+.pb-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.pb-btn.pb-main {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+}
+
+.pb-btn.pb-main:hover:not(:disabled) { background: var(--accent-hover); }
+
+.seek-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(560px, 100%);
+}
+
+.seek-row span {
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.seek-row input[type="range"] {
+  flex: 1;
+  height: 4px;
+}
+
+.pb-right {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+}
+
+.pb-state,
+.pb-int {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+.pb-state { min-width: 56px; text-align: right; }
+.pb-int { min-width: 84px; }
+
+.pb-int.ok { color: var(--ok); }
+
+/* ------------------------------------------------------------------ */
+/* Now Playing page                                                    */
+/* ------------------------------------------------------------------ */
+
+.np-page {
+  display: grid;
+  grid-template-columns: minmax(240px, 360px) 1fr;
+  gap: 36px;
+  align-items: start;
+}
+
+.np-art {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 24px 48px -24px rgba(0, 0, 0, 0.8);
+}
+
+.art-glyph {
+  font-size: 64px;
+  color: var(--text-3);
+  opacity: 0.4;
+}
+
+.art-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.np-side {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+}
+
+.np-title {
+  margin: 4px 0 0;
+  font-size: var(--fs-display);
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+  color: var(--text);
+  overflow-wrap: break-word;
+}
+
+.np-artist {
+  margin: 0 0 26px;
+  color: var(--text-2);
+  font-size: 15px;
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px 20px;
+  margin: 0;
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.signal-grid div { display: flex; flex-direction: column; gap: 3px; }
+
+.signal-grid dt {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.signal-grid dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-height: 1.2em;
+  line-height: 1.2;
+}
+
+.signal-grid dd.ok { color: var(--ok); }
