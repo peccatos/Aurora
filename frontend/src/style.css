@@ -1,23 +1,26 @@
-/* Aurora — redesign (refs: dark base #0F-14, left sidebar, fixed bottom
-   playback bar, one lavender accent, uppercase eyebrows, depth via
-   background darker than cards). */
+/* Aurora — redesign per Figma "with Danya": black bg, white cards,
+   purple #8043CE accent with glow, purple top-edge on panels,
+   fixed bottom playback bar, uppercase eyebrows. */
 
 :root {
   color-scheme: dark;
-  --bg: #0f0e13;
-  --bg-2: #14131a;
-  --card: #191822;
-  --card-2: #1d1c27;
-  --line: #26242f;
-  --line-2: #34323f;
-  --text: #f0eef4;
-  --text-2: #b9b6c4;
-  --text-3: #8a8798;
-  --accent: #a79ae0;
-  --accent-2: #8f84c9;
-  --accent-soft: rgba(167, 154, 224, 0.14);
-  --ok: #8bcca8;
-  --warn: #d8b08a;
+  /* Figma "with Danya": black bg, near-white cards, purple #8043CE accent */
+  --bg: #000000;
+  --bg-2: #0a0a0a;
+  --card: #f5f5f5;
+  --card-2: #ececec;
+  --line: #d9d9d9;
+  --line-2: #c7c7c7;
+  --text: #111111;
+  --text-2: #3d3d3d;
+  --text-3: #767676;
+  --accent: #9858e4;
+  --accent-2: #8043ce;
+  --accent-soft: rgba(128, 67, 206, 0.12);
+  --accent-glow: rgba(128, 67, 206, 0.35);
+  --on-accent: #ffffff;
+  --ok: #2e9e6b;
+  --warn: #b07d2e;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
@@ -31,9 +34,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(ellipse 60rem 40rem at 85% -10%, rgba(143, 132, 201, 0.07), transparent),
-    var(--bg);
+  background: var(--bg);
 }
 
 button { font: inherit; }
@@ -58,8 +59,8 @@ button { font: inherit; }
   flex-direction: column;
   gap: 22px;
   padding: 22px 14px 16px;
-  border-right: 1px solid var(--line);
-  background: linear-gradient(180deg, var(--bg-2), var(--bg));
+  border-right: 1px solid #161616;
+  background: var(--bg);
   position: sticky;
   top: 0;
   height: calc(100vh - 84px);
@@ -80,7 +81,7 @@ button { font: inherit; }
   display: block;
 }
 
-.brand h1 { margin: 0; font-size: 16px; letter-spacing: .01em; }
+.brand h1 { margin: 0; font-size: 16px; letter-spacing: .01em; color: #ffffff; }
 .brand .eyebrow { margin: 0; }
 
 .nav {
@@ -104,12 +105,12 @@ button { font: inherit; }
   transition: color .15s ease, background .15s ease;
 }
 
-.nav-item:hover { color: var(--text); background: var(--card); }
+.nav-item:hover { color: var(--card); background: #111111; }
 
 .nav-item.active {
-  color: var(--text);
-  background: var(--accent-soft);
-  box-shadow: inset 2px 0 0 var(--accent-2);
+  color: #ffffff;
+  background: var(--accent-2);
+  box-shadow: 0 0 18px var(--accent-glow);
 }
 
 .sidebar-foot {
@@ -157,16 +158,16 @@ button { font: inherit; }
 .np-art {
   position: relative;
   aspect-ratio: 1;
-  border-radius: 18px;
+  border-radius: 16px;
   overflow: hidden;
   background:
-    radial-gradient(ellipse at 30% 20%, rgba(167, 154, 224, 0.25), transparent 60%),
-    linear-gradient(160deg, var(--card-2), var(--card) 55%, var(--bg-2));
+    radial-gradient(ellipse at 30% 20%, rgba(128, 67, 206, 0.35), transparent 65%),
+    linear-gradient(160deg, var(--card-2), var(--card) 60%);
   border: 1px solid var(--line-2);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 22px 44px -18px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 22px 44px -18px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(128, 67, 206, 0.15);
 }
 
 .np-art-glyph {
@@ -219,16 +220,19 @@ button.ghost,
   border: 1px solid var(--line-2);
   border-radius: 9px;
   padding: 8px 13px;
-  background: var(--card);
+  background: #ffffff;
   color: var(--text-2);
   font: inherit;
   font-size: 12px;
   letter-spacing: .02em;
   cursor: pointer;
-  transition: border-color .15s ease, color .15s ease;
+  transition: border-color .15s ease, color .15s ease, box-shadow .15s ease;
 }
 
-button.ghost:hover:not(:disabled) { border-color: var(--accent-2); color: var(--text); }
+button.ghost:hover:not(:disabled) {
+  border-color: var(--accent-2);
+  color: var(--accent-2);
+}
 button.ghost:disabled { opacity: .4; cursor: not-allowed; }
 
 button.accent {
@@ -236,15 +240,18 @@ button.accent {
   border-radius: 9px;
   padding: 8px 15px;
   background: var(--accent-2);
-  color: #14131c;
+  color: var(--on-accent);
   font: inherit;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition: background .15s ease;
+  transition: background .15s ease, box-shadow .15s ease;
 }
 
-button.accent:hover:not(:disabled) { background: var(--accent); }
+button.accent:hover:not(:disabled) {
+  background: var(--accent);
+  box-shadow: 0 0 16px var(--accent-glow);
+}
 button.accent:disabled { opacity: .4; cursor: not-allowed; }
 
 .lib-count { color: var(--text-3); font-size: 11px; letter-spacing: .04em; }
@@ -304,7 +311,7 @@ select,
 input[type="search"] {
   border: 1px solid var(--line-2);
   border-radius: 9px;
-  background: var(--card);
+  background: #ffffff;
   color: var(--text);
   font: inherit;
   font-size: 12px;
@@ -323,8 +330,8 @@ input[type="search"] { width: 230px; }
   margin: 0;
   padding: 20px 22px;
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--card);
+  border-radius: 12px;
+  background: var(--card-2);
 }
 
 .signal-path div { display: flex; flex-direction: column; gap: 3px; }
@@ -367,13 +374,15 @@ input[type="search"] { width: 230px; }
 .queue-panel {
   width: min(860px, 100%);
   margin: 0 auto;
-  padding: 28px 30px 30px;
+  padding: 26px 30px 30px;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-top: 2px solid var(--accent-2);
+  border-radius: 14px;
   background: var(--card);
   display: flex;
   flex-direction: column;
   gap: 22px;
+  box-shadow: 0 18px 44px -22px rgba(128, 67, 206, 0.28);
 }
 
 .eq-bands {
@@ -440,6 +449,9 @@ input[type="search"] { width: 230px; }
   background: var(--accent-soft);
   box-shadow: inset 2px 0 0 var(--accent-2);
 }
+
+/* Progress fill glow (Figma's gradient accent) */
+input[type="range"] { accent-color: var(--accent-2); }
 
 .queue-name {
   flex: 1;
@@ -598,13 +610,15 @@ input[type="search"] { width: 230px; }
 .settings-panel {
   width: min(680px, 100%);
   margin: 0 auto;
-  padding: 28px 30px 30px;
+  padding: 26px 30px 30px;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-top: 2px solid var(--accent-2);
+  border-radius: 14px;
   background: var(--card);
   display: flex;
   flex-direction: column;
   gap: 22px;
+  box-shadow: 0 18px 44px -22px rgba(128, 67, 206, 0.28);
 }
 
 .settings-controls {
@@ -672,9 +686,9 @@ input[type="search"] { width: 230px; }
   align-items: center;
   gap: 18px;
   padding: 0 clamp(18px, 4vw, 48px);
-  background: rgba(15, 14, 19, 0.88);
+  background: rgba(0, 0, 0, 0.92);
   backdrop-filter: blur(14px);
-  border-top: 1px solid var(--line);
+  border-top: 1px solid #1a1a1a;
   z-index: 10;
 }
 
@@ -739,11 +753,15 @@ input[type="search"] { width: 230px; }
   height: 42px;
   border-radius: 11px;
   background: var(--accent-2);
-  color: #14131c;
+  color: var(--on-accent);
   font-size: 16px;
+  box-shadow: 0 0 14px var(--accent-glow);
 }
 
-.pb-btn.pb-main:hover:not(:disabled) { background: var(--accent); }
+.pb-btn.pb-main:hover:not(:disabled) {
+  background: var(--accent);
+  box-shadow: 0 0 22px var(--accent-glow);
+}
 
 .seek-row {
   display: flex;
