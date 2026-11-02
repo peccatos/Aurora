@@ -165,7 +165,10 @@ app.innerHTML = `
       <!-- NOW PLAYING -->
       <section class="panel active" id="now">
         <div class="now-playing">
-          <div class="np-art" id="np-art"><span class="np-art-glyph">♪</span></div>
+          <div class="np-left">
+            <div class="np-art" id="np-art"><span class="np-art-glyph">♪</span></div>
+          </div>
+          <div class="np-progress" id="np-progress"><div class="np-progress-fill" id="np-progress-fill"></div></div>
           <div class="np-info">
             <p class="eyebrow">NOW PLAYING</p>
             <h2 id="np-title">Nothing playing</h2>
@@ -1174,6 +1177,11 @@ async function setupSeek() {
       if (!seeking && bar && currentDurationS > 0) {
         bar.disabled = false;
         bar.value = String((pos / currentDurationS) * 100);
+      }
+      // Now-playing vertical progress column (Figma layout).
+      const vfill = document.getElementById("np-progress-fill");
+      if (vfill && currentDurationS > 0) {
+        vfill.style.height = `${Math.min(100, (pos / currentDurationS) * 100)}%`;
       }
       if (cur) cur.textContent = fmtTime(pos);
       if (dur && currentDurationS > 0) dur.textContent = fmtTime(currentDurationS);
