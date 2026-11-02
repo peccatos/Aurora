@@ -187,6 +187,7 @@ pub fn test_plugin_load(path: &str, class_id: &str) -> Result<String, String> {
         return Err(format!("plugin file not found: {path}"));
     }
     let mut host = match Vst3HostBuilder::default()
+        .with_process_isolation(true)
         .sample_rate(44_100.0)
         .block_size(BLOCK_SIZE)
         .build()
@@ -237,7 +238,12 @@ impl VstPluginChain {
         let sample_rate = f64::from(format.sample_rate);
         let channels = usize::from(format.channels.max(1));
 
-        let mut host_builder = Vst3HostBuilder::default();
+        // PROCESS ISOLATION ON (ADR 0004): the builder's default is
+        // OFF, and a plugin that calls abort() (NeuralAmpModeler did,
+        // 0xc0000409 via ucrtbase) then kills the whole player. The
+        // chain must load every plugin into the vst3-host-helper
+        // process — a crash costs the plugin, never the app.
+        let mut host_builder = Vst3HostBuilder::default().with_process_isolation(true);
         host_builder = host_builder
             .sample_rate(sample_rate)
             .block_size(BLOCK_SIZE)
@@ -500,6 +506,7 @@ fn probe_plugin(path: &str, class_id: &str) -> Result<Plugin, String> {
         return Err(format!("plugin file not found: {path}"));
     }
     let mut host = Vst3HostBuilder::default()
+        .with_process_isolation(true)
         .sample_rate(44_100.0)
         .block_size(BLOCK_SIZE)
         .build()
