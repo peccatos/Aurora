@@ -12,6 +12,7 @@ aurora-dsp.workspace = true
 aurora-vst.workspace = true
 cpal.workspace = true
 ringbuf.workspace = true
+rustfft.workspace = true
 serde.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true

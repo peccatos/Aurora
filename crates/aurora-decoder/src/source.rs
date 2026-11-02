@@ -259,6 +259,55 @@ impl AudioSource {
     }
 }
 
+/// Waveform peaks for the seek-bar overview: `count` absolute peak values
+/// (0..1) sampled across the WHOLE file. Decodes the full stream (f32,
+/// mono-mixed); bounded by the duration so a 10-minute FLAC is well under
+/// a second of work. Called once per track (cache at the command layer).
+pub fn waveform_peaks(path: &Path, count: usize) -> Result<Vec<f32>, SourceError> {
+    let mut source = AudioSource::open(path)?;
+    let duration_s = source.info().duration_ms.unwrap_or(0) as f64 / 1000.0;
+    if duration_s <= 0.0 || count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut peaks = vec![0f32; count];
+    // Rough frames-per-bin: total frames estimated from duration + rate.
+    let rate = f64::from(source.pcm_format().sample_rate);
+    let total_frames_est = (duration_s * rate).max(1.0);
+
+    let mut frame_idx: u64 = 0;
+    loop {
+        let chunk = match source.next_chunk() {
+            Ok(c) => c,
+            Err(DecodeError::EndOfStream) => break,
+            Err(_) => break,
+        };
+        let samples = chunk.to_f32_interleaved();
+        let nch = usize::from(source.pcm_format().channels.max(1));
+        let frames = samples.len() / nch.max(1);
+        for f in 0..frames {
+            let bin = ((frame_idx as f64 / total_frames_est) * count as f64) as usize;
+            let bin = bin.min(count - 1);
+            let mut m = 0f32;
+            for ch in 0..nch {
+                let v = samples[f * nch + ch];
+                m = m.max(v.abs());
+            }
+            if m > peaks[bin] {
+                peaks[bin] = m;
+            }
+            frame_idx += 1;
+        }
+    }
+    // Normalize to 0..1 (full-scale stays 1.0).
+    let max = peaks.iter().cloned().fold(0f32, f32::max);
+    if max > 0.0 {
+        for p in peaks.iter_mut() {
+            *p /= max;
+        }
+    }
+    Ok(peaks)
+}
+
 /// Extract a PcmChunk from a decoded symphonia buffer, preserving the native
 /// sample representation (bytes are copied interleaved without conversion).
 fn chunk_format_from_decoded(

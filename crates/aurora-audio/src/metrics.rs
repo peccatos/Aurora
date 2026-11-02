@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct PlaybackMetrics {
     frames_played: AtomicU64,
     underruns: AtomicU64,
+    /// Real-time spectrum: 16 log-spaced band energies (0..1), written by
+    /// the DECODE WORKER (non-RT; coarse atomic pairs per band, readers
+    /// accept torn values within a band — display-only). Updated per
+    /// chunk; the UI polls `spectrum()`.
+    spectrum: [AtomicU64; 16],
 }
 
 impl PlaybackMetrics {
@@ -16,6 +21,7 @@ impl PlaybackMetrics {
         Self {
             frames_played: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            spectrum: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -37,9 +43,30 @@ impl PlaybackMetrics {
         self.underruns.load(Ordering::Relaxed)
     }
 
+    /// Publish a new spectrum snapshot (worker side, non-RT). Values are
+    /// f32 energies 0..1, quantized to u64 fixed-point (1e6 scale).
+    pub(crate) fn publish_spectrum(&self, bands: &[f32]) {
+        for (i, slot) in self.spectrum.iter().enumerate() {
+            let v = bands.get(i).copied().unwrap_or(0.0);
+            let q = (v.clamp(0.0, 1.0) * 1e6) as u64;
+            slot.store(q, Ordering::Relaxed);
+        }
+    }
+
+    /// The current spectrum snapshot (16 bands, 0..1).
+    pub fn spectrum(&self) -> Vec<f32> {
+        self.spectrum
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed) as f32 / 1e6)
+            .collect()
+    }
+
     pub(crate) fn reset(&self) {
         self.frames_played.store(0, Ordering::Relaxed);
         self.underruns.store(0, Ordering::Relaxed);
+        for slot in &self.spectrum {
+            slot.store(0, Ordering::Relaxed);
+        }
     }
 }
 

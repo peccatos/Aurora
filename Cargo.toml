@@ -35,6 +35,7 @@ aurora-app = { path = "crates/aurora-app" }
 
 # Audio stack
 cpal = "0.18.2"
+rustfft = "6.4.1"
 vst3-host = { version = "0.10", default-features = false, features = ["process-isolation"] }
 symphonia = { version = "0.6.1", features = ["all"] }
 rubato = "5.0.1"
@@ -50,7 +51,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_Media_KernelStreaming"] }
 tauri = "2.12.5"
 tauri-build = "2.7.4"
-tauri-plugin-dialog = "2.8"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-global-shortcut = "2.4.1"
 
 # Process control (Unix termination signals; no-op on Windows)
 ctrlc = "3.5"

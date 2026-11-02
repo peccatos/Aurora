@@ -9,6 +9,10 @@ let found: VstPluginDto[] = [];
 let slots: VstSlot[] = [];
 let paramsFor: { path: string; class_id: string } | null = null;
 let paramsList: VstParamDto[] = [];
+/** Bypassed slot indices (A/B compare). */
+let bypassedSlots = new Set<number>();
+/** One-shot chain restore flag (library auto-open may race the mount). */
+let restored = false;
 
 function note(text: string, isError = false) {
   const el = document.getElementById("vst-note");
@@ -21,6 +25,11 @@ function note(text: string, isError = false) {
 async function applyChain() {
   try {
     await invoke("set_vst_chain", { slots });
+    // Persist so the chain survives restarts (best effort: the library
+    // may not be open).
+    await invoke("save_vst_chain_setting", { slots: slots.length ? slots : null }).catch(
+      () => {},
+    );
     renderChain(document.getElementById("page-root")!);
   } catch (e) {
     note(`chain failed: ${String(e)}`, true);
@@ -80,9 +89,34 @@ function render(root: HTMLElement) {
     slots = [];
     paramsFor = null;
     paramsList = [];
+    bypassedSlots.clear();
     await applyChain();
     note("chain off");
   });
+
+  // Restore the persisted chain (library settings) once at mount.
+  if (!restored) {
+    restored = true;
+    void (async () => {
+      try {
+        const saved = await invoke<VstSlot[] | null>("load_vst_chain_setting");
+        if (saved?.length) {
+          slots = saved;
+          await invoke("set_vst_chain", { slots });
+          note(`Chain restored: ${slots.length} plugin(s)`);
+          update(root);
+        }
+      } catch {
+        /* library may not be open yet */
+      }
+    })();
+  }
+  // Refresh bypass state from the engine.
+  void invoke<number[]>("vst_bypassed_slots")
+    .then((list) => {
+      bypassedSlots = new Set(list);
+    })
+    .catch(() => {});
 
   update(root);
 }
@@ -293,7 +327,26 @@ function update(root: HTMLElement) {
       slots.splice(idx, 1);
       await applyChain();
     });
-    li.append(name, del);
+
+    // Bypass (A/B): instant compare with/without this slot.
+    const bypassBtn = document.createElement("button");
+    bypassBtn.type = "button";
+    bypassBtn.className = "btn";
+    bypassBtn.textContent = bypassedSlots.has(idx) ? "Bypassed" : "Bypass";
+    bypassBtn.title = "Route audio around this slot (A/B compare) — the plugin stays live";
+    bypassBtn.addEventListener("click", async () => {
+      const next = !bypassedSlots.has(idx);
+      try {
+        await invoke("set_vst_slot_bypass", { slot: idx, bypassed: next });
+        if (next) bypassedSlots.add(idx);
+        else bypassedSlots.delete(idx);
+        update(root);
+        note(next ? `Slot ${idx + 1} bypassed` : `Slot ${idx + 1} active`);
+      } catch (e) {
+        note(`bypass failed: ${String(e)}`, true);
+      }
+    });
+    li.append(name, bypassBtn, del);
     ul.appendChild(li);
   });
 

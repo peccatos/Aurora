@@ -11,6 +11,7 @@ pub mod exclusive;
 pub mod exclusive_stream;
 pub mod loopback;
 pub mod metrics;
+pub mod spectrum;
 
 pub use device::{OutputDevice, default_output_device, output_devices};
 pub use engine::{EngineState, PlaybackEngine};

@@ -23,6 +23,11 @@ export function activePage(): string {
   return activeId;
 }
 
+/** The currently-active route id (alias, for shell animations). */
+export function activeRoute(): string {
+  return activeId;
+}
+
 export function setRouteChangeListener(fn: () => void) {
   onRouteChange = fn;
 }

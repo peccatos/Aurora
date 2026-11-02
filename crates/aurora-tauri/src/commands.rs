@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use aurora_audio::{EngineState, PlaybackEngine};
 use aurora_core::PlaybackMode;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_global_shortcut::ShortcutState;
 
 use crate::error::CommandError;
 
@@ -1186,6 +1187,122 @@ pub fn close_vst_editor(state: State<AppState>) -> Result<(), CommandError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Spectrum / waveform / A-B loop / VST bypass / chain persistence
+// ---------------------------------------------------------------------------
+
+/// Live spectrum: 16 log-spaced band energies (0..1), post-DSP/post-VST
+/// (what the wire carries). Display-only, coarse.
+#[tauri::command]
+pub fn playback_spectrum(state: State<AppState>) -> Result<Vec<f32>, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(engine.metrics().spectrum())
+}
+
+/// Waveform peaks for the seek bar: `bins` absolute values (0..1) across
+/// the whole file. Full decode, ~1s per 10-min FLAC — cached here so the
+/// UI asks once per track.
+#[tauri::command]
+pub fn waveform(path: String, bins: u32) -> Result<Vec<f32>, CommandError> {
+    let bins = bins.clamp(16, 2048) as usize;
+    fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>,
+        > = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+    let cache = cache();
+    if let Some(hit) = cache.lock().ok().and_then(|m| m.get(&path).cloned()) {
+        return Ok(hit);
+    }
+    let peaks = aurora_decoder::waveform_peaks(std::path::Path::new(&path), bins).map_err(|e| {
+        CommandError::Engine {
+            message: e.to_string(),
+        }
+    })?;
+    if let Ok(mut map) = cache.lock() {
+        // Bound: 32 tracks.
+        if map.len() >= 32 {
+            map.clear();
+        }
+        map.insert(path, peaks.clone());
+    }
+    Ok(peaks)
+}
+
+/// Set / clear the A/B loop region (seconds). `loop_start`/`loop_end` of
+/// null clears it.
+#[tauri::command]
+pub fn set_loop(
+    loop_start: Option<f64>,
+    loop_end: Option<f64>,
+    state: State<AppState>,
+) -> Result<Option<(f64, f64)>, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    let region = match (loop_start, loop_end) {
+        (Some(s), Some(e)) if e > s => Some((s, e)),
+        _ => None,
+    };
+    engine.set_loop(region);
+    Ok(engine.loop_region())
+}
+
+/// Bypass one VST chain slot (A/B comparison; the plugin stays live in
+/// its helper process, toggling back is instant).
+#[tauri::command]
+pub fn set_vst_slot_bypass(
+    slot: usize,
+    bypassed: bool,
+    state: State<AppState>,
+) -> Result<(), CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    engine.set_vst_slot_bypass(slot, bypassed);
+    Ok(())
+}
+
+/// Which VST chain slots are currently bypassed.
+#[tauri::command]
+pub fn vst_bypassed_slots(state: State<AppState>) -> Result<Vec<usize>, CommandError> {
+    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok(engine.vst_bypassed_slots())
+}
+
+/// Persist the VST chain (slots) into the library settings so it
+/// survives restarts. `None` clears the stored chain.
+#[tauri::command]
+pub async fn save_vst_chain_setting(
+    slots: Option<Vec<VstSlotDto>>,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let value = slots.map(|s| serde_json::to_string(&s).unwrap_or_else(|_| "[]".to_string()));
+    match value {
+        Some(v) => {
+            aurora_storage::set_setting(service.pool(), "vst_chain", &v)
+                .await
+                .map_err(CommandError::from)?;
+        }
+        None => {
+            let _ = aurora_storage::delete_setting(service.pool(), "vst_chain").await;
+        }
+    }
+    Ok(())
+}
+
+/// The persisted VST chain, restored at app start.
+#[tauri::command]
+pub async fn load_vst_chain_setting(
+    state: State<'_, AppState>,
+) -> Result<Option<Vec<VstSlotDto>>, CommandError> {
+    let library = state.library.lock().await;
+    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
+    let value = aurora_storage::get_setting(service.pool(), "vst_chain")
+        .await
+        .map_err(CommandError::from)?;
+    Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
 /// One automatable plugin parameter (normalized 0..1 value).
 #[derive(Debug, Serialize)]
 pub struct VstParamDto {
@@ -1403,6 +1520,69 @@ pub fn stop_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandEr
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    // Media keys: transport control from anywhere (keyboard,
+                    // headphones, remote). Engine commands are shared with
+                    // the UI buttons; queue order lives in the frontend.
+                    let app_state = app.clone();
+                    let key = shortcut.to_string();
+                    let task = if key.contains("MediaPlayPause") {
+                        "playpause"
+                    } else if key.contains("MediaStop") {
+                        "stop"
+                    } else if key.contains("MediaTrackNext") {
+                        "next"
+                    } else if key.contains("MediaTrackPrevious") {
+                        "prev"
+                    } else {
+                        return;
+                    };
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_state.state::<AppState>();
+                        let Ok(mut engine) = state.engine.lock() else {
+                            return;
+                        };
+                        match task {
+                            "stop" => {
+                                engine.stop();
+                            }
+                            "playpause" => {
+                                let playing = engine.state() == aurora_audio::EngineState::Playing;
+                                if playing {
+                                    let _ = engine.pause();
+                                } else {
+                                    let _ = engine.resume();
+                                }
+                            }
+                            "next" => {
+                                // The queue order is frontend state; ask it
+                                // to advance (the frontend calls next_track).
+                                drop(engine);
+                                let _ = app_state.emit("media-next", ());
+                            }
+                            "prev" => {
+                                drop(engine);
+                                let _ = app_state.emit("media-prev", ());
+                            }
+                            _ => {}
+                        }
+                    });
+                })
+                .with_shortcut("MediaPlayPause")
+                .expect("MediaPlayPause")
+                .with_shortcut("MediaStop")
+                .expect("MediaStop")
+                .with_shortcut("MediaTrackNext")
+                .expect("MediaTrackNext")
+                .with_shortcut("MediaTrackPrevious")
+                .expect("MediaTrackPrevious")
+                .build(),
+        )
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             app_version,
@@ -1452,6 +1632,13 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             save_vst_preset,
             load_vst_preset,
             list_vst_presets,
+            playback_spectrum,
+            waveform,
+            set_loop,
+            set_vst_slot_bypass,
+            vst_bypassed_slots,
+            save_vst_chain_setting,
+            load_vst_chain_setting,
             get_track_artwork,
             pause_playback,
             resume_playback,

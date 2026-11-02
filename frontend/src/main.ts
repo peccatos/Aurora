@@ -4,15 +4,18 @@
  *  routes in ./router (hash-based: #/player, #/queue, …). */
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles/base.css";
 import "./styles/components.css";
 import "./styles/player.css";
 import "./styles/pages.css";
 
-import { navigate, refreshActive, registerPage, startRouter } from "./router";
+import { navigate, refreshActive, registerPage, startRouter, activeRoute } from "./router";
 import { app, loadStatus, nextTrack, prevTrack, setQueue, setToast, subscribe } from "./state";
+import { registerDrop } from "./drop";
 import { loadDsp } from "./pages/eq";
-import { playerPage } from "./pages/player";
+import { playerPage, animatePlayer } from "./pages/player";
 import { queuePage } from "./pages/queue";
 import { libraryPage } from "./pages/library";
 import { eqPage } from "./pages/eq";
@@ -305,8 +308,52 @@ async function pollPosition() {
 setInterval(pollStatus, 500);
 setInterval(pollPosition, 400);
 
+// Player page animation: waveform progress + spectrum (only while the
+// player route is active).
+setInterval(() => {
+  if (activeRoute() === "player") animatePlayer();
+}, 120);
+
 // State changes re-render the active page.
 subscribe(() => refreshActive());
+
+// Media keys (keyboard/headphones) -> transport.
+void listen("media-next", () => {
+  void nextTrack().then((q) => {
+    if (!q && app.queueTracks.length === 1) void invoke("play_queue_index", { index: 0 });
+  });
+});
+void listen("media-prev", () => {
+  void prevTrack();
+});
+
+// External file drops (Explorer -> window).
+void registerDrop();
+
+// Keyboard: Space play/pause, arrows seek, Ctrl+K quick search.
+document.addEventListener("keydown", (e) => {
+  const inField = (e.target as HTMLElement)?.matches?.("input, select, textarea");
+  if (e.code === "Space" && !inField) {
+    e.preventDefault();
+    playFromBar();
+  } else if (e.key === "ArrowRight" && !inField) {
+    void invoke("seek", { positionS: Math.min(app.durationS, currentPos() + 5) });
+  } else if (e.key === "ArrowLeft" && !inField) {
+    void invoke("seek", { positionS: Math.max(0, currentPos() - 5) });
+  } else if (e.ctrlKey && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    navigate("library");
+    setTimeout(() => document.querySelector<HTMLInputElement>("#lib-search")?.focus(), 60);
+  }
+});
+
+function currentPos(): number {
+  const bar = document.getElementById("seek") as HTMLInputElement | null;
+  if (bar && app.durationS > 0) {
+    return (Number.parseFloat(bar.value) / 100) * app.durationS;
+  }
+  return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Boot

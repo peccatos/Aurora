@@ -219,3 +219,88 @@
 }
 
 .signal-grid dd.ok { color: var(--ok); }
+
+/* ------------------------------------------------------------------ */
+/* Waveform seek + spectrum + A/B loop (Player page)                   */
+/* ------------------------------------------------------------------ */
+
+.wave-seek {
+  position: relative;
+  height: 56px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+#wave-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.wave-progress {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-right: 2px solid var(--accent);
+  pointer-events: none;
+}
+
+.wave-loop {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(232, 80, 10, 0.18);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+}
+
+.wave-times {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.wave-times span {
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.loop-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.loop-controls .btn { padding: 3px 10px; font-size: 11px; }
+
+/* Spectrum: 16 bars, CSS var-driven height. */
+.spectrum {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 42px;
+  margin-top: 14px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.spec-bar {
+  flex: 1;
+  height: calc(4% + var(--v, 0) * 96%);
+  min-height: 2px;
+  background: var(--accent);
+  opacity: 0.75;
+  border-radius: 1px;
+  transition: height 0.1s linear;
+}

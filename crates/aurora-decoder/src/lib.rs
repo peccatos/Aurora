@@ -9,4 +9,4 @@ pub mod source;
 
 pub use error::{DecodeError, SourceError};
 pub use pcm::{PcmChunk, frame_size_bytes};
-pub use source::{AudioSource, SourceInfo};
+pub use source::{AudioSource, SourceInfo, waveform_peaks};

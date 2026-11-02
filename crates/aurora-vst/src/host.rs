@@ -228,6 +228,9 @@ pub struct VstPluginChain {
     channels: usize,
     /// Accumulated output produced but not yet consumed by the caller.
     out: Vec<f32>,
+    /// Bypassed slots for the current pass (see process_with_bypass):
+    /// slot output is replaced by its input — identity routing.
+    bypassed_now: std::collections::HashSet<usize>,
 }
 
 impl VstPluginChain {
@@ -299,6 +302,7 @@ impl VstPluginChain {
             fifo: Vec::new(),
             channels,
             out: Vec::new(),
+            bypassed_now: std::collections::HashSet::new(),
         })
     }
 
@@ -354,6 +358,20 @@ impl VstPluginChain {
     /// Process interleaved f32 samples. Returns the processed interleaved
     /// samples; length may differ from the input (block quantization +
     /// plugin latency). Call `flush` at end of stream for the tail.
+    /// Slots in `bypassed` are routed around: the plugin still processes
+    /// (latency accounting stays honest) but its output is replaced by
+    /// its input — identity. Plugins stay live, toggling back is instant.
+    pub fn process_with_bypass(
+        &mut self,
+        interleaved: &[f32],
+        bypassed: &std::collections::HashSet<usize>,
+    ) -> Vec<f32> {
+        self.bypassed_now = bypassed.clone();
+        let out = self.process(interleaved);
+        self.bypassed_now.clear();
+        out
+    }
+
     pub fn process(&mut self, interleaved: &[f32]) -> Vec<f32> {
         if self.plugins.is_empty() {
             return interleaved.to_vec();
@@ -431,6 +449,14 @@ impl VstPluginChain {
                     for ch in 0..buffers.output_channels().min(buffers.input_channels()) {
                         buffers.outputs[ch].copy_from_slice(&buffers.inputs[ch]);
                     }
+                }
+            }
+            // Bypass (A/B): the slot's output becomes its input — the
+            // plugin still ran (latency/FIFO honest), the audio doesn't.
+            if self.bypassed_now.contains(&i) {
+                let buffers = &mut self.buffers[i];
+                for ch in 0..buffers.output_channels().min(buffers.input_channels()) {
+                    buffers.outputs[ch].copy_from_slice(&buffers.inputs[ch]);
                 }
             }
             if next_needs_input {

@@ -94,6 +94,9 @@ struct Shared {
     /// worker rebuilds the chain when the version changes; plugins run
     /// out-of-process, inline on this worker thread — never the callback.
     vst: Arc<Mutex<LiveVst>>,
+    /// A/B loop window in seconds: (start, end). When set, the worker
+    /// seeks back to `start` when the position passes `end`.
+    loop_region: Arc<Mutex<Option<(f64, f64)>>>,
 }
 
 /// Live VST chain state shared with the worker.
@@ -108,6 +111,10 @@ pub struct LiveVst {
     /// Which chain slot the param_updates belong to (editor GUI instance
     /// index in the chain). None = no GUI session yet.
     pub param_slot: Option<usize>,
+    /// Per-slot bypass flags: when true the worker skips that slot's
+    /// processing (audio passes unprocessed, the chain itself stays live
+    /// so toggling back is instant). A/B comparison without a reload.
+    pub bypassed: std::collections::HashSet<usize>,
 }
 
 /// Live DSP state shared with the worker.
@@ -170,7 +177,9 @@ impl PlaybackEngine {
                     version: 0,
                     param_updates: std::collections::HashMap::new(),
                     param_slot: None,
+                    bypassed: std::collections::HashSet::new(),
                 })),
+                loop_region: Arc::new(Mutex::new(None)),
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
@@ -302,6 +311,7 @@ impl PlaybackEngine {
         let worker_frames_played = Arc::clone(&self.metrics);
         let live_vst = Arc::clone(&self.shared.vst);
         let worker_restart_flag = Arc::clone(&self.shared.needs_dsp_restart);
+        let worker_loop_region = Arc::clone(&self.shared.loop_region);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
@@ -383,6 +393,9 @@ impl PlaybackEngine {
                     let mut compiled_pipeline = dsp_pipeline;
                     let mut compiled_vst_version = 0u64;
                     let mut live_vst_chain = vst_chain;
+                    let mut spectrum_analyzer =
+                        crate::spectrum::SpectrumAnalyzer::new(target_format.sample_rate);
+                    let worker_metrics = Arc::clone(&worker_frames_played);
                     loop {
                         if !running.load(Ordering::Acquire) {
                             break;
@@ -554,6 +567,40 @@ impl PlaybackEngine {
                             }
                         }
 
+                        // A/B loop: when the position passes the region end,
+                        // seek back to the start. Checked before the decode
+                        // step so the jump happens between chunks (no clicks
+                        // beyond the ring's in-flight audio).
+                        {
+                            let region = worker_loop_region
+                                .lock()
+                                .ok()
+                                .and_then(|mut r| r.take())
+                                .filter(|(start, end)| *end > *start);
+                            if let Some((start, e)) = region {
+                                let played = worker_frames_played.frames_played();
+                                let rate = f64::from(target_format.sample_rate);
+                                let pos = live_seek_rebase
+                                    .lock()
+                                    .ok()
+                                    .and_then(|rb| *rb)
+                                    .map(|(base, p)| {
+                                        p + played.saturating_sub(base) as f64 / rate
+                                    })
+                                    .unwrap_or_else(|| played as f64 / rate);
+                                if pos >= e {
+                                    if let Ok(mut slot) = live_seek.lock() {
+                                        *slot = Some(start);
+                                    }
+                                } else {
+                                    // Region still ahead: keep it armed.
+                                    if let Ok(mut r) = worker_loop_region.lock() {
+                                        *r = Some((start, e));
+                                    }
+                                }
+                            }
+                        }
+
                         // Seek: drain the ring, seek the source, continue.
                         let pending_seek = live_seek.lock().ok().and_then(|mut s| s.take());
                         if let Some(position_s) = pending_seek {
@@ -635,12 +682,32 @@ impl PlaybackEngine {
                                         continue;
                                     };
                                     let samples = chunk.to_f32_interleaved();
+                                    // A/B bypass set for this pass (slot
+                                    // indices count attached plugins).
+                                    let bypassed = live_vst
+                                        .lock()
+                                        .ok()
+                                        .map(|v| v.bypassed.clone())
+                                        .unwrap_or_default();
                                     let after_vst = match live_vst_chain.as_mut() {
-                                        Some(chain) => chain.process(&samples),
+                                        Some(chain) => {
+                                            chain.process_with_bypass(&samples, &bypassed)
+                                        }
                                         None => samples,
                                     };
                                     let mut samples = after_vst;
                                     let processed = pipeline.process(&mut samples);
+
+                                    // Spectrum: feed the ANALYZED signal
+                                    // (post-DSP, post-VST — what the wire
+                                    // actually carries), recompute bands.
+                                    // Worker-side, non-RT.
+                                    spectrum_analyzer.push(
+                                        &processed,
+                                        usize::from(target_format.channels.max(1)),
+                                    );
+                                    let bands = spectrum_analyzer.analyze();
+                                    worker_metrics.publish_spectrum(bands);
 
                                     // Dither only when converting to integer
                                     // output; float output needs none.
@@ -1022,6 +1089,42 @@ impl PlaybackEngine {
         if let Ok(mut slot) = self.shared.seek.lock() {
             *slot = Some(position_s.clamp(0.0, f64::MAX));
         }
+    }
+
+    /// Set / clear the A/B loop region in seconds. `None` disables.
+    /// The worker loops by seeking back to `start` when the position
+    /// passes `end` — DSP/VST keep running uninterrupted.
+    pub fn set_loop(&self, region: Option<(f64, f64)>) {
+        if let Ok(mut slot) = self.shared.loop_region.lock() {
+            *slot = region;
+        }
+    }
+
+    /// The configured A/B loop region, if any.
+    pub fn loop_region(&self) -> Option<(f64, f64)> {
+        self.shared.loop_region.lock().ok().and_then(|r| *r)
+    }
+
+    /// Bypass one VST chain slot (A/B comparison without unloading: the
+    /// slot's plugin stays live in its helper process; the worker just
+    /// routes audio around it).
+    pub fn set_vst_slot_bypass(&self, slot: usize, bypassed: bool) {
+        if let Ok(mut live) = self.shared.vst.lock() {
+            if bypassed {
+                live.bypassed.insert(slot);
+            } else {
+                live.bypassed.remove(&slot);
+            }
+        }
+    }
+
+    /// Which chain slots are currently bypassed.
+    pub fn vst_bypassed_slots(&self) -> Vec<usize> {
+        self.shared
+            .vst
+            .lock()
+            .map(|v| v.bypassed.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Update the DSP configuration live. Takes effect within one chunk

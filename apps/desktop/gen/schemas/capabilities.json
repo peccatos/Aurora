@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Aurora main window: core invoke + file dialogs for playback.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
+{"default":{"identifier":"default","description":"Aurora main window: core invoke, file dialogs, media keys.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","global-shortcut:allow-register","global-shortcut:allow-unregister","global-shortcut:allow-is-registered"]}}
