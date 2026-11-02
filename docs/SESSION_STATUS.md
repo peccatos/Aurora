@@ -1,133 +1,125 @@
 # Aurora — сводка состояния проекта
 
-_Дата: 1 ноября 2026 (обновление 3: exclusive+loopback бэкенд, редизайн референсы). Полный отчёт для продолжения в новом окне._
+_Дата: 2 ноября 2026 (обновление 4: VST3 закрыт, редизайн по Фигме, обложки, file-лог).
+Полный отчёт для продолжения в новом окне. Кластерные логи: окно умерло — читать это._
 
 ## СРОЧНО ДЛЯ НОВОЙ СЕССИИ
 
-1. **Exclusive+loopback почти готов**: бэкенд закоммичен (481767a).
-   Осталось: применить ГОТОВЫЙ патч `docs/_next_session_patch_exclusive_tauri.py`
-   (python <файл> — добавляет команды play_exclusive_track и
-   verify_bit_perfect в aurora-tauri), потом кнопка «Bit-perfect» в
-   frontend + проверка на живом устройстве.
-2. **Редизайн (задача 3)**: пользователь скинул 6 референс-скриншотов.
-   Ключ: тёмная база #0F–14 с глубиной (фон темнее карточек), САЙДБАР
-   слева (Library/Playlists/EQ/Settings), фиксированный НИЖНИЙ
-   playback-bar (превью+транспорт+seek), album-art сетка + большая
-   now-playing обложка, один акцентный цвет (лаванда/пурпур),
-   uppercase-eyebrows (уже есть). НЕ брать: полноэкранные визуализаторы,
-   круглые кнопки-пузыри, неон. Обложки = бэкенд (lofty картинки из
-   тегов + кэш) — ещё не сделано.
-3. Порядок от пользователя: сначала дожать exclusive (п.1), потом
-   редизайн (п.2), потом VST3 (Phase 9, ADR 0004 перед стартом).
-4. **Токен-бюджет**: пользователь попросил экономить токены — меньше
-   патч-скриптов-переборов, аккуратные якоря, минимум итераций сборки.
-   Скрипт из docs/_next_session_patch_exclusive_tauri.py уже проверен
-   анкорами — применить одним вызовом python.
+1. **Всё закоммичено** (`7e92bfe` HEAD, рабочее дерево чистое). Валидация зелёная
+   (fmt/clippy/тесты 27 наборов/tsc/build).
+2. **Запуск приложения**: ДВА окна PowerShell (не закрывать первое!):
+   - `cd frontend && npm run dev` (vite, порт 1420) — должен слушать ПЕРВЫМ
+   - `cd apps/desktop && TAURI_DEV="true" cargo run` — вторым
+   Если окно приложения показывает «127.0.0.1 отказано в подключении» — умер vite:
+   поднять его первым, потом перезапустить приложение.
+3. **Файл-лог падений**: `%APPDATA%\dev.aurora.player\logs\aurora.log.<дата>` — при любом
+   падении читать последние строки, там причина. Консоль умирает вместе с процессом,
+   файл — нет.
+4. **Токен-бюджет**: пользователь просил экономить. Меньше итераций, точные якоря,
+   патчи через python-файл для массовых правок.
 
 ## Что такое Aurora
 
-Локальный аудиоплеер уровня «аудиофильский движок с честным трактом».
-Rust + Tauri 2 + TypeScript. Windows/Linux/macOS.
+Локальный аудиоплеер, Rust + Tauri 2 + TypeScript, Windows/Linux/macOS.
+Идеология (ADR 0002): плеер, которому верят — bit-perfect это ИЗМЕРЕННОЕ свойство,
+каждая трансформация честно репортится.
 
-**Ключевая идеология (ADR 0002):** плеер, которому верят. Bit-perfect — это
-*измеренное* свойство тракта, а не маркетинговое заявление. Любая активная
-трансформация честно репортится; непроверяемый тракт = `unverified`, не
-«bit-perfect». VST3-хостинг запланирован как Phase 9 (post-1.0), VST2
-отвергнут навсегда (закрытый SDK).
-
-## Архитектура (Cargo workspace, 9 крейтов)
+## Крейты (10)
 
 ```
-aurora-core     — домен: PcmFormat, TrackId (контент-хеш), Track (+genre/
-                  year/track_no/ReplayGain, display_title/display_line),
-                  Playlist, AudioTransformation, OutputIntegrity
-aurora-decoder  — Symphonia; формат из РЕАЛЬНОГО буфера (F32 для MP3/FLAC!)
-aurora-dsp      — EQ (10-band), Freeverb, Gain/ReplayGain, TPDF dither,
-                  resampler, speed; DspPipeline, live-рекомпиляция
-aurora-audio    — движок: worker -> SPSC ring (1MB) -> CPAL; live-DSP,
-                  пауза/seek; play_with_replaygain(теги из библиотеки)
-aurora-metadata — lofty: title/artist/album/genre/year/track, duration,
-                  ReplayGain-парсер ("−6.5 dB" / "−6.5", мусор→None)
-aurora-storage  — SQLite (sqlx 0.9, WAL, миграции), upsert по TrackId
-                  (идемпотентность rescan!), search, prune, плейлисты,
-                  blake3 content_digest
-aurora-library  — LibraryService: scan_folder (walkdir→digest→метаданные→
-                  upsert→prune, honest ScanSummary), search, async-мьютекс
-                  на сканы, spawn_blocking на метаданные
-aurora-tauri    — команды: движок + очередь (QueueTrack с RG-тегами и
-                  display-именами) + 10 библиотечных команд
-aurora-app      — composition root
+aurora-core     — домен; AudioTransformation::ExternalPlugin (новый)
+aurora-decoder  — Symphonia; формат из реального буфера (F32 у MP3/FLAC!)
+aurora-dsp      — EQ/реверб/gain/TPDF-dither/ресемплер/speed; live-рекомпиляция
+aurora-vst      — VST3-хостинг (Phase 9): scan/load/chain + gui + vst-gui-helper
+aurora-audio    — движок: worker→SPSC ring→CPAL; exclusive WASAPI; loopback;
+                  VST-цепь на decode-worker'е; restart_for_dsp
+aurora-metadata — lofty; read_cover_art() — обложки из тегов
+aurora-storage  — SQLite WAL, идемпотентный rescan (контент-хеш)
+aurora-library  — сканер/поиск/плейлисты
+aurora-tauri    — команды (движок, очередь, библиотека, VST, artwork, exclusive)
+aurora-app      — composition root + файловое логирование (tracing-appender)
 apps/desktop    — Tauri бинарник
-frontend/       — плеер + EQ + reverb/speed + ПАНЕЛЬ LIBRARY (скан, поиск,
-                  плейлисты, корректные имена)
+frontend/       — весь UI в main.ts (один файл ~1500 строк) + style.css
 ```
 
-## Фазы (по ROADMAP.md)
+## Фазы
 
 | Фаза | Статус |
 |---|---|
-| Sprint 0 Foundation | ✅ CI три ОС + audit + MSRV 1.90 |
-| 1 Domain core | ✅ property-тесты |
-| 2 Decoder | ✅ bit-exact roundtrip |
-| 3 Playback | ✅ реальный звук, 0 underruns |
-| 4 DSP | ✅ live EQ/реверб/пресеты/speed |
-| 5 Output integrity | ✅ честная классификация + WASAPI
-  exclusive probe (Realtek: 16/24-bit YES) + loopback-математика.
-  Полный exclusive-стрим и физ. loopback — следующий слой |
-| 6 Library+SQLite | ✅ СВЕРШИЛОСЬ: сканер, метаданные (lofty),
-  идемпотентный rescan (контент-хеш → TrackId), поиск, плейлисты,
-  корректные имена (display_title/display_line), ReplayGain-теги до DSP.
-  ADR 0003 написан |
-| 7 Desktop product | ✅ автозагрузка библиотеки из app-data,
-  персистентный выбор устройства (SQLite settings + fallback при
-  отключённом устройстве), rescan всех корней, queue UI панель,
-  add-to-queue, выбор из библиотеки |
-| 8 Hardening | ✅ crash containment (worker panics ловятся
-  catch_unwind, процесс жив), device-loss recovery (stream_error +
-  recover_playback + кнопка Recover & Replay), graceful shutdown (WAL
-  checkpoint при закрытии окна), перф-тесты DSP (10x realtime floor,
-  44.1k/96k), release workflow (draft release, бандлы 3 ОС),
-  PLATFORM_LIMITATIONS.md |
-| 9 VST3 host (post-1.0) | задокументирован в ROADMAP |
+| 0-8 | ✅ (foundation…hardening — см. git history / прошлые сводки) |
+| 9 VST3 | ✅ Закрыта этой сессией (f6a3371 + серия фиксов) |
+| Редизайн | ⏳ частично: тема Фигмы применена, Now Playing перестроен |
 
-## Ключевые баги, которые мы поймали и починили (уроки!)
+## Сделано этой сессией (окончательно)
 
-1. **Белый шум #1**: negotiate брал sample format первый из enum (U8!).
-   Фикс: `wire_compatible()` — совпадение семейства И битовой ширины.
-2. **Белый шум #2 (главный)**: symphonia декодит MP3/FLAC в **F32**-буферы,
-   а формат брался из параметров кодека (None → дефолт S16). **Урок:
-   формат бери из реального буфера.**
-3. **Задержка пресетов**: ring 8MB = ~46 сек старой обработки. Фикс:
-   ring 1MB + drain-флаг.
-4. **Worker-пиннинг на паузе**: back-pressure цикл крутился вечно. Фикс:
-   paused-флаг + bounded waits.
-5. **Play вместо Resume**.
-6. **Два одинаковых WAV в тесте сканера = один трек**: контент-хеш
-   действительно делает то, что обещает — тест-файлы должны отличаться.
+1. **VST3 (Phase 9)**: aurora-vst крейт, ADR 0004. Плагины out-of-process
+   (helper-процессы: vst3-host-probe/helper + НАШ vst-gui-helper). Скан
+   (папка %LOCALAPPDATA%\VST3 + Program Files), честный Attach с живым тестом
+   (test_vst_plugin), цепь на decode-worker'е (не в RT-колбэке), exclusive
+   отказывает при активной цепи. **GUI редактора: vst-gui-helper процесс**
+   (первый in-process вариант ронял приложение — сегфолт; вынесли, теперь падение
+   редактора = умирает только окно). Параметры из редактора → JSON-строки stdout →
+   param_updates → воркер применяет. Установлен CHOWTapeModel.vst3 (MIT,
+   Chowdhury DSP) в %LOCALAPPDATA%\VST3 для тестов.
+2. **Обложки**: read_cover_art (lofty) → get_track_artwork (data-URL, кэш) →
+   now-playing hero показывает реальный арт.
+3. **UI-фиксы по репортам пользователя**: play/pause одной кнопкой (glyph =
+   действие: ⏸ игра / ⏵ пауза / ▶ idle); панели расчищены (panel-head/toolbar/row
+   — заголовок/тулбар/контролы в три строки); main = фикс. высота со своим
+   скроллом; статусы tabular-nums (не скачут); сброс seek только на смене трека.
+4. **DSP на нативном стриме**: активация EQ/реверба/speed на native-пути раньше
+   игнорировалась — теперь воркер флагает, set_dst перезапускает трек через
+   DSP-путь (restart_for_dsp).
+5. **Редизайн по Фигме** (ссылка от пользователя, файл "with Danya"
+   wQub0nBCBf2i53s5VU31AL, node 22-54): документ-API закрыт (нужен auth),
+   разобрано превью 800×405 по пикселям (палитра, структура фреймов, текстовые
+   строки, акценты). Применено: инверсия темы — **чёрный фон #000 + белые
+   карточки #f5f5f5 + пурпур #8043CE** со свечением, пурпурная кромка сверху
+   панелей, Now Playing = [арт][вертикальный пурпурный прогресс-столбик][белая
+   инфо-карточка]. Анализ: docs/FIGMA_DESIGN_NOTES.md.
 
-## Фронтенд-структура (frontend/src/main.ts)
+## Ключевые баги этой сессии (уроки)
 
-- Плеер: PlaybackStatus, DspConfig (get_dsp/set_dsp live), очередь
-  `QueueTrack[]` (path + title/artist + RG-теги), seek, shuffle
-- **Библиотека (новое)**: `open_library` (диалог .db) → `scan_folder`
-  (диалог папки, honest summary) → `list_tracks`/`search_library`
-  (debounce 250ms) → чекбоксы → Enter = играть выбранное; плейлисты
-  (создать/открыть/удалить), `display` = "Artist — Title" со
-  stem-fallback
-- Пресеты EQ (8), Speed кнопки (Slowed 0.8x / Speed Up 1.25x)
-- Poll статуса 500ms, позиция 400ms, авто-advance
+1. **In-process GUI плагина = сегфолт всего приложения** (лог поймал точно).
+   Вывод: чужой C++ код — только в отдельном ПРОЦЕССЕ, треды не спасают.
+2. **Safe-discovery молча не работала** без собранного probe-бинарника —
+   «плагинов нет» vs «скан не запустился» неотличимы. Проверять report.scan_ran().
+3. **ДСП на native-пути**: native-путь не имеет pipeline — активация DSP требует
+   рестарта стрима. Учесть в будущих live-фичах.
+4. **Панели «слипались»** из-за контролей в строке заголовка — фикс структурой
+   panel-head/panel-toolbar/panel-row.
 
-## Команды запуска/валидации
+## НЕ сделано / открыто
 
-```bash
-# Валидация (всё зелёное на коммите Phase 6)
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-cd frontend && npx tsc --noEmit && npm run build
+1. **Verify (loopback) на живом устройстве** — пользователь так и не отчитался.
+   Exclusive работает (кнопка, рестарт-семантика). Проверка вердикта Verify — TODO.
+2. **Редизайн не завершён**: применены тема+Now Playing; остальные панели
+   (Library/Queue/EQ/Reverb/VST/Settings) на новой палитре, но НЕ перестроены под
+   Фигма-композиции. Пользователь предлагал принести код из ChatGPT — не
+   получилось; вариант — Фигма Dev Mode Inspect (CSS по элементам) вручную.
+3. **Плагейлисты**: drag-n-drop, экспорт/импорт.
+4. **Watch библиотеки** (изменения папок на лету) — нет.
+5. **VST3**: GUI-параметры применяются к первому слоту цепи (multi-slot GUI нет);
+   пресеты плагинов (save/load state) не реализованы.
+6. Seek: старый буфер доигрывает ~1MB перед прыжком; реверб только стерео.
 
-# Запуск (vite должен слушать 127.0.0.1:1420)
-cd frontend && npm run dev      # отдельный терминал
-cd apps/desktop && TAURI_DEV="true" cargo run
-```
+## Критичные хвосты инфраструктуры
+
+- Приложение+vite запускаются в ОТДЕЛЬНЫХ окнах PowerShell (переживают сессии
+  агента). Пользователь знает: «не закрывать окно с npm run dev».
+- Один runaway-процесс мог раздуть лог-файл до 237MB (bash fork loop) — периодически
+  проверять `C:\Users\madei\AppData\Local\Temp\claude\*\tasks\`.
+- Команда полного прогона: `cargo fmt --all && cargo clippy --workspace
+  --all-targets -- -D warnings && cargo test --workspace` + `cd frontend &&
+  npx tsc --noEmit && npm run build`.
+
+## Что делать дальше (приоритеты)
+
+1. Дожать редизайн: панели под Фигма-композиции (см. FIGMA_DESIGN_NOTES.md;
+   точность — только через Inspect CSS от пользователя).
+2. Проверка Verify (loopback-вердикт) на устройстве пользователя.
+3. Полировка VST3: multi-slot GUI, пресеты.
+4. Плейлисты: drag-n-drop.
 
 ## Правила для агента (CLAUDE.md в корне!)
 
@@ -135,25 +127,4 @@ cd apps/desktop && TAURI_DEV="true" cargo run
 - сложные команды → Write в файл-скрипт → запуск одним вызовом
 - EOF/syntax error = сломан вызов, НЕ проект
 - повторяешься 3-й раз → СТОП и скажи пользователю
-
-## Что делать дальше (приоритеты)
-
-1. Полный WASAPI exclusive-стрим (поверх probe из Phase 5) — поднимет
-   honest-статус с unverified до проверяемого
-3. Физический loopback-захват (верификация Verified)
-4. VST3-хост (Phase 9, out-of-process изоляция)
-
-## Технический долг / известные границы
-
-- Seek: старый буфер доигрывает ~1MB перед прыжком
-- Реверб только стерео (моно проходит мимо)
-- ReplayGain: теги читаются и применяются; preamp/clipping-guard —
-  можно улучшить
-- Библиотека: нет watch (изменения папки на лету), нет обложек
-- Плейлисты: нет drag-n-drop переупорядочивания (только порядок
-  сохранения), нет экспорта/импорта
-- Устройство применяется к следующему треку (не hot-swap текущего стрима)
-- Настройки хранятся в library.db (в settings), отдельного конфига нет
-- Подпись релизов требует секретов (TAURI_SIGNING_PRIVATE_KEY, Apple
-  notarization) — без них артефакты unsigned
-- Frontend-валидация (tsc+build) не в CI-джобе rust (есть в release.yml)
+- НЕ коммитить без прогона fmt + clippy + test + tsc + build
