@@ -48,3 +48,6 @@ frontend/node_modules/
 Thumbs.db
 Desktop.ini
 apps/desktop/binaries/
+
+# Agent instructions (local, not project source)
+CLAUDE.md
