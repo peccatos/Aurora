@@ -46,6 +46,7 @@
     },
     "externalBin": [
       "binaries/vst3-host-helper",
+      "binaries/vst3-host-probe",
       "binaries/vst-gui-helper"
     ]
   }
