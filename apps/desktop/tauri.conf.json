@@ -26,7 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "category": "AudioVideo",
+    "category": "Music",
     "shortDescription": "Local-first music player",
     "longDescription": "Aurora is a local-first music player with a bit-perfect-capable audio pipeline, hybrid DSP path and SQLite-backed library.",
     "icon": [
@@ -43,6 +43,10 @@
       "deb": {
         "depends": []
       }
-    }
+    },
+    "externalBin": [
+      "binaries/vst3-host-helper",
+      "binaries/vst-gui-helper"
+    ]
   }
 }
