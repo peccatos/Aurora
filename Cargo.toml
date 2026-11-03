@@ -10,6 +10,7 @@ members = [
     "crates/aurora-storage",
     "crates/aurora-library",
     "crates/aurora-kernel",
+    "crates/aurora-web",
     "crates/aurora-tauri",
     "crates/aurora-app",
     "apps/desktop",
@@ -32,6 +33,7 @@ aurora-metadata = { path = "crates/aurora-metadata" }
 aurora-storage = { path = "crates/aurora-storage" }
 aurora-library = { path = "crates/aurora-library" }
 aurora-kernel = { path = "crates/aurora-kernel" }
+aurora-web = { path = "crates/aurora-web" }
 aurora-tauri = { path = "crates/aurora-tauri" }
 aurora-app = { path = "crates/aurora-app" }
 

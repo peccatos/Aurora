@@ -1,0 +1,727 @@
+/* YouTube Music design system — Aurora Web shell (план §7).
+   Один-в-один: тёмная тема YTM, красный акцент #FF0033, Roboto.
+   Десктоп: сайдбар + ленты карточек + плеербар.
+   Мобильный (<=768px): нижние табы + мини-плеер + fullscreen player. */
+
+:root {
+  /* Surfaces */
+  --ytm-bg: #030303;
+  --ytm-surface: #212121;
+  --ytm-surface-hover: #272727;
+  --ytm-surface-active: #353535;
+  --ytm-raised: #2d2d2d;
+
+  /* Text */
+  --ytm-text: #ffffff;
+  --ytm-text-2: #aaaaaa;
+  --ytm-text-3: #909090;
+
+  /* Accent — YTM red */
+  --ytm-accent: #ff0033;
+  --ytm-accent-hover: #cc0029;
+
+  /* Misc */
+  --ytm-divider: #303030;
+  --ytm-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+  --ytm-radius: 8px;
+
+  /* Layout metrics (desktop) */
+  --ytm-sidebar-w: 240px;
+  --ytm-player-h: 72px;
+  --ytm-tabbar-h: 56px; /* mobile bottom tabs */
+  --ytm-miniplayer-h: 64px; /* mobile */
+
+  font-family: Roboto, "Segoe UI", Arial, sans-serif;
+}
+
+/* ------------------------------------------------------------------ */
+/* App shell                                                           */
+/* ------------------------------------------------------------------ */
+
+.ytm-app {
+  display: grid;
+  grid-template-areas:
+    "sidebar content"
+    "player player";
+  grid-template-columns: var(--ytm-sidebar-w) 1fr;
+  grid-template-rows: 1fr var(--ytm-player-h);
+  height: 100vh;
+  background: var(--ytm-bg);
+  color: var(--ytm-text);
+  overflow: hidden;
+}
+
+.ytm-content {
+  grid-area: content;
+  overflow-y: auto;
+  padding: 24px 32px 96px;
+  scroll-behavior: smooth;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sidebar (desktop)                                                   */
+/* ------------------------------------------------------------------ */
+
+.ytm-sidebar {
+  grid-area: sidebar;
+  background: var(--ytm-bg);
+  border-right: 1px solid var(--ytm-divider);
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0;
+  overflow-y: auto;
+}
+
+.ytm-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 24px 16px;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.3px;
+}
+
+.ytm-logo svg {
+  width: 26px;
+  height: 26px;
+}
+
+.ytm-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 0 24px;
+  height: 44px;
+  color: var(--ytm-text-2);
+  font-size: 14px;
+  cursor: pointer;
+  border-radius: 0;
+  transition: background 0.1s;
+}
+
+.ytm-nav-item:hover {
+  background: var(--ytm-surface-hover);
+  color: var(--ytm-text);
+}
+
+.ytm-nav-item.active {
+  color: var(--ytm-text);
+  background: var(--ytm-surface);
+  font-weight: 500;
+}
+
+.ytm-nav-item svg {
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+.ytm-nav-section {
+  padding: 16px 24px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ytm-text-3);
+}
+
+/* ------------------------------------------------------------------ */
+/* Shelf: a horizontal row of cards (YTM home)                          */
+/* ------------------------------------------------------------------ */
+
+.ytm-shelf {
+  margin-bottom: 40px;
+}
+
+.ytm-shelf-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.ytm-shelf-title {
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--ytm-text);
+  white-space: nowrap;
+}
+
+.ytm-shelf-more {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ytm-text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.ytm-shelf-more:hover {
+  color: var(--ytm-text-2);
+}
+
+.ytm-shelf-row {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scrollbar-width: thin;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cards                                                               */
+/* ------------------------------------------------------------------ */
+
+.ytm-card {
+  width: 180px;
+  flex-shrink: 0;
+  cursor: pointer;
+  border-radius: var(--ytm-radius);
+  padding: 8px;
+  transition: background 0.15s;
+}
+
+.ytm-card:hover {
+  background: var(--ytm-surface-hover);
+}
+
+.ytm-card-art {
+  width: 164px;
+  height: 164px;
+  border-radius: 6px;
+  background: var(--ytm-raised);
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ytm-card-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Round art for artists */
+.ytm-card-art.round {
+  border-radius: 50%;
+}
+
+/* Play-on-hover button (bottom-right of art, like YTM) */
+.ytm-card-play {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--ytm-accent);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--ytm-shadow);
+  opacity: 0;
+  transform: translateY(6px);
+  transition:
+    opacity 0.15s,
+    transform 0.15s;
+  cursor: pointer;
+}
+
+.ytm-card:hover .ytm-card-play,
+.ytm-card-play:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.ytm-card-play:hover {
+  background: var(--ytm-accent-hover);
+}
+
+.ytm-card-play svg {
+  width: 22px;
+  height: 22px;
+  fill: #fff;
+}
+
+.ytm-card-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--ytm-text);
+  margin-top: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.ytm-card-sub {
+  font-size: 12px;
+  color: var(--ytm-text-3);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ */
+/* Player bar (bottom, desktop)                                        */
+/* ------------------------------------------------------------------ */
+
+.ytm-player {
+  grid-area: player;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(280px, 2fr) minmax(180px, 1fr);
+  align-items: center;
+  padding: 0 16px;
+  background: var(--ytm-bg);
+  border-top: 1px solid var(--ytm-divider);
+}
+
+/* Left: now playing preview */
+.ytm-player-now {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.ytm-player-art {
+  width: 48px;
+  height: 48px;
+  border-radius: 4px;
+  background: var(--ytm-raised);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.ytm-player-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ytm-player-meta {
+  min-width: 0;
+}
+
+.ytm-player-title {
+  font-size: 14px;
+  color: var(--ytm-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ytm-player-artist {
+  font-size: 12px;
+  color: var(--ytm-text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Center: transport + progress */
+.ytm-player-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0 24px;
+}
+
+.ytm-transport {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.ytm-btn-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ytm-text-2);
+  cursor: pointer;
+  transition: color 0.1s;
+}
+
+.ytm-btn-icon:hover {
+  color: var(--ytm-text);
+}
+
+.ytm-btn-icon svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+}
+
+.ytm-btn-play {
+  width: 48px;
+  height: 48px;
+  color: var(--ytm-text);
+}
+
+.ytm-btn-play svg {
+  width: 32px;
+  height: 32px;
+}
+
+.ytm-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 640px;
+}
+
+.ytm-time {
+  font-size: 11px;
+  color: var(--ytm-text-3);
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+}
+
+.ytm-progress input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 4px;
+  background: var(--ytm-surface-active);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.ytm-progress input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ytm-accent);
+  border: none;
+  cursor: pointer;
+}
+
+/* Right: extra controls */
+.ytm-player-right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Fullscreen player (tap on preview)                                  */
+/* ------------------------------------------------------------------ */
+
+.ytm-fullscreen {
+  position: fixed;
+  inset: 0;
+  background: var(--ytm-bg);
+  z-index: 100;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: center;
+  padding: 48px 96px;
+  animation: ytm-slide-up 0.25s ease;
+}
+
+@keyframes ytm-slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.ytm-fullscreen-art {
+  width: min(480px, 90%);
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background: var(--ytm-raised);
+  overflow: hidden;
+  box-shadow: var(--ytm-shadow);
+  justify-self: center;
+}
+
+.ytm-fullscreen-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ytm-fullscreen-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ytm-fullscreen-title {
+  font-size: 32px;
+  font-weight: 500;
+  color: var(--ytm-text);
+}
+
+.ytm-fullscreen-artist {
+  font-size: 16px;
+  color: var(--ytm-text-3);
+}
+
+.ytm-fullscreen-close {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Search bar (YTM Explore)                                            */
+/* ------------------------------------------------------------------ */
+
+.ytm-search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--ytm-surface);
+  border-radius: 8px;
+  padding: 0 16px;
+  height: 48px;
+  max-width: 560px;
+  margin-bottom: 24px;
+}
+
+.ytm-search input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--ytm-text);
+  font-size: 15px;
+  font-family: inherit;
+}
+
+.ytm-search input::placeholder {
+  color: var(--ytm-text-3);
+}
+
+/* ------------------------------------------------------------------ */
+/* Chips (filter row, like YTM)                                        */
+/* ------------------------------------------------------------------ */
+
+.ytm-chips {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 16px;
+}
+
+.ytm-chip {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--ytm-surface);
+  color: var(--ytm-text-2);
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.ytm-chip:hover {
+  background: var(--ytm-surface-hover);
+}
+
+.ytm-chip.active {
+  color: #fff;
+  border-color: var(--ytm-text-2);
+}
+
+/* ------------------------------------------------------------------ */
+/* Track list (YTM song rows)                                          */
+/* ------------------------------------------------------------------ */
+
+.ytm-tracklist {
+  display: flex;
+  flex-direction: column;
+}
+
+.ytm-track-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ytm-track-row:hover {
+  background: var(--ytm-surface-hover);
+}
+
+.ytm-track-row.playing {
+  color: var(--ytm-accent);
+}
+
+.ytm-track-index {
+  width: 28px;
+  text-align: right;
+  font-size: 13px;
+  color: var(--ytm-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.ytm-track-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  background: var(--ytm-raised);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.ytm-track-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ytm-track-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ytm-track-title {
+  font-size: 14px;
+  color: var(--ytm-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ytm-track-row.playing .ytm-track-title {
+  color: var(--ytm-accent);
+}
+
+.ytm-track-meta {
+  font-size: 12px;
+  color: var(--ytm-text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ytm-track-dur {
+  font-size: 13px;
+  color: var(--ytm-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ */
+/* Mobile layout (<=768px): bottom tabs + miniplayer                   */
+/* ------------------------------------------------------------------ */
+
+@media (max-width: 768px) {
+  .ytm-app {
+    grid-template-areas:
+      "content"
+      "mini"
+      "tabs";
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr var(--ytm-miniplayer-h) var(--ytm-tabbar-h);
+  }
+
+  .ytm-sidebar {
+    display: none;
+  }
+
+  .ytm-content {
+    padding: 16px 12px 24px;
+  }
+
+  .ytm-card {
+    width: 140px;
+  }
+
+  .ytm-card-art {
+    width: 124px;
+    height: 124px;
+  }
+
+  /* Miniplayer above tabs */
+  .ytm-miniplayer {
+    grid-area: mini;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 12px;
+    border-top: 1px solid var(--ytm-divider);
+    cursor: pointer;
+  }
+
+  .ytm-miniplayer .ytm-player-meta {
+    flex: 1;
+  }
+
+  /* Bottom tabs */
+  .ytm-tabs {
+    grid-area: tabs;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-top: 1px solid var(--ytm-divider);
+    background: var(--ytm-bg);
+  }
+
+  .ytm-tab {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 8px 0;
+    color: var(--ytm-text-3);
+    font-size: 10px;
+    cursor: pointer;
+  }
+
+  .ytm-tab.active {
+    color: var(--ytm-text);
+  }
+
+  .ytm-tab svg {
+    width: 24px;
+    height: 24px;
+    fill: currentColor;
+  }
+
+  /* Fullscreen player: stacked on mobile */
+  .ytm-fullscreen {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+    padding: 80px 24px 48px;
+  }
+
+  .ytm-fullscreen-art {
+    width: min(320px, 90%);
+  }
+
+  .ytm-fullscreen-title {
+    font-size: 22px;
+  }
+}

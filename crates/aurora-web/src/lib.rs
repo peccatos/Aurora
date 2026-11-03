@@ -1,0 +1,291 @@
+//! Aurora Web: the wasm shell over `aurora-kernel` (ADR 0005/0006).
+//!
+//! `WebKernel` mirrors the kernel's surface for JavaScript: the frontend
+//! calls the same methods the Tauri shell's commands do, events flow to
+//! JS callbacks. Output: the engine's ring consumer is drained from an
+//! AudioWorklet on the JS side (see `web_pull`).
+//!
+//! Honesty contracts travel unchanged (ADR 0002): bit-perfect is
+//! reported as N/A here — the browser audio path cannot be measured —
+//! never claimed.
+
+use aurora_kernel::{
+    DeckDto, ExclusiveProbe, KernelError, LibraryStatus, PlayRequest, PlaybackStatus, PlayerKernel,
+    QueueDto, QueueTrack,
+};
+use wasm_bindgen::prelude::*;
+
+/// Map kernel errors to JS exceptions with the kind tag (the same shape
+/// the Tauri shell's CommandError serializes to).
+fn js_err(e: KernelError) -> JsValue {
+    let (kind, message) = match e {
+        KernelError::Poisoned => ("poisoned", "internal state is poisoned".into()),
+        KernelError::Engine { message } => ("engine", message),
+        KernelError::Device(key) => ("device", format!("device not found: {key}")),
+        KernelError::Library { message } => ("library", message),
+        KernelError::LibraryNotOpen => ("library_not_open", "library is not open".into()),
+        KernelError::Metadata { message } => ("metadata", message),
+    };
+    serde_json::json!({ "kind": kind, "message": message })
+        .to_string()
+        .into()
+}
+
+fn to_js<T: serde::Serialize>(value: T) -> Result<JsValue, JsValue> {
+    serde_wasm_bindgen::to_value(&value).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The web shell's kernel handle: one per page.
+#[wasm_bindgen]
+pub struct WebKernel {
+    kernel: PlayerKernel,
+}
+
+#[wasm_bindgen]
+impl WebKernel {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            kernel: PlayerKernel::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Playback
+    // -----------------------------------------------------------------
+
+    pub fn playback_status(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.playback_status().map_err(js_err)?)
+    }
+
+    pub fn playback_position(&self) -> Result<f64, JsValue> {
+        self.kernel.playback_position().map_err(js_err)
+    }
+
+    pub fn play_track(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let request: PlayRequest = serde_wasm_bindgen::from_value(request).map_err(|e| {
+            js_err(KernelError::Engine {
+                message: format!("play request: {e}"),
+            })
+        })?;
+        to_js(self.kernel.play_track(request).map_err(js_err)?)
+    }
+
+    pub fn pause(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.pause_playback().map_err(js_err)?)
+    }
+
+    pub fn resume(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.resume_playback().map_err(js_err)?)
+    }
+
+    pub fn stop(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.stop_playback().map_err(js_err)?)
+    }
+
+    pub fn seek(&self, position_s: f64) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.seek(position_s).map_err(js_err)?)
+    }
+
+    // -----------------------------------------------------------------
+    // Queue
+    // -----------------------------------------------------------------
+
+    pub fn set_queue(&self, tracks: JsValue) -> Result<JsValue, JsValue> {
+        let tracks: Vec<QueueTrack> = serde_wasm_bindgen::from_value(tracks).map_err(|e| {
+            js_err(KernelError::Engine {
+                message: format!("queue payload: {e}"),
+            })
+        })?;
+        to_js(self.kernel.set_queue(tracks).map_err(js_err)?)
+    }
+
+    pub fn get_queue(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.get_queue().map_err(js_err)?)
+    }
+
+    pub fn play_queue_index(&self, index: usize) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.play_queue_index(index).map_err(js_err)?)
+    }
+
+    pub fn next_track(&self) -> Result<Option<JsValue>, JsValue> {
+        let dto = self.kernel.next_track().map_err(js_err)?;
+        match dto {
+            Some(q) => Ok(Some(to_js(q)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn prev_track(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.prev_track().map_err(js_err)?)
+    }
+
+    /// The queue snapshot DTO (for shells that need the raw shape).
+    pub fn queue_dto(&self, queue: &JsValue) -> Result<JsValue, JsValue> {
+        // Convenience passthrough is unnecessary; kept minimal: the
+        // queue DTO is already returned by set/get/next/prev.
+        let _ = queue;
+        self.get_queue()
+    }
+
+    // -----------------------------------------------------------------
+    // DSP
+    // -----------------------------------------------------------------
+
+    pub fn get_dsp(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.get_dsp().map_err(js_err)?)
+    }
+
+    pub fn set_dsp(&self, config: JsValue) -> Result<JsValue, JsValue> {
+        let config: aurora_dsp::DspConfig =
+            serde_wasm_bindgen::from_value(config).map_err(|e| {
+                js_err(KernelError::Engine {
+                    message: format!("dsp config: {e}"),
+                })
+            })?;
+        to_js(self.kernel.set_dsp(config).map_err(js_err)?)
+    }
+
+    // -----------------------------------------------------------------
+    // Spectrum / loop
+    // -----------------------------------------------------------------
+
+    pub fn playback_spectrum(&self) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.playback_spectrum().map_err(js_err)?)
+    }
+
+    pub fn set_loop(&self, start: f64, end: f64) -> Result<JsValue, JsValue> {
+        let (s, e) = if end > start {
+            (Some(start), Some(end))
+        } else {
+            (None, None)
+        };
+        to_js(self.kernel.set_loop(s, e).map_err(js_err)?)
+    }
+
+    // -----------------------------------------------------------------
+    // DJ decks
+    // -----------------------------------------------------------------
+
+    pub async fn deck_load(
+        &self,
+        deck: usize,
+        path: String,
+        title: Option<String>,
+        artist: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        to_js(
+            self.kernel
+                .deck_load(deck, path, title, artist)
+                .await
+                .map_err(js_err)?,
+        )
+    }
+
+    pub fn deck_play(&self, deck: usize) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.deck_play(deck).map_err(js_err)?)
+    }
+
+    pub fn deck_stop(&self, deck: usize) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.deck_stop(deck).map_err(js_err)?)
+    }
+
+    pub fn deck_seek(&self, deck: usize, position_s: f64) -> Result<(), JsValue> {
+        self.kernel.deck_seek(deck, position_s).map_err(js_err)
+    }
+
+    pub fn deck_fader(&self, deck: usize, value: f64) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.deck_fader(deck, value).map_err(js_err)?)
+    }
+
+    pub fn set_crossfader(&self, value: f64) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.set_crossfader(value).map_err(js_err)?)
+    }
+
+    pub fn deck_set_cue(
+        &self,
+        deck: usize,
+        slot: usize,
+        position: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        to_js(
+            self.kernel
+                .deck_set_cue(deck, slot, position)
+                .map_err(js_err)?,
+        )
+    }
+
+    pub fn deck_jump_cue(&self, deck: usize, slot: usize) -> Result<(), JsValue> {
+        self.kernel.deck_jump_cue(deck, slot).map_err(js_err)
+    }
+
+    pub fn deck_tempo(&self, deck: usize, speed: f64) -> Result<JsValue, JsValue> {
+        to_js(self.kernel.deck_tempo(deck, speed).map_err(js_err)?)
+    }
+
+    pub fn deck_status(&self) -> Result<JsValue, JsValue> {
+        let decks: [DeckDto; 2] = self.kernel.deck_status().map_err(js_err)?;
+        to_js(decks)
+    }
+
+    pub async fn track_bpm(&self, path: String) -> Result<Option<f64>, JsValue> {
+        self.kernel.track_bpm(&path).await.map_err(js_err)
+    }
+
+    // -----------------------------------------------------------------
+    // Devices / probe — honest N/A answers on the browser path (ADR 0002)
+    // -----------------------------------------------------------------
+
+    pub fn output_devices(&self) -> Result<JsValue, JsValue> {
+        to_js(
+            self.kernel
+                .resolve_device(None)
+                .map_err(js_err)?
+                .name()
+                .to_string(),
+        )
+    }
+
+    pub fn probe_exclusive(&self) -> Result<JsValue, JsValue> {
+        // The kernel's no-win-wasapi build already reports honestly.
+        to_js(self.kernel.probe_exclusive().map_err(js_err)?)
+    }
+
+    // -----------------------------------------------------------------
+    // Library status — the wasm kernel has no SQLite; the JS shell owns
+    // storage (IndexedDB). This reports "no library" honestly.
+    // -----------------------------------------------------------------
+
+    pub async fn library_status(&self) -> Result<JsValue, JsValue> {
+        // Native: kernel method. Wasm: constant honest status.
+        to_js(LibraryStatus {
+            open: false,
+            path: None,
+            track_count: 0,
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------
+
+    /// Subscribe to kernel events. The callback receives the serialized
+    /// `KernelEvent` (same wire shape as the Tauri event payloads).
+    pub fn subscribe(&self, callback: js_sys::Function) -> usize {
+        let kernel = &self.kernel;
+        let sub = kernel.events.subscribe(move |event| {
+            let payload = serde_json::to_string(event).unwrap_or_default();
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&payload));
+        });
+        // The subscription lives as long as the kernel; the id is for
+        // diagnostics (JS cannot unsubscribe in this iteration).
+        std::mem::forget(sub);
+        0
+    }
+}
+
+impl Default for WebKernel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
