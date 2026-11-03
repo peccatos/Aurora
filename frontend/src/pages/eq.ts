@@ -1,6 +1,6 @@
 /** EQ page: 10-band parametric EQ, preamp/volume, reverb, speed. */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../invoke";
 import type { Page } from "../router";
 import { app, setToast } from "../state";
 import type { DspConfig, EqBand, ReverbParams } from "../types";

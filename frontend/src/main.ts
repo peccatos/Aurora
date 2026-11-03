@@ -3,9 +3,10 @@
  *  pages, one global player bar. Pages live in ./pages, state in ./state,
  *  routes in ./router (hash-based: #/player, #/queue, …). */
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { invoke, platform } from "./invoke";
+import { onKernelEvent } from "./invoke";
+const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
+  import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
 import "./styles/base.css";
 import "./styles/components.css";
 import "./styles/player.css";
@@ -22,6 +23,14 @@ import { eqPage } from "./pages/eq";
 import { pluginsPage } from "./pages/plugins";
 import { settingsPage } from "./pages/settings";
 import { decksPage } from "./pages/decks";
+import {
+  isWebShell,
+  renderWebShell,
+  bindWebPlayerBar,
+  renderWebBar,
+  renderWebProgress,
+  homePage,
+} from "./web-shell";
 import type { PlaybackStatus, QueueDto } from "./types";
 
 registerPage(playerPage);
@@ -31,11 +40,67 @@ registerPage(eqPage);
 registerPage(pluginsPage);
 registerPage(settingsPage);
 registerPage(decksPage);
+if (isWebShell()) registerPage(homePage);
 
 const shell = document.querySelector<HTMLDivElement>("#app");
 if (!shell) throw new Error("Application root #app was not found");
 
-shell.innerHTML = `
+// ---------------------------------------------------------------------------
+// Web shell (YTM one-to-one): different chrome, same pages/router.
+// ---------------------------------------------------------------------------
+if (isWebShell()) {
+  const { content, sidebar, tabs } = renderWebShell(shell);
+  bindWebPlayerBar();
+
+  // Default route: Home.
+  if (!window.location.hash) window.location.hash = "#/home";
+  startRouter(content, sidebar);
+
+  const clickNav = (ev: Event) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-route]");
+    if (btn?.dataset.route) navigate(btn.dataset.route);
+  };
+  sidebar.addEventListener("click", clickNav);
+  tabs.addEventListener("click", clickNav);
+
+  // Web polls: status + progress through the YTM bar.
+  setInterval(async () => {
+    try {
+      await loadStatus();
+      renderWebBar();
+      refreshActive();
+    } catch {
+      /* kernel busy */
+    }
+  }, 500);
+
+  setInterval(async () => {
+    try {
+      const pos = await invoke<number>("playback_position");
+      renderWebProgress(pos);
+      if (app.durationS > 0 && pos >= app.durationS - 0.3) {
+        const q = await nextTrack();
+        if (!q && app.queueTracks.length === 1) {
+          await invoke("play_queue_index", { index: 0 });
+        }
+      }
+    } catch {
+      /* not playing */
+    }
+  }, 400);
+
+  void loadStatus().then(() => renderWebBar());
+} else {
+  mainDesktop();
+}
+
+// ---------------------------------------------------------------------------
+// Desktop shell (the original layout) — runs only under Tauri.
+// ---------------------------------------------------------------------------
+
+function mainDesktop(): void {
+
+shell!.innerHTML = `
   <div class="shell">
     <nav class="rail" id="rail">
       <div class="rail-brand">
@@ -321,32 +386,29 @@ setInterval(() => {
 subscribe(() => refreshActive());
 
 // Media keys (keyboard/headphones) -> transport.
-void listen("media-next", () => {
+void onKernelEvent("media-next", () => {
   void nextTrack().then((q) => {
     if (!q && app.queueTracks.length === 1) void invoke("play_queue_index", { index: 0 });
   });
 });
-void listen("media-prev", () => {
+void onKernelEvent("media-prev", () => {
   void prevTrack();
 });
 
-// Library watcher (backend): a rescan added/removed tracks on disk —
+// Library watcher (kernel event): a rescan added/removed tracks —
 // refresh the rail count and re-render whatever page is showing.
-void listen<{ added: number; pruned: number; updated: number }>(
-  "library-changed",
-  (ev) => {
-    const { added, pruned } = ev.payload;
-    setToast(
-      added > 0
-        ? `Library: ${added} new track${added === 1 ? "" : "s"}`
-        : pruned > 0
-          ? `Library: ${pruned} removed`
-          : "Library updated",
-    );
-    refreshActive();
-    void updateRailCount();
-  },
-);
+void onKernelEvent("library-changed", (payload) => {
+  const { added, pruned } = payload as { added: number; pruned: number };
+  setToast(
+    added > 0
+      ? `Library: ${added} new track${added === 1 ? "" : "s"}`
+      : pruned > 0
+        ? `Library: ${pruned} removed`
+        : "Library updated",
+  );
+  refreshActive();
+  void updateRailCount();
+});
 
 // External file drops (Explorer -> window).
 void registerDrop();
@@ -394,3 +456,4 @@ async function updateRailCount(): Promise<void> {
   }
 }
 setInterval(() => void updateRailCount(), 5000);
+}

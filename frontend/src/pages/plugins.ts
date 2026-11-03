@@ -1,6 +1,6 @@
 /** Plugins page: VST3 scan, attach, chain, editor, generic params, presets. */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../invoke";
 import type { Page } from "../router";
 import { setToast } from "../state";
 import type { VstParamDto, VstPresetDto, VstPluginDto, VstSlot } from "../types";

@@ -1,6 +1,6 @@
 /** Embedded cover art: data-URL cache (path -> url | null). */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 
 const cache = new Map<string, string | null>();
 

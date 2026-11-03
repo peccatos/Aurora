@@ -40,16 +40,45 @@ pub struct AudioSource {
 
 impl AudioSource {
     /// Open a file and probe it for a decodable audio track.
+    ///
+    /// wasm: "web://<id>" paths resolve through the in-memory registry
+    /// (see `web_files`); the JS shell registers the bytes first.
     pub fn open(path: &Path) -> Result<Self, SourceError> {
+        #[cfg(target_family = "wasm")]
+        if let Some(id) = path.to_str().and_then(|p| p.strip_prefix("web://")) {
+            let (bytes, ext) =
+                crate::web_files::take(id).ok_or(SourceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("web file not registered: {id}"),
+                )))?;
+            return Self::open_from_bytes(bytes, &ext);
+        }
         let file = File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
         // Extension hint accelerates probing but is not required.
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        Self::open_stream(mss, &ext)
+    }
 
+    /// Open in-memory bytes (wasm: a JS File read into a Vec) and probe
+    /// them. The extension (without dot) helps compressed formats.
+    pub fn open_from_bytes(data: Vec<u8>, extension: &str) -> Result<Self, SourceError> {
+        let cursor = std::io::Cursor::new(data);
+        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+        Self::open_stream(mss, extension)
+    }
+
+    /// Probe a media source stream for a decodable audio track.
+    fn open_stream(mss: MediaSourceStream<'static>, extension: &str) -> Result<Self, SourceError> {
+        let mut hint = Hint::new();
+        if !extension.is_empty() {
+            hint.with_extension(extension);
+        }
         let mut format = symphonia::default::get_probe()
             .probe(
                 &hint,
@@ -139,7 +168,7 @@ impl AudioSource {
 
         let info = SourceInfo {
             pcm_format,
-            audio_format: audio_format_from_extension(path),
+            audio_format: AudioFormat::from_extension(extension),
             duration_ms,
             total_frames,
         };

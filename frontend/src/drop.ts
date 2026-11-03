@@ -1,7 +1,7 @@
 /** Drag-n-drop audio files from Explorer into the app window.
  *  Tauri's drag-drop events carry absolute file paths (DOM events don't). */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./invoke";
 import { app, setQueue, setToast } from "./state";
 
 const AUDIO_EXT = new Set([

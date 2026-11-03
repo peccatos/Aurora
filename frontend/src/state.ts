@@ -1,7 +1,8 @@
 /** Central application state + typed invoke wrappers.
  *  Single source of truth every page module subscribes to. */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, platform } from "./invoke";
+import { startOutput, stopOutput, outputRunning } from "./audio-bridge";
 import type {
   DeviceDto,
   DspConfig,
@@ -74,6 +75,14 @@ export async function loadStatus(): Promise<PlaybackStatus> {
   app.status = s;
   if (s.duration_s && s.duration_s > 0) app.durationS = s.duration_s;
   if (s.state === "idle") app.exclusiveActive = false;
+  // Web build: drive the browser output while the engine plays.
+  if (platform === "web") {
+    if (s.state === "playing" && s.sample_rate) {
+      if (!outputRunning()) void startOutput(s.sample_rate, s.channels ?? 2);
+    } else if (s.state === "idle" && outputRunning()) {
+      stopOutput();
+    }
+  }
   notify();
   return s;
 }

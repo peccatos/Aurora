@@ -15,6 +15,15 @@ use aurora_kernel::{
 };
 use wasm_bindgen::prelude::*;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// In-memory file registry: the JS shell registers File bytes by id
+/// ("web://<id>" queue paths resolve here). The browser has no disk.
+fn register_web_file(id: &str, bytes: Vec<u8>, extension: &str) {
+    aurora_decoder::web_files::register(id, bytes, extension);
+}
+
 /// Map kernel errors to JS exceptions with the kind tag (the same shape
 /// the Tauri shell's CommandError serializes to).
 fn js_err(e: KernelError) -> JsValue {
@@ -266,6 +275,20 @@ impl WebKernel {
     }
 
     // -----------------------------------------------------------------
+    // Web file registry
+    // -----------------------------------------------------------------
+
+    /// Register a file for playback: `id` + bytes + extension (no dot).
+    /// The queue uses "web://<id>" as the path; the decoder resolves it
+    /// through the registry (the browser has no filesystem).
+    ///
+    /// Re-registering is the normal flow for replays — the registry
+    /// consumes entries on play.
+    pub fn register_file(&self, id: String, bytes: js_sys::Uint8Array, extension: String) {
+        register_web_file(&id, bytes.to_vec(), &extension);
+    }
+
+    // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
 
@@ -281,6 +304,30 @@ impl WebKernel {
         // diagnostics (JS cannot unsubscribe in this iteration).
         std::mem::forget(sub);
         0
+    }
+
+    // -----------------------------------------------------------------
+    // Web output bridge: the AudioWorklet polls these from JS to drain
+    // the engine's ring (the browser owns the audio device — ADR 0006).
+    // -----------------------------------------------------------------
+
+    /// Pull decoded+processed samples from the engine ring as f32
+    /// interleaved. Returns an empty array when nothing is playing or
+    /// the ring ran dry (the worklet fills silence then).
+    ///
+    /// The engine pushes wire-format bytes (its negotiated f32 target);
+    /// this converts to a JS Float32Array.
+    pub fn web_pull(&self, max_bytes: usize) -> js_sys::Float32Array {
+        let samples = self
+            .kernel
+            .engine
+            .lock()
+            .ok()
+            .and_then(|mut engine| engine.pull_web(max_bytes))
+            .unwrap_or_default();
+        let arr = js_sys::Float32Array::new_with_length(samples.len() as u32);
+        arr.copy_from(&samples);
+        arr
     }
 }
 

@@ -1,7 +1,10 @@
 /** Library page: search, track list, playlists column, actions. */
 
-import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { invoke } from "../invoke";
+const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
+  import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
+const save = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["save"]>) =>
+  import("@tauri-apps/plugin-dialog").then((m) => m.save(...a));
 import type { Page } from "../router";
 import { app, refreshLibraryStatus, setQueue, setToast, trackToQueueTrack } from "../state";
 import type { PlaylistDto, ScanSummary, TrackDto } from "../types";

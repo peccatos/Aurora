@@ -1,7 +1,7 @@
 /** Now Playing page: big art, waveform seek, spectrum, A/B loop,
  *  honest signal-path report. */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../invoke";
 import type { Page } from "../router";
 import { app, setToast } from "../state";
 import { renderArtwork } from "../artwork";

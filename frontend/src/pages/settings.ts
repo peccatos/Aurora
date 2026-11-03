@@ -1,7 +1,8 @@
 /** Settings page: output device, bit-perfect (exclusive + verify), files. */
 
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "../invoke";
+const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
+  import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
 import type { Page } from "../router";
 import { app, loadStatus, setQueue, setToast, trackToQueueTrack } from "../state";
 import type { BitPerfectVerdict, DeviceDto, ExclusivePlayResult, PlaybackStatus, QueueDto } from "../types";

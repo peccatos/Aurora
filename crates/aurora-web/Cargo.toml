@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# wasm-opt crashes on this binary (large Symphonia graph); skip it —
+# the release profile already optimizes.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [dependencies]
 aurora-core.workspace = true
 aurora-kernel.workspace = true

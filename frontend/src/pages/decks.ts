@@ -3,8 +3,9 @@
  *  load/play/seek, channel fader, 8 hot cues, tempo, jog waveform.
  *  Center: crossfader (equal-power). */
 
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "../invoke";
+const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
+  import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
 import type { Page } from "../router";
 import { setToast } from "../state";
 import type { TrackDto } from "../types";

@@ -1418,6 +1418,44 @@ impl Default for PlaybackEngine {
     // Note: Default manually implemented; Drop is explicit via stop().
 }
 
+// Web output bridge: the browser AudioWorklet drains the ring through
+// the wasm shell (the engine has no CPAL stream there). Bytes in the
+// ring are already the negotiated f32 wire format — interpreted here,
+// converted to f32 samples for JS.
+#[cfg(target_family = "wasm")]
+impl PlaybackEngine {
+    /// Pop up to `max_bytes` wire bytes from the ring as f32 interleaved
+    /// samples. Empty when not playing or dry (the worklet fills
+    /// silence; the metrics count the deficit via its own counter).
+    pub fn pull_web(&mut self, max_bytes: usize) -> Option<Vec<f32>> {
+        use ringbuf::traits::Consumer;
+        let cons = self.web_cons.as_mut()?;
+        let frame_bytes = self
+            .negotiated
+            .map(|f| (usize::from(f.channels) * usize::from(f.bits_per_sample).div_ceil(8)).max(1))
+            .unwrap_or(8);
+        // Whole frames only; leave a partial frame in the ring.
+        let frames_avail = max_bytes / frame_bytes;
+        if frames_avail == 0 {
+            return Some(Vec::new());
+        }
+        let mut bytes = vec![0u8; frames_avail * frame_bytes];
+        let popped = cons.pop_slice(&mut bytes);
+        if popped == 0 {
+            return Some(Vec::new());
+        }
+        let popped_frames = popped / frame_bytes;
+        let samples = popped_frames * frame_bytes / 4; // f32 wire
+        let out: Vec<f32> = bytes[..popped_frames * frame_bytes]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        self.metrics.add_frames(popped_frames as u64);
+        let _ = samples;
+        Some(out)
+    }
+}
+
 /// Build the output stream with the real-time callback.
 #[cfg(not(target_family = "wasm"))]
 fn build_stream(
