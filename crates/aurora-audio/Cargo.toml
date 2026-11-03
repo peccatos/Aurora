@@ -18,10 +18,22 @@ symphonia.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing.workspace = true
-windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_Devices_Properties", "Win32_Media_KernelStreaming", "Win32_System_Threading", "Win32_Foundation"] }
+
 [dev-dependencies]
 hound.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[features]
+# WASAPI exclusive output + loopback verification. Defaulted ON for
+# Windows targets via the workspace default-members mechanism; other
+# platforms build the shared CPAL path (the exclusive APIs honestly
+# return "unavailable" — ADR 0002, never a fake verdict).
+default = []
+win-wasapi = ["dep:windows"]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", optional = true, features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_Devices_Properties", "Win32_Media_KernelStreaming", "Win32_System_Threading", "Win32_Foundation"] }
+
 [lints]
 workspace = true

@@ -10,7 +10,6 @@ aurora-core.workspace = true
 aurora-decoder.workspace = true
 aurora-dsp.workspace = true
 aurora-vst.workspace = true
-aurora-audio.workspace = true
 aurora-metadata.workspace = true
 aurora-storage.workspace = true
 aurora-library.workspace = true
@@ -21,6 +20,19 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 notify.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# WASAPI exclusive path on Windows builds (default on for the desktop
+# app; off on other platforms — see aurora-audio's win-wasapi feature).
+aurora-audio = { workspace = true, features = ["win-wasapi"] }
+
+[target.'cfg(not(windows))'.dependencies]
+aurora-audio.workspace = true
+
+[features]
+# Mirrors aurora-audio's win-wasapi: enabled by the Windows target
+# dependency (which requests the feature) so kernel cfg gates line up.
+win-wasapi = ["aurora-audio/win-wasapi"]
 
 [lints]
 workspace = true

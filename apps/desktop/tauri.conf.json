@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm --prefix ../../frontend run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm --prefix C:/Users/madei/OneDrive/Desktop/aurora/frontend run build",
+    "beforeBuildCommand": "npm --prefix ../../frontend run build",
     "frontendDist": "../../frontend/dist"
   },
   "app": {

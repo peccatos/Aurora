@@ -137,6 +137,7 @@ pub struct PlaybackEngine {
     /// WASAPI exclusive-mode stream (Windows). When active, it replaces
     /// the CPAL stream entirely: the source's exact bytes go to the
     /// endpoint, bypassing the Windows audio engine.
+    #[cfg(feature = "win-wasapi")]
     exclusive_stream: Option<crate::exclusive_stream::ExclusiveStream>,
     worker: Option<JoinHandle<()>>,
     /// The negotiated output PCM format (for diagnostics).
@@ -184,6 +185,7 @@ impl PlaybackEngine {
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
             stream: None,
+            #[cfg(feature = "win-wasapi")]
             exclusive_stream: None,
             exclusive_reference: None,
             worker: None,
@@ -917,7 +919,7 @@ impl PlaybackEngine {
     /// honest (`FormatUnsupported`) and the caller falls back to the
     /// shared path. Integrity is `Unverified` until loopback measurement
     /// proves it (see `verify_loopback`).
-    #[cfg(target_os = "windows")]
+    #[cfg(feature = "win-wasapi")]
     pub fn play_exclusive(
         &mut self,
         path: PathBuf,
@@ -1257,6 +1259,7 @@ impl PlaybackEngine {
     /// stream: capture what the endpoint rendered and compare with the
     /// reference bytes. Honest verdict per ADR 0002 — `Verified` only
     /// from >= 99.9% byte identity.
+    #[cfg(feature = "win-wasapi")]
     pub fn verify_loopback(
         &self,
         duration: std::time::Duration,
@@ -1276,6 +1279,15 @@ impl PlaybackEngine {
             .lock()
             .map_err(|_| EngineError::Internal("reference lock poisoned".into()))?;
         crate::loopback::verify_playback(&device_key, format, &reference, duration)
+    }
+
+    /// Loopback verification without the WASAPI build: an honest
+    /// "not available", never a fake verdict (ADR 0002).
+    #[cfg(not(feature = "win-wasapi"))]
+    pub fn verify_loopback(&self, _duration: std::time::Duration) -> Result<(), EngineError> {
+        Err(EngineError::Internal(
+            "loopback verification requires the win-wasapi build (Windows)".into(),
+        ))
     }
 
     /// Approximate playback position in seconds, derived from frames
@@ -1303,9 +1315,9 @@ impl PlaybackEngine {
         *self.state.lock().expect("state mutex") = EngineState::Idle;
     }
 
-    /// Exclusive-mode playback is Windows-only; other platforms get an
+    /// Exclusive-mode playback is Windows-only; other builds get an
     /// honest error (the shared path remains available).
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(feature = "win-wasapi"))]
     pub fn play_exclusive(
         &mut self,
         _path: PathBuf,
@@ -1326,6 +1338,7 @@ impl PlaybackEngine {
         }
         // Stop the exclusive stream first (its render thread joins);
         // then the CPAL stream if any.
+        #[cfg(feature = "win-wasapi")]
         if let Some(mut exclusive) = self.exclusive_stream.take() {
             exclusive.stop();
         }

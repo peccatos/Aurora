@@ -320,6 +320,7 @@ impl PlayerKernel {
 
     /// Probe WASAPI exclusive-mode support for the playing format.
     /// The honest ADR 0002 classification.
+    #[cfg(feature = "win-wasapi")]
     pub fn probe_exclusive(&self) -> Result<ExclusiveProbe, KernelError> {
         let engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
         let (Some(source), Some(device_key)) =
@@ -354,8 +355,21 @@ impl PlayerKernel {
         })
     }
 
+    /// Exclusive path probe without the WASAPI build: honest
+    /// "unsupported", never a claim (ADR 0002).
+    #[cfg(not(feature = "win-wasapi"))]
+    pub fn probe_exclusive(&self) -> Result<ExclusiveProbe, KernelError> {
+        Ok(ExclusiveProbe {
+            playing: false,
+            exclusive_capable: None,
+            integrity: "unverified".into(),
+            note: "exclusive output requires the win-wasapi build (Windows)".into(),
+        })
+    }
+
     /// Play a track through WASAPI exclusive mode: no mixer, no DSP, the
     /// source's exact bytes to the endpoint. Honest fallback on refusal.
+    #[cfg(feature = "win-wasapi")]
     pub fn play_exclusive_track(
         &self,
         request: PlayRequest,
@@ -398,9 +412,29 @@ impl PlayerKernel {
         }
     }
 
+    /// Exclusive play without the WASAPI build: honest "unsupported"
+    /// (the shared path remains the caller's option).
+    #[cfg(not(feature = "win-wasapi"))]
+    pub fn play_exclusive_track(
+        &self,
+        request: PlayRequest,
+    ) -> Result<ExclusivePlayResult, KernelError> {
+        // Honest fallback: this build has no exclusive path at all; play
+        // the shared way and say so.
+        let status = self.play_track(request)?;
+        Ok(ExclusivePlayResult {
+            exclusive: false,
+            fallback_reason: Some(
+                "exclusive output requires the win-wasapi build (Windows)".into(),
+            ),
+            status,
+        })
+    }
+
     /// Run the physical loopback verification on the playing exclusive
     /// stream: capture what the endpoint rendered, compare byte-for-byte
     /// with the reference the engine pushed.
+    #[cfg(feature = "win-wasapi")]
     pub fn verify_bit_perfect(
         &self,
         seconds: Option<f64>,
@@ -431,6 +465,22 @@ impl PlayerKernel {
                 note: e.to_string(),
             }),
         }
+    }
+
+    /// Bit-perfect verdict without the WASAPI build: honestly
+    /// "unverified" — the measurement cannot run, so it is never claimed.
+    #[cfg(not(feature = "win-wasapi"))]
+    pub fn verify_bit_perfect(
+        &self,
+        _seconds: Option<f64>,
+    ) -> Result<BitPerfectVerdict, KernelError> {
+        Ok(BitPerfectVerdict {
+            exclusive_active: false,
+            identity: None,
+            frames_compared: None,
+            integrity: "unverified".into(),
+            note: "loopback verification requires the win-wasapi build (Windows)".into(),
+        })
     }
 
     // -----------------------------------------------------------------

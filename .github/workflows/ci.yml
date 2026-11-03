@@ -31,7 +31,8 @@ jobs:
             libxdo-dev \
             libssl-dev \
             librsvg2-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,6 +43,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Stage VST helper binaries (externalBin)
+        # externalBin files are gitignored build artifacts; tauri-build
+        # requires them in the checkout. Dependency bins (vst3-host-*)
+        # need an explicit --bins build to exist in target/debug.
+        shell: bash
+        run: |
+          cargo build --workspace --bins
+          mkdir -p apps/desktop/binaries
+          TRIPLE=$(rustc -vV | sed -n 's/host: //p')
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe";; esac
+          for name in vst3-host-helper vst3-host-probe vst-gui-helper; do
+            if [ -f "target/debug/$name$EXT" ]; then
+              cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
+            fi
+          done
+          ls -la apps/desktop/binaries/ || true
       - name: Check workspace
         run: cargo check --workspace
 
@@ -73,9 +91,27 @@ jobs:
             libxdo-dev \
             libssl-dev \
             librsvg2-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            libasound2-dev
       - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
+      - name: Stage VST helper binaries (externalBin)
+        # externalBin files are gitignored build artifacts; tauri-build
+        # requires them in the checkout. Dependency bins (vst3-host-*)
+        # need an explicit --bins build to exist in target/debug.
+        shell: bash
+        run: |
+          cargo build --workspace --bins
+          mkdir -p apps/desktop/binaries
+          TRIPLE=$(rustc -vV | sed -n 's/host: //p')
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe";; esac
+          for name in vst3-host-helper vst3-host-probe vst-gui-helper; do
+            if [ -f "target/debug/$name$EXT" ]; then
+              cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
+            fi
+          done
+          ls -la apps/desktop/binaries/ || true
       - name: Check workspace at MSRV
         run: cargo check --workspace
 
@@ -132,7 +168,8 @@ jobs:
             libxdo-dev \
             libssl-dev \
             librsvg2-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -141,9 +178,28 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
         working-directory: frontend
+      - name: Stage VST helper binaries (externalBin)
+        # externalBin files are gitignored build artifacts; tauri-build
+        # requires them in the checkout. Dependency bins (vst3-host-*)
+        # need an explicit --bins build to exist in target/debug.
+        shell: bash
+        run: |
+          cargo build --workspace --bins
+          mkdir -p apps/desktop/binaries
+          TRIPLE=$(rustc -vV | sed -n 's/host: //p')
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe";; esac
+          for name in vst3-host-helper vst3-host-probe vst-gui-helper; do
+            if [ -f "target/debug/$name$EXT" ]; then
+              cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
+            fi
+          done
+          ls -la apps/desktop/binaries/ || true
       - name: Bundle desktop application
-        run: npm run tauri:build -- ${{ matrix.args }}
-        working-directory: frontend
+        # Run tauri CLI from apps/desktop (its config dir): tauri-cli
+        # resolves the project relative to its own cwd.
+        run: npx --prefix ../../frontend tauri build --bundles ${{ matrix.args }}
+        working-directory: apps/desktop
       - name: Upload artifacts (Linux/Windows)
         if: matrix.os == 'ubuntu-24.04' || matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
