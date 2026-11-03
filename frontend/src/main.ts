@@ -21,6 +21,7 @@ import { libraryPage } from "./pages/library";
 import { eqPage } from "./pages/eq";
 import { pluginsPage } from "./pages/plugins";
 import { settingsPage } from "./pages/settings";
+import { decksPage } from "./pages/decks";
 import type { PlaybackStatus, QueueDto } from "./types";
 
 registerPage(playerPage);
@@ -29,6 +30,7 @@ registerPage(libraryPage);
 registerPage(eqPage);
 registerPage(pluginsPage);
 registerPage(settingsPage);
+registerPage(decksPage);
 
 const shell = document.querySelector<HTMLDivElement>("#app");
 if (!shell) throw new Error("Application root #app was not found");
@@ -43,6 +45,7 @@ shell.innerHTML = `
       <button class="nav-item" data-route="player" type="button">Player</button>
       <button class="nav-item" data-route="queue" type="button">Queue</button>
       <button class="nav-item" data-route="library" type="button">Library</button>
+      <button class="nav-item" data-route="decks" type="button">Decks</button>
       <button class="nav-item" data-route="eq" type="button">Equalizer</button>
       <button class="nav-item" data-route="plugins" type="button">Plugins</button>
       <button class="nav-item" data-route="settings" type="button">Settings</button>

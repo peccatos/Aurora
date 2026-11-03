@@ -33,6 +33,77 @@ pub struct AppState {
     /// Open plugin editor GUI session (one at a time; the window owns
     /// its own GUI thread with a Win32 message pump).
     pub vst_gui: std::sync::Mutex<Option<aurora_vst::PluginGui>>,
+    /// DJ decks (Pioneer DDJ-1000-style): each deck is a fully
+    /// independent playback stream — own engine, own DSP, own cue
+    /// points. Deck 0 doubles as the main player (queue commands target
+    /// it), deck 1 exists for the /decks page. Crossfader: 0 = full A,
+    /// 1 = full B, equal-power curve applied to per-deck channel gain.
+    pub decks: std::sync::Mutex<[Deck; 2]>,
+    /// Crossfader position 0..1 (0.5 = both decks equally loud).
+    pub crossfader: std::sync::Mutex<f64>,
+}
+
+/// One DJ deck: engine + channel fader + hot cues.
+pub struct Deck {
+    pub engine: PlaybackEngine,
+    /// Channel fader 0..1 (user's own volume, BEFORE crossfader).
+    pub channel_fader: f64,
+    /// The loaded track (path + display), for the deck's UI.
+    pub loaded: Option<QueueTrack>,
+    /// Hot cues: 8 slots, positions in seconds.
+    pub cues: [Option<f64>; 8],
+    /// The deck's own DSP config (EQ/eq-high-low kills, tempo, filter).
+    pub dsp: aurora_dsp::DspConfig,
+}
+
+impl Deck {
+    fn new() -> Self {
+        Self {
+            engine: PlaybackEngine::new(),
+            channel_fader: 1.0,
+            loaded: None,
+            cues: std::array::from_fn(|_| None),
+            dsp: aurora_dsp::DspConfig::default(),
+        }
+    }
+
+    /// Total gain in dB from fader + crossfader (equal-power curve):
+    /// A gets cos, B gets sin — at center both are -3dB, at the ends
+    /// one is full, the other silent.
+    fn gain_db(channel_fader: f64, crossfader: f64, is_deck_b: bool) -> f64 {
+        let fader = channel_fader.clamp(0.0, 1.0);
+        // Fader: dB scale (0 -> -inf.. we clamp at -60dB silence).
+        let fader_db = if fader <= 0.001 {
+            -60.0
+        } else {
+            60.0 * fader.log10() // 1.0 -> 0dB, 0.5 -> -18dB, 0.1 -> -60dB
+        };
+        let x = crossfader.clamp(0.0, 1.0);
+        let cf = if is_deck_b {
+            (x * std::f64::consts::FRAC_PI_2).sin()
+        } else {
+            ((1.0 - x) * std::f64::consts::FRAC_PI_2).cos()
+        };
+        let cf_db = if cf <= 0.001 {
+            -60.0
+        } else {
+            20.0 * cf.log10()
+        };
+        fader_db + cf_db
+    }
+
+    /// Push the computed gain into the deck's live DSP volume (keeping
+    /// the user's other DSP settings).
+    fn apply_volume(&mut self, gain_db: f64) {
+        self.dsp.volume_db = gain_db as f32;
+        self.engine.set_dsp_config(self.dsp.clone());
+        // Native-path streams have no pipeline: a DSP change requests a
+        // restart through the DSP path (honest; the transition is
+        // audible but correct).
+        if self.engine.take_dsp_transition() {
+            let _ = self.engine.restart_for_dsp();
+        }
+    }
 }
 
 /// One queue entry: the path plus what the engine needs from the library
@@ -108,6 +179,8 @@ impl AppState {
             library_path_slot: std::sync::Mutex::new(None),
             device_key: std::sync::Mutex::new(None),
             vst_gui: std::sync::Mutex::new(None),
+            decks: std::sync::Mutex::new([Deck::new(), Deck::new()]),
+            crossfader: std::sync::Mutex::new(0.0),
         }
     }
 }
@@ -1517,6 +1590,301 @@ pub fn stop_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandEr
     Ok(status_of(&engine))
 }
 
+// ---------------------------------------------------------------------------
+// DJ decks (Pioneer DDJ-1000-style, Phase 10)
+// ---------------------------------------------------------------------------
+
+/// Deck status snapshot for the /decks page.
+#[derive(Debug, Serialize)]
+pub struct DeckDto {
+    pub index: usize,
+    /// Deck letter "A"/"B".
+    pub name: String,
+    pub loaded: Option<QueueTrack>,
+    pub state: String,
+    pub position_s: f64,
+    pub duration_s: Option<f64>,
+    /// Channel fader 0..1 (pre-crossfader).
+    pub channel_fader: f64,
+    /// Applied gain (fader + crossfader), dB.
+    pub gain_db: f64,
+    /// Hot cue positions (seconds), 8 slots.
+    pub cues: Vec<Option<f64>>,
+    /// Tempo multiplier (DspConfig.speed).
+    pub speed: f64,
+}
+
+fn deck_dto(index: usize, deck: &Deck, crossfader: f64) -> DeckDto {
+    let state = match deck.engine.state() {
+        aurora_audio::EngineState::Idle => "idle",
+        aurora_audio::EngineState::Playing => "playing",
+        aurora_audio::EngineState::Paused => "paused",
+        aurora_audio::EngineState::Draining => "draining",
+    };
+    DeckDto {
+        index,
+        name: if index == 0 { "A".into() } else { "B".into() },
+        loaded: deck.loaded.clone(),
+        state: state.into(),
+        position_s: deck.engine.position_s(),
+        duration_s: deck.engine.duration_s(),
+        channel_fader: deck.channel_fader,
+        gain_db: Deck::gain_db(deck.channel_fader, crossfader, index == 1),
+        cues: deck.cues.to_vec(),
+        speed: f64::from(deck.dsp.speed),
+    }
+}
+
+/// Load a track onto a deck (does not start it — like pressing LOAD on a
+/// CDJ). The deck's DSP (EQ/tempo/fader gain) applies from the start.
+#[tauri::command]
+pub fn deck_load(
+    deck: usize,
+    path: String,
+    title: Option<String>,
+    artist: Option<String>,
+    state: State<AppState>,
+) -> Result<DeckDto, CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let device_key = state
+        .device_key
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .clone();
+    let device = resolve_device(device_key.as_deref())?;
+    let track = QueueTrack {
+        path,
+        title,
+        artist,
+        replaygain_track_db: None,
+        replaygain_album_db: None,
+    };
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    d.engine.stop();
+    d.cues = std::array::from_fn(|_| None);
+    let rg = track
+        .replaygain_track_db
+        .map(|t| (t, track.replaygain_album_db));
+    d.engine
+        .play_with_replaygain(PathBuf::from(&track.path), &device, d.dsp.clone(), rg)?;
+    // Loading pauses at position 0 (CUE standby): pause immediately so
+    // the DJ starts it on purpose.
+    let _ = d.engine.pause();
+    d.loaded = Some(track);
+    Ok(deck_dto(idx, d, crossfader))
+}
+
+/// Press PLAY/PAUSE on a deck.
+#[tauri::command]
+pub fn deck_play(deck: usize, state: State<AppState>) -> Result<DeckDto, CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    match d.engine.state() {
+        aurora_audio::EngineState::Playing => {
+            d.engine.pause()?;
+        }
+        aurora_audio::EngineState::Paused => {
+            d.engine.resume()?;
+        }
+        _ => {
+            // Idle: re-play the loaded track.
+            if let Some(t) = d.loaded.clone() {
+                let device = resolve_device(
+                    state
+                        .device_key
+                        .lock()
+                        .map_err(|_| CommandError::Poisoned)?
+                        .as_deref(),
+                )?;
+                let rg = t.replaygain_track_db.map(|v| (v, t.replaygain_album_db));
+                d.engine.play_with_replaygain(
+                    PathBuf::from(&t.path),
+                    &device,
+                    d.dsp.clone(),
+                    rg,
+                )?;
+            }
+        }
+    }
+    Ok(deck_dto(idx, d, crossfader))
+}
+
+/// Stop the deck (back to standby).
+#[tauri::command]
+pub fn deck_stop(deck: usize, state: State<AppState>) -> Result<DeckDto, CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    decks[idx].engine.stop();
+    Ok(deck_dto(idx, &decks[idx], crossfader))
+}
+
+/// Seek a deck (jog wheel / needle drop).
+#[tauri::command]
+pub fn deck_seek(deck: usize, position_s: f64, state: State<AppState>) -> Result<(), CommandError> {
+    let idx = deck.min(1);
+    let decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    decks[idx].engine.seek(position_s.max(0.0));
+    Ok(())
+}
+
+/// Set a deck's channel fader (0..1, pre-crossfader). Applies the
+/// combined fader+crossfader gain live.
+#[tauri::command]
+pub fn deck_fader(
+    deck: usize,
+    value: f64,
+    state: State<AppState>,
+) -> Result<DeckDto, CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    d.channel_fader = value.clamp(0.0, 1.0);
+    let gain = Deck::gain_db(d.channel_fader, crossfader, idx == 1);
+    d.apply_volume(gain);
+    Ok(deck_dto(idx, d, crossfader))
+}
+
+/// Move the crossfader (0 = deck A, 1 = deck B). Both decks' gains
+/// update live (equal-power curve).
+#[tauri::command]
+pub fn set_crossfader(value: f64, state: State<AppState>) -> Result<[DeckDto; 2], CommandError> {
+    let x = value.clamp(0.0, 1.0);
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let (fa, fb) = (decks[0].channel_fader, decks[1].channel_fader);
+    let ga = Deck::gain_db(fa, x, false);
+    let gb = Deck::gain_db(fb, x, true);
+    decks[0].apply_volume(ga);
+    decks[1].apply_volume(gb);
+    *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)? = x;
+    Ok([deck_dto(0, &decks[0], x), deck_dto(1, &decks[1], x)])
+}
+
+/// Set a hot cue (slot 0..7) at a position; `position: null` clears it.
+/// Jump: when the deck plays, `deck_jump_cue` seeks there.
+#[tauri::command]
+pub fn deck_set_cue(
+    deck: usize,
+    slot: usize,
+    position: Option<f64>,
+    state: State<AppState>,
+) -> Result<Vec<Option<f64>>, CommandError> {
+    let idx = deck.min(1);
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    if slot < 8 {
+        d.cues[slot] = position;
+    }
+    Ok(d.cues.to_vec())
+}
+
+/// Jump to a hot cue: seek there and play (the CDJ behavior).
+#[tauri::command]
+pub fn deck_jump_cue(deck: usize, slot: usize, state: State<AppState>) -> Result<(), CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let device_key = state
+        .device_key
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?
+        .clone();
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    let Some(&Some(pos)) = d.cues.get(slot) else {
+        return Ok(());
+    };
+    // Idle deck: start the track first, then seek.
+    if d.engine.state() == aurora_audio::EngineState::Idle
+        && let Some(t) = d.loaded.clone()
+    {
+        let device = resolve_device(device_key.as_deref())?;
+        let rg = t.replaygain_track_db.map(|v| (v, t.replaygain_album_db));
+        d.engine
+            .play_with_replaygain(PathBuf::from(&t.path), &device, d.dsp.clone(), rg)?;
+        let _ = d.engine.pause();
+    }
+    d.engine.seek(pos);
+    let _ = d.engine.resume();
+    let _ = crossfader;
+    Ok(())
+}
+
+/// Set the deck's tempo (pitch) multiplier, e.g. 1.0 = normal, 1.08 =
+/// +8%. Live DSP change, no restart.
+#[tauri::command]
+pub fn deck_tempo(
+    deck: usize,
+    speed: f64,
+    state: State<AppState>,
+) -> Result<DeckDto, CommandError> {
+    let idx = deck.min(1);
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    let d = &mut decks[idx];
+    d.dsp.speed = speed.clamp(0.5, 2.0) as f32;
+    d.engine.set_dsp_config(d.dsp.clone());
+    Ok(deck_dto(idx, d, crossfader))
+}
+
+/// Full deck status snapshot (poll from the UI).
+#[tauri::command]
+pub fn deck_status(state: State<AppState>) -> Result<[DeckDto; 2], CommandError> {
+    let crossfader = *state
+        .crossfader
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
+    Ok([
+        deck_dto(0, &decks[0], crossfader),
+        deck_dto(1, &decks[1], crossfader),
+    ])
+}
+
+/// Common device resolution for decks.
+fn resolve_device(key: Option<&str>) -> Result<aurora_audio::OutputDevice, CommandError> {
+    match key {
+        None | Some("") => {
+            aurora_audio::default_output_device().map_err(|e| CommandError::Engine {
+                message: e.to_string(),
+            })
+        }
+        Some(k) => aurora_audio::output_devices()
+            .map_err(|e| CommandError::Engine {
+                message: e.to_string(),
+            })?
+            .into_iter()
+            .find(|d| d.key() == k)
+            .ok_or_else(|| CommandError::Device(k.to_string()))
+            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e)),
+    }
+}
+
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1639,6 +2007,16 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             vst_bypassed_slots,
             save_vst_chain_setting,
             load_vst_chain_setting,
+            deck_load,
+            deck_play,
+            deck_stop,
+            deck_seek,
+            deck_fader,
+            set_crossfader,
+            deck_set_cue,
+            deck_jump_cue,
+            deck_tempo,
+            deck_status,
             get_track_artwork,
             pause_playback,
             resume_playback,
