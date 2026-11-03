@@ -31,3 +31,19 @@ audit-cache/
 рефы/
 _refconv/
 _refpng/
+
+# Tauri generated schemas (regenerated on every build; ACL/capability
+# snapshots are not source)
+apps/desktop/gen/schemas/
+
+# Tauri bundler output
+apps/desktop/target/
+apps/desktop/dist/
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+
+# OS junk
+Thumbs.db
+Desktop.ini
