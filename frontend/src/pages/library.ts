@@ -1,7 +1,7 @@
 /** Library page: search, track list, playlists column, actions. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { Page } from "../router";
 import { app, refreshLibraryStatus, setQueue, setToast, trackToQueueTrack } from "../state";
 import type { PlaylistDto, ScanSummary, TrackDto } from "../types";
@@ -64,7 +64,13 @@ function render(root: HTMLElement) {
         <aside class="playlists-col">
           <div class="col-head">
             <span>Playlists</span>
-            <button id="pl-new" class="icon-btn" type="button" title="New playlist">+</button>
+            <span class="col-head-actions">
+              <button id="pl-import" class="icon-btn" type="button"
+                title="Import playlist (M3U, PLS, Spotify JSON, CSV)">↓</button>
+              <button id="pl-export" class="icon-btn" type="button"
+                title="Export active playlist as M3U8" disabled>↑</button>
+              <button id="pl-new" class="icon-btn" type="button" title="New playlist">+</button>
+            </span>
           </div>
           <ul id="playlist-list" class="playlist-list"></ul>
         </aside>
@@ -209,6 +215,69 @@ function render(root: HTMLElement) {
     }
   });
 
+  // Import: M3U/M3U8/PLS (paths) or Spotify JSON / CSV (title+artist
+  // matched against the local library). Honest report: matched and
+  // unmatched counts, never silent fabrication.
+  root.querySelector<HTMLButtonElement>("#pl-import")?.addEventListener("click", async () => {
+    if (!app.library.open) {
+      setToast("Open a library first");
+      return;
+    }
+    const picked = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "Playlists",
+          extensions: ["m3u", "m3u8", "pls", "json", "csv", "txt"],
+        },
+      ],
+    });
+    const path = typeof picked === "string" ? picked : null;
+    if (!path) return;
+    setToast("Importing…");
+    try {
+      const report = await invoke<{
+        playlist_id: string;
+        playlist_name: string;
+        matched: number;
+        unmatched: number;
+        resolved_by_scan: boolean;
+        unmatched_names: string[];
+      }>("import_playlist", { path });
+      const scanNote = report.resolved_by_scan ? " (new files scanned in)" : "";
+      setToast(
+        `Imported "${report.playlist_name}": ${report.matched} matched${scanNote}, ` +
+          (report.unmatched > 0
+            ? `${report.unmatched} not found — ${report.unmatched_names.slice(0, 3).join("; ")}…`
+            : "all found"),
+      );
+      activePlaylist = report.playlist_id;
+      await loadPlaylists();
+      await loadTracks();
+      update(root);
+    } catch (e) {
+      setToast(`Import failed: ${String(e)}`);
+    }
+  });
+
+  // Export the active playlist as M3U8 (universal format).
+  root.querySelector<HTMLButtonElement>("#pl-export")?.addEventListener("click", async () => {
+    if (!activePlaylist) return;
+    const pl = playlists.find((p) => p.id === activePlaylist);
+    if (!pl) return;
+    const dest = await save({
+      defaultPath: `${pl.name.replace(/[\\/:*?"<>|]/g, "_")}.m3u8`,
+      filters: [{ name: "M3U8 playlist", extensions: ["m3u8"] }],
+    });
+    if (!dest) return;
+    try {
+      await invoke("export_playlist", { playlistId: pl.id, dest });
+      setToast(`Exported "${pl.name}" (${pl.track_count} tracks)`);
+    } catch (e) {
+      setToast(`Export failed: ${String(e)}`);
+    }
+  });
+
   // Boot load.
   void (async () => {
     await refreshLibraryStatus();
@@ -246,6 +315,8 @@ function update(root: HTMLElement) {
   if (playBtn) playBtn.disabled = !has;
   if (queueBtn) queueBtn.disabled = !has;
   if (plBtn) plBtn.disabled = !has || !activePlaylist;
+  const exportBtn = root.querySelector<HTMLButtonElement>("#pl-export");
+  if (exportBtn) exportBtn.disabled = !activePlaylist;
   if (count) count.textContent = app.library.open ? `${app.library.tracks.length} tracks` : "";
   if (note)
     note.textContent = app.library.open

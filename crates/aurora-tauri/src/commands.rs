@@ -1,186 +1,31 @@
-//! Tauri command surface: thin wrappers over the application services.
+//! Tauri command surface: thin wrappers over the kernel (ADR 0005).
 //!
-//! The engine lives in managed state; commands only translate between the
-//! frontend's JSON payloads and backend calls. No business logic here.
+//! One command = one kernel call + DTO translation. No business logic
+//! lives here: the music player IS `aurora-kernel`.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use aurora_audio::{EngineState, PlaybackEngine};
-use aurora_core::PlaybackMode;
-use serde::{Deserialize, Serialize};
+use aurora_kernel::{
+    BitPerfectVerdict, DeckDto, ExclusivePlayResult, ExclusiveProbe, ImportReport, KernelError,
+    LibraryStatus, PlayRequest, PlaybackStatus, PlayerKernel, QueueDto, QueueTrack, TrackDto,
+    VstParamDto, VstPluginDto, VstPresetDto, VstSlotDto,
+};
+use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_global_shortcut::ShortcutState;
 
 use crate::error::CommandError;
 
-/// Managed application state.
+/// Managed application state: the kernel + the shell-side pieces that
+/// are Tauri-specific (nothing but the GUI session, which is native).
 pub struct AppState {
-    pub engine: Mutex<PlaybackEngine>,
-    /// Persisted DSP configuration: the UI edits this and every new
-    /// playback picks it up.
-    pub dsp: std::sync::Mutex<aurora_dsp::DspConfig>,
-    /// Playback queue with the current index.
-    pub queue: std::sync::Mutex<TrackQueue>,
-    /// Track library (SQLite + scanner). Async by nature: scanning and
-    /// queries run on the tokio runtime, never blocking the UI thread.
-    /// None until `open_library` runs.
-    pub library: tokio::sync::Mutex<Option<aurora_library::LibraryService>>,
-    /// Library database path (None = library not opened yet).
-    pub library_path_slot: std::sync::Mutex<Option<PathBuf>>,
-    /// Selected output device key ("" = default). Persisted to settings.
-    pub device_key: std::sync::Mutex<Option<String>>,
-    /// Open plugin editor GUI session (one at a time; the window owns
-    /// its own GUI thread with a Win32 message pump).
-    pub vst_gui: std::sync::Mutex<Option<aurora_vst::PluginGui>>,
-    /// DJ decks (Pioneer DDJ-1000-style): each deck is a fully
-    /// independent playback stream — own engine, own DSP, own cue
-    /// points. Deck 0 doubles as the main player (queue commands target
-    /// it), deck 1 exists for the /decks page. Crossfader: 0 = full A,
-    /// 1 = full B, equal-power curve applied to per-deck channel gain.
-    pub decks: std::sync::Mutex<[Deck; 2]>,
-    /// Crossfader position 0..1 (0.5 = both decks equally loud).
-    pub crossfader: std::sync::Mutex<f64>,
-}
-
-/// One DJ deck: engine + channel fader + hot cues.
-pub struct Deck {
-    pub engine: PlaybackEngine,
-    /// Channel fader 0..1 (user's own volume, BEFORE crossfader).
-    pub channel_fader: f64,
-    /// The loaded track (path + display), for the deck's UI.
-    pub loaded: Option<QueueTrack>,
-    /// Hot cues: 8 slots, positions in seconds.
-    pub cues: [Option<f64>; 8],
-    /// The deck's own DSP config (EQ/eq-high-low kills, tempo, filter).
-    pub dsp: aurora_dsp::DspConfig,
-}
-
-impl Deck {
-    fn new() -> Self {
-        Self {
-            engine: PlaybackEngine::new(),
-            channel_fader: 1.0,
-            loaded: None,
-            cues: std::array::from_fn(|_| None),
-            dsp: aurora_dsp::DspConfig::default(),
-        }
-    }
-
-    /// Total gain in dB from fader + crossfader (equal-power curve):
-    /// A gets cos, B gets sin — at center both are -3dB, at the ends
-    /// one is full, the other silent.
-    fn gain_db(channel_fader: f64, crossfader: f64, is_deck_b: bool) -> f64 {
-        let fader = channel_fader.clamp(0.0, 1.0);
-        // Fader: dB scale (0 -> -inf.. we clamp at -60dB silence).
-        let fader_db = if fader <= 0.001 {
-            -60.0
-        } else {
-            60.0 * fader.log10() // 1.0 -> 0dB, 0.5 -> -18dB, 0.1 -> -60dB
-        };
-        let x = crossfader.clamp(0.0, 1.0);
-        let cf = if is_deck_b {
-            (x * std::f64::consts::FRAC_PI_2).sin()
-        } else {
-            ((1.0 - x) * std::f64::consts::FRAC_PI_2).cos()
-        };
-        let cf_db = if cf <= 0.001 {
-            -60.0
-        } else {
-            20.0 * cf.log10()
-        };
-        fader_db + cf_db
-    }
-
-    /// Push the computed gain into the deck's live DSP volume (keeping
-    /// the user's other DSP settings).
-    fn apply_volume(&mut self, gain_db: f64) {
-        self.dsp.volume_db = gain_db as f32;
-        self.engine.set_dsp_config(self.dsp.clone());
-        // Native-path streams have no pipeline: a DSP change requests a
-        // restart through the DSP path (honest; the transition is
-        // audible but correct).
-        if self.engine.take_dsp_transition() {
-            let _ = self.engine.restart_for_dsp();
-        }
-    }
-}
-
-/// One queue entry: the path plus what the engine needs from the library
-/// (ReplayGain tags) and what the UI shows (display name).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QueueTrack {
-    pub path: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub artist: Option<String>,
-    #[serde(default)]
-    pub replaygain_track_db: Option<f64>,
-    #[serde(default)]
-    pub replaygain_album_db: Option<f64>,
-}
-
-impl QueueTrack {
-    /// Display label: "Artist — Title" with file-stem fallback.
-    pub fn display_line(&self) -> String {
-        let title = self
-            .title
-            .as_deref()
-            .unwrap_or_else(|| file_stem(&self.path));
-        match &self.artist {
-            Some(a) if !a.is_empty() => format!("{a} — {title}"),
-            _ => title.to_string(),
-        }
-    }
-}
-
-/// File stem of a path (both separators, no extension).
-fn file_stem(path: &str) -> &str {
-    let start = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    let end = path.rfind('.').filter(|&i| i > start).unwrap_or(path.len());
-    &path[start..end]
-}
-
-/// The user's playback queue.
-#[derive(Default)]
-pub struct TrackQueue {
-    pub tracks: Vec<QueueTrack>,
-    pub current: Option<usize>,
-}
-
-impl TrackQueue {
-    fn next(&mut self) -> Option<QueueTrack> {
-        let idx = self.current? + 1;
-        if idx >= self.tracks.len() {
-            return None;
-        }
-        self.current = Some(idx);
-        self.tracks.get(idx).cloned()
-    }
-
-    fn prev(&mut self) -> Option<QueueTrack> {
-        let idx = self.current?;
-        if idx == 0 {
-            return self.tracks.first().cloned();
-        }
-        self.current = Some(idx - 1);
-        self.tracks.get(idx - 1).cloned()
-    }
+    pub kernel: Arc<PlayerKernel>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            engine: Mutex::new(PlaybackEngine::new()),
-            dsp: std::sync::Mutex::new(aurora_dsp::DspConfig::default()),
-            queue: std::sync::Mutex::new(TrackQueue::default()),
-            library: tokio::sync::Mutex::new(None),
-            library_path_slot: std::sync::Mutex::new(None),
-            device_key: std::sync::Mutex::new(None),
-            vst_gui: std::sync::Mutex::new(None),
-            decks: std::sync::Mutex::new([Deck::new(), Deck::new()]),
-            crossfader: std::sync::Mutex::new(0.0),
+            kernel: Arc::new(PlayerKernel::new()),
         }
     }
 }
@@ -191,380 +36,121 @@ impl Default for AppState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Library commands (Phase 6)
-// ---------------------------------------------------------------------------
-
-/// Track as the frontend sees it: display fields + what playback needs.
-#[derive(Debug, Clone, Serialize)]
-pub struct TrackDto {
-    pub id: String,
-    pub path: String,
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
-    pub genre: Option<String>,
-    pub year: Option<i32>,
-    pub track_number: Option<u32>,
-    pub format: String,
-    pub duration_ms: Option<u64>,
-    pub replaygain_track_db: Option<f64>,
-    pub replaygain_album_db: Option<f64>,
-    /// "Artist - Title" (file stem when untagged): the correct name.
-    pub display: String,
-    /// Duration formatted "m:ss" for list rows.
-    pub duration_display: String,
-}
-
-impl TrackDto {
-    fn from_track(t: &aurora_core::Track) -> Self {
-        let duration_display = t
-            .duration_ms
-            .map(|ms| {
-                let sec = ms / 1000;
-                format!("{}:{:02}", sec / 60, sec % 60)
-            })
-            .unwrap_or_default();
-        Self {
-            id: t.id.0.to_string(),
-            path: t.path.clone(),
-            title: t.title.clone(),
-            artist: t.artist.as_ref().map(|a| a.name.clone()),
-            album: t.album.as_ref().map(|a| a.title.clone()),
-            genre: t.genre.clone(),
-            year: t.year,
-            track_number: t.track_number,
-            format: format!("{:?}", t.format).to_lowercase(),
-            duration_ms: t.duration_ms,
-            replaygain_track_db: t.replaygain_track_db,
-            replaygain_album_db: t.replaygain_album_db,
-            display: t.display_line(),
-            duration_display,
-        }
+fn map_err(e: KernelError) -> CommandError {
+    match e {
+        KernelError::Poisoned => CommandError::Poisoned,
+        KernelError::Engine { message } => CommandError::Engine { message },
+        KernelError::Device(key) => CommandError::Device(key),
+        KernelError::Library { message } => CommandError::Library { message },
+        KernelError::LibraryNotOpen => CommandError::LibraryNotOpen,
+        KernelError::Metadata { message } => CommandError::Metadata { message },
     }
 }
+
+type K<'a> = State<'a, AppState>;
+
+// ---------------------------------------------------------------------------
+// Version / playback basics
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[tauri::command]
+pub fn app_name() -> &'static str {
+    "Aurora"
+}
+
+#[tauri::command]
+pub fn playback_modes() -> Vec<aurora_core::PlaybackMode> {
+    vec![
+        aurora_core::PlaybackMode::BitPerfect,
+        aurora_core::PlaybackMode::Dsp,
+        aurora_core::PlaybackMode::Auto,
+    ]
+}
+
+#[tauri::command]
+pub fn playback_status(state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.playback_status().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn playback_position(state: K<'_>) -> Result<f64, CommandError> {
+    state.kernel.playback_position().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn pause_playback(state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.pause_playback().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn resume_playback(state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.resume_playback().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn stop_playback(state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.stop_playback().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn seek(position_s: f64, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.seek(position_s).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn play_track(request: PlayRequest, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.play_track(request).map_err(map_err)
+}
+
+// ---------------------------------------------------------------------------
+// Output devices
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-pub struct LibraryStatus {
-    pub open: bool,
-    pub path: Option<String>,
-    pub track_count: u64,
-}
-
-#[tauri::command]
-pub async fn library_status(state: State<'_, AppState>) -> Result<LibraryStatus, CommandError> {
-    let count = {
-        let slot = state.library.lock().await;
-        match slot.as_ref() {
-            Some(lib) => aurora_storage::track_count(lib.pool())
-                .await
-                .map_err(CommandError::from)?,
-            None => 0,
-        }
-    };
-    let path = state
-        .library_path_slot
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .as_ref()
-        .map(|p| p.display().to_string());
-    Ok(LibraryStatus {
-        open: path.is_some(),
-        path,
-        track_count: count,
-    })
-}
-
-/// Open (or create) the library database at `path` (a .db file).
-#[tauri::command]
-pub async fn open_library(
-    path: String,
-    state: State<'_, AppState>,
-) -> Result<LibraryStatus, CommandError> {
-    let service = aurora_library::LibraryService::open(std::path::Path::new(&path))
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })?;
-    let count = aurora_storage::track_count(service.pool())
-        .await
-        .map_err(CommandError::from)?;
-    let mut slot = state.library.lock().await;
-    *slot = Some(service);
-    *state
-        .library_path_slot
-        .lock()
-        .map_err(|_| CommandError::Poisoned)? = Some(PathBuf::from(&path));
-    Ok(LibraryStatus {
-        open: true,
-        path: Some(path),
-        track_count: count,
-    })
-}
-
-/// Scan a folder into the library. Returns the honest scan summary.
-#[tauri::command]
-pub async fn scan_folder(
-    root: String,
-    state: State<'_, AppState>,
-) -> Result<aurora_library::ScanSummary, CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let summary = service
-        .scan_folder(std::path::Path::new(&root))
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })?;
-    // Remember the root so future "refresh" rescans can replay it
-    // (Phase 7: device-independent library roots).
-    aurora_storage::add_library_root(service.pool(), &root)
-        .await
-        .map_err(CommandError::from)?;
-    drop(library);
-    Ok(summary)
-}
-
-/// Rescan every known library root (the "refresh library" button).
-#[tauri::command]
-pub async fn rescan_all(
-    state: State<'_, AppState>,
-) -> Result<aurora_library::ScanSummary, CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let roots = aurora_storage::library_roots(service.pool())
-        .await
-        .map_err(CommandError::from)?;
-    let mut total = aurora_library::ScanSummary::default();
-    for root in roots {
-        let summary = service
-            .scan_folder(std::path::Path::new(&root))
-            .await
-            .map_err(|e| CommandError::Library {
-                message: e.to_string(),
-            })?;
-        total.discovered += summary.discovered;
-        total.added += summary.added;
-        total.updated += summary.updated;
-        total.pruned += summary.pruned;
-        total.failed += summary.failed;
-    }
-    drop(library);
-    Ok(total)
-}
-
-/// Get a persisted setting (e.g. "output_device").
-#[tauri::command]
-pub async fn get_setting_cmd(
-    key: String,
-    state: State<'_, AppState>,
-) -> Result<Option<String>, CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let value = aurora_storage::get_setting(service.pool(), &key)
-        .await
-        .map_err(CommandError::from)?;
-    drop(library);
-    Ok(value)
-}
-
-/// Persist a setting (device selection, UI prefs).
-#[tauri::command]
-pub async fn set_setting_cmd(
-    key: String,
-    value: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<(), CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    match value {
-        Some(v) => {
-            aurora_storage::set_setting(service.pool(), &key, &v)
-                .await
-                .map_err(CommandError::from)?;
-        }
-        None => {
-            // Erase by writing an empty sentinel-free delete.
-            aurora_storage::delete_setting(service.pool(), &key)
-                .await
-                .map_err(CommandError::from)?;
-        }
-    }
-    drop(library);
-    Ok(())
-}
-
-/// All library tracks (ordered artist/album/track).
-#[tauri::command]
-pub async fn list_tracks(state: State<'_, AppState>) -> Result<Vec<TrackDto>, CommandError> {
-    let library = state.library.lock().await;
-    let tracks = library
-        .as_ref()
-        .ok_or(CommandError::LibraryNotOpen)?
-        .tracks()
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })?;
-    drop(library);
-    Ok(tracks.iter().map(TrackDto::from_track).collect())
-}
-
-/// Case-insensitive search over title/artist/album/file name.
-#[tauri::command]
-pub async fn search_library(
-    query: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<TrackDto>, CommandError> {
-    let library = state.library.lock().await;
-    let tracks = library
-        .as_ref()
-        .ok_or(CommandError::LibraryNotOpen)?
-        .search(&query)
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })?;
-    drop(library);
-    Ok(tracks.iter().map(TrackDto::from_track).collect())
-}
-
-#[derive(Debug, Serialize)]
-pub struct PlaylistDto {
-    pub id: String,
+pub struct DeviceDto {
+    pub key: String,
     pub name: String,
-    pub track_count: u64,
 }
 
 #[tauri::command]
-pub async fn list_playlists(state: State<'_, AppState>) -> Result<Vec<PlaylistDto>, CommandError> {
-    let library = state.library.lock().await;
-    let playlists = {
-        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-        aurora_storage::all_playlists(lib.pool())
-            .await
-            .map_err(|e| CommandError::Library {
-                message: e.to_string(),
-            })?
-    };
-    Ok(playlists
+pub fn list_output_devices(state: K<'_>) -> Result<Vec<DeviceDto>, CommandError> {
+    let engine = state
+        .kernel
+        .engine
+        .lock()
+        .map_err(|_| CommandError::Poisoned)?;
+    let devices = engine.devices().map_err(|e| CommandError::Engine {
+        message: e.to_string(),
+    })?;
+    Ok(devices
         .into_iter()
-        .map(|p| PlaylistDto {
-            id: p.id,
-            name: p.name,
-            track_count: p.track_count,
+        .map(|d| DeviceDto {
+            key: d.key().to_string(),
+            name: d.name().to_string(),
         })
         .collect())
 }
 
 #[tauri::command]
-pub async fn create_playlist(
-    name: String,
-    state: State<'_, AppState>,
-) -> Result<PlaylistDto, CommandError> {
-    let library = state.library.lock().await;
-    let id = {
-        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-        aurora_storage::create_playlist(lib.pool(), &name)
-            .await
-            .map_err(|e| CommandError::Library {
-                message: e.to_string(),
-            })?
-    };
-    Ok(PlaylistDto {
-        id,
-        name,
-        track_count: 0,
-    })
-}
-
-#[tauri::command]
-pub async fn rename_playlist(
-    playlist_id: String,
-    new_name: String,
-    state: State<'_, AppState>,
-) -> Result<(), CommandError> {
-    let library = state.library.lock().await;
-    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    aurora_storage::rename_playlist(lib.pool(), &playlist_id, &new_name)
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })
-}
-
-#[tauri::command]
-pub async fn delete_playlist(
-    playlist_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), CommandError> {
-    let library = state.library.lock().await;
-    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    aurora_storage::delete_playlist(lib.pool(), &playlist_id)
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })
-}
-
-/// Set playlist contents (track ids, order preserved).
-#[tauri::command]
-pub async fn set_playlist_tracks(
-    playlist_id: String,
-    track_ids: Vec<String>,
-    state: State<'_, AppState>,
-) -> Result<(), CommandError> {
-    let library = state.library.lock().await;
-    let ids: Vec<aurora_core::TrackId> = track_ids
-        .iter()
-        .filter_map(|s| uuid::Uuid::parse_str(s).ok())
-        .map(aurora_core::TrackId)
-        .collect();
-    let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    aurora_storage::set_playlist_tracks(lib.pool(), &playlist_id, &ids)
-        .await
-        .map_err(|e| CommandError::Library {
-            message: e.to_string(),
-        })
-}
-
-/// Playlist tracks as full DTOs, in saved order.
-#[tauri::command]
-pub async fn playlist_tracks(
-    playlist_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<TrackDto>, CommandError> {
-    let library = state.library.lock().await;
-    let tracks = {
-        let lib = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-        aurora_storage::playlist_tracks(lib.pool(), &playlist_id)
-            .await
-            .map_err(|e| CommandError::Library {
-                message: e.to_string(),
-            })?
-    };
-    Ok(tracks.iter().map(TrackDto::from_track).collect())
-}
-
-/// Select the output device for all playback (persisted across runs).
-///
-/// Empty key = system default. Applied to the next track; the current
-/// stream keeps its device until it ends (switching a live CPAL stream
-/// mid-flight is a device-loss recovery path, not a hot-swap).
-#[tauri::command]
 pub async fn select_output_device(
     device_key: Option<String>,
-    state: State<'_, AppState>,
+    state: K<'_>,
 ) -> Result<(), CommandError> {
     {
         let mut slot = state
+            .kernel
             .device_key
             .lock()
             .map_err(|_| CommandError::Poisoned)?;
         *slot = device_key.clone().filter(|k| !k.is_empty());
     }
     // Persist into settings when the library is open (best effort).
-    let library = state.library.lock().await;
+    let library = state.kernel.library.lock().await;
     if let Some(service) = library.as_ref() {
         let value = device_key.clone().filter(|k| !k.is_empty());
         let result = match value {
@@ -579,560 +165,257 @@ pub async fn select_output_device(
     Ok(())
 }
 
-/// The persisted output device key, for restoring the selector on start.
 #[tauri::command]
-pub async fn get_output_device_setting(
-    state: State<'_, AppState>,
-) -> Result<Option<String>, CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let value = aurora_storage::get_setting(service.pool(), "output_device")
+pub async fn get_output_device_setting(state: K<'_>) -> Result<Option<String>, CommandError> {
+    let value = state
+        .kernel
+        .get_setting("output_device")
         .await
-        .map_err(CommandError::from)?;
-    drop(library);
+        .map_err(map_err)?;
     Ok(value.filter(|k| !k.is_empty()))
 }
 
-/// Append tracks to the end of the queue (library "add to queue").
+// ---------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------
+
 #[tauri::command]
-pub fn queue_add_tracks(
-    tracks: Vec<QueueTrack>,
-    state: State<AppState>,
-) -> Result<QueueDto, CommandError> {
-    let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    queue.tracks.extend(tracks);
-    if queue.current.is_none() && !queue.tracks.is_empty() {
-        queue.current = Some(0);
-    }
-    Ok(queue_dto(&queue))
+pub async fn library_status(state: K<'_>) -> Result<LibraryStatus, CommandError> {
+    state.kernel.library_status().await.map_err(map_err)
 }
 
 #[tauri::command]
-pub fn app_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+pub async fn open_library(path: String, state: K<'_>) -> Result<LibraryStatus, CommandError> {
+    state.kernel.open_library(&path).await.map_err(map_err)
 }
 
 #[tauri::command]
-pub fn app_name() -> &'static str {
-    "Aurora"
+pub async fn scan_folder(
+    root: String,
+    state: K<'_>,
+) -> Result<aurora_library::ScanSummary, CommandError> {
+    state.kernel.scan_folder(&root).await.map_err(map_err)
 }
 
 #[tauri::command]
-pub fn playback_modes() -> Vec<PlaybackMode> {
-    vec![
-        PlaybackMode::BitPerfect,
-        PlaybackMode::Dsp,
-        PlaybackMode::Auto,
-    ]
+pub async fn rescan_all(state: K<'_>) -> Result<aurora_library::ScanSummary, CommandError> {
+    state.kernel.rescan_all().await.map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn get_setting_cmd(key: String, state: K<'_>) -> Result<Option<String>, CommandError> {
+    state.kernel.get_setting(&key).await.map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn set_setting_cmd(
+    key: String,
+    value: Option<String>,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .set_setting(&key, value.as_deref())
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn list_tracks(state: K<'_>) -> Result<Vec<TrackDto>, CommandError> {
+    state.kernel.list_tracks().await.map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn search_library(query: String, state: K<'_>) -> Result<Vec<TrackDto>, CommandError> {
+    state.kernel.search_library(&query).await.map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
-// Device + playback commands
+// Playlists
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-pub struct DeviceDto {
-    pub key: String,
+pub struct PlaylistDto {
+    pub id: String,
     pub name: String,
+    pub track_count: u64,
 }
 
 #[tauri::command]
-pub fn list_output_devices(state: State<AppState>) -> Result<Vec<DeviceDto>, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let devices = engine.devices()?;
-    Ok(devices
+pub async fn list_playlists(state: K<'_>) -> Result<Vec<PlaylistDto>, CommandError> {
+    let playlists = state.kernel.list_playlists().await.map_err(map_err)?;
+    Ok(playlists
         .into_iter()
-        .map(|d| DeviceDto {
-            key: d.key().to_string(),
-            name: d.name().to_string(),
+        .map(|p| PlaylistDto {
+            id: p.id,
+            name: p.name,
+            track_count: p.track_count,
         })
         .collect())
 }
 
-#[derive(Debug, Serialize)]
-pub struct PlaybackStatus {
-    pub state: EngineState,
-    /// Phase 8: set when the stream errored (device loss) or the decode
-    /// worker panicked since the last status poll. The UI shows a
-    /// recovery note; faults are one-shot (cleared on read).
-    pub fault: Option<String>,
-    /// Negotiated output sample rate, when playing.
-    pub sample_rate: Option<u32>,
-    pub channels: Option<u16>,
-    pub bits_per_sample: Option<u16>,
-    /// Active transformations, reported per ADR 0002.
-    pub transformations: Vec<aurora_core::AudioTransformation>,
-    /// ADR 0002 output path integrity classification.
-    pub integrity: aurora_core::OutputIntegrity,
-    /// Total track duration in seconds, when the container declares it.
-    pub duration_s: Option<f64>,
-    pub frames_played: u64,
-    pub underruns: u64,
+#[tauri::command]
+pub async fn create_playlist(name: String, state: K<'_>) -> Result<PlaylistDto, CommandError> {
+    let id = state.kernel.create_playlist(&name).await.map_err(map_err)?;
+    Ok(PlaylistDto {
+        id,
+        name,
+        track_count: 0,
+    })
 }
 
-fn status_of(engine: &PlaybackEngine) -> PlaybackStatus {
-    let format = engine.output_format();
-    // One-shot fault flags: reading consumes them, so each fault is
-    // reported to the UI exactly once (not on every 500ms poll).
-    let fault = if engine.take_stream_error() {
-        Some("output stream error (device lost?)".to_string())
-    } else if engine.take_worker_panicked() {
-        Some("decode worker crashed; playback stopped".to_string())
-    } else {
-        None
-    };
-    PlaybackStatus {
-        state: engine.state(),
-        fault,
-        sample_rate: format.map(|f| f.sample_rate),
-        channels: format.map(|f| f.channels),
-        bits_per_sample: format.map(|f| f.bits_per_sample),
-        transformations: engine.transformations().to_vec(),
-        integrity: engine.integrity(),
-        duration_s: engine.duration_s(),
-        frames_played: engine.metrics().frames_played(),
-        underruns: engine.metrics().underruns(),
+#[tauri::command]
+pub async fn rename_playlist(
+    playlist_id: String,
+    new_name: String,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .rename_playlist(&playlist_id, &new_name)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn delete_playlist(playlist_id: String, state: K<'_>) -> Result<(), CommandError> {
+    state
+        .kernel
+        .delete_playlist(&playlist_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn set_playlist_tracks(
+    playlist_id: String,
+    track_ids: Vec<String>,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .set_playlist_tracks(&playlist_id, &track_ids)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn playlist_tracks(
+    playlist_id: String,
+    state: K<'_>,
+) -> Result<Vec<TrackDto>, CommandError> {
+    state
+        .kernel
+        .playlist_tracks(&playlist_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn import_playlist(path: String, state: K<'_>) -> Result<ImportReport, CommandError> {
+    state.kernel.import_playlist(&path).await.map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn export_playlist(
+    playlist_id: String,
+    dest: String,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .export_playlist(&playlist_id, &dest)
+        .await
+        .map_err(map_err)
+}
+
+// ---------------------------------------------------------------------------
+// Queue / DSP / exclusive / recovery
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn set_queue(tracks: Vec<QueueTrack>, state: K<'_>) -> Result<QueueDto, CommandError> {
+    state.kernel.set_queue(tracks).map_err(map_err)
+}
+
+/// Append tracks to the queue (keeps the current index; a fresh queue
+/// starts at 0).
+#[tauri::command]
+pub fn queue_add_tracks(tracks: Vec<QueueTrack>, state: K<'_>) -> Result<QueueDto, CommandError> {
+    let kernel = &state.kernel;
+    let mut queue = kernel.queue.lock().map_err(|_| CommandError::Poisoned)?;
+    queue.tracks.extend(tracks);
+    if queue.current.is_none() && !queue.tracks.is_empty() {
+        queue.current = Some(0);
     }
+    let dto = kernel.queue_dto(&queue);
+    Ok(dto)
 }
 
 #[tauri::command]
-pub fn playback_status(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(status_of(&engine))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PlayRequest {
-    pub path: String,
-    /// Device key from `list_output_devices`; empty = default device.
-    pub device: Option<String>,
-    /// DSP configuration for this stream; defaults to bypassed.
-    #[serde(default)]
-    pub dsp: aurora_dsp::DspConfig,
-    /// ReplayGain tags for this track (from the library), when known.
-    #[serde(default)]
-    pub replaygain_track_db: Option<f64>,
-    #[serde(default)]
-    pub replaygain_album_db: Option<f64>,
+pub fn get_queue(state: K<'_>) -> Result<QueueDto, CommandError> {
+    state.kernel.get_queue().map_err(map_err)
 }
 
 #[tauri::command]
-pub fn play_track(
-    request: PlayRequest,
-    state: State<AppState>,
-) -> Result<PlaybackStatus, CommandError> {
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let selected = state
-        .device_key
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .clone();
-    let requested = request
-        .device
-        .clone()
-        .filter(|d| !d.is_empty())
-        .or(selected);
-    let device = match requested.as_deref() {
-        None => aurora_audio::default_output_device()?,
-        Some(key) => aurora_audio::output_devices()?
-            .into_iter()
-            .find(|d| d.key() == key)
-            .ok_or_else(|| {
-                tracing::warn!(key, "requested device missing, using default");
-                CommandError::Device(key.to_string())
-            })
-            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e))?,
-    };
-    // The request's DSP overrides the persisted config when present;
-    // otherwise the UI's last saved settings apply.
-    let dsp = if request.dsp == aurora_dsp::DspConfig::default() {
-        state
-            .dsp
-            .lock()
-            .map_err(|_| CommandError::Poisoned)?
-            .clone()
-    } else {
-        request.dsp
-    };
-    let rg = request
-        .replaygain_track_db
-        .map(|t| (t, request.replaygain_album_db));
-    engine.play_with_replaygain(PathBuf::from(&request.path), &device, dsp, rg)?;
-    Ok(status_of(&engine))
+pub fn play_queue_index(index: usize, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.play_queue_index(index).map_err(map_err)
 }
 
 #[tauri::command]
-pub fn get_dsp(state: State<AppState>) -> Result<aurora_dsp::DspConfig, CommandError> {
-    let dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(dsp.clone())
-}
-
-// ---------------------------------------------------------------------------
-// Queue commands
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-pub struct QueueDto {
-    tracks: Vec<QueueTrack>,
-    current: Option<usize>,
-    /// "Artist — Title" per entry, in order (the UI's correct names).
-    display: Vec<String>,
-}
-
-fn queue_dto(queue: &TrackQueue) -> QueueDto {
-    QueueDto {
-        display: queue.tracks.iter().map(|t| t.display_line()).collect(),
-        tracks: queue.tracks.clone(),
-        current: queue.current,
-    }
+pub fn next_track(state: K<'_>) -> Result<Option<QueueDto>, CommandError> {
+    state.kernel.next_track().map_err(map_err)
 }
 
 #[tauri::command]
-pub fn set_queue(
-    tracks: Vec<QueueTrack>,
-    state: State<AppState>,
-) -> Result<QueueDto, CommandError> {
-    let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    queue.tracks = tracks;
-    queue.current = None;
-    Ok(queue_dto(&queue))
+pub fn prev_track(state: K<'_>) -> Result<QueueDto, CommandError> {
+    state.kernel.prev_track().map_err(map_err)
 }
 
 #[tauri::command]
-pub fn get_queue(state: State<AppState>) -> Result<QueueDto, CommandError> {
-    let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(queue_dto(&queue))
-}
-
-fn start_track_at(
-    track: &QueueTrack,
-    state: &State<AppState>,
-) -> Result<PlaybackStatus, CommandError> {
-    let device = match state
-        .device_key
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .as_deref()
-    {
-        None | Some("") => aurora_audio::default_output_device()?,
-        Some(key) => aurora_audio::output_devices()?
-            .into_iter()
-            .find(|d| d.key() == key)
-            .ok_or_else(|| {
-                // Saved/selected device vanished (unplugged): fall back
-                // to the default instead of failing playback (invariant 8).
-                tracing::warn!(key, "selected output device missing, using default");
-                CommandError::Device(key.to_string())
-            })
-            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e))?,
-    };
-    let dsp = state
-        .dsp
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .clone();
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.stop();
-    let rg = track
-        .replaygain_track_db
-        .map(|t| (t, track.replaygain_album_db));
-    engine.play_with_replaygain(std::path::PathBuf::from(&track.path), &device, dsp, rg)?;
-    Ok(status_of(&engine))
-}
-
-#[tauri::command]
-pub fn play_queue_index(
-    index: usize,
-    state: State<AppState>,
-) -> Result<PlaybackStatus, CommandError> {
-    let track = {
-        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-        let track = queue
-            .tracks
-            .get(index)
-            .cloned()
-            .ok_or_else(|| CommandError::Device(format!("queue index {index} out of range")))?;
-        queue.current = Some(index);
-        track
-    };
-    start_track_at(&track, &state)
-}
-
-#[tauri::command]
-pub fn next_track(state: State<AppState>) -> Result<Option<QueueDto>, CommandError> {
-    let track = {
-        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-        queue.next()
-    };
-    match track {
-        Some(t) => {
-            start_track_at(&t, &state)?;
-            let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-            Ok(Some(queue_dto(&queue)))
-        }
-        None => {
-            let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-            engine.stop();
-            Ok(None)
-        }
-    }
-}
-
-#[tauri::command]
-pub fn prev_track(state: State<AppState>) -> Result<QueueDto, CommandError> {
-    let track = {
-        let mut queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-        queue.prev()
-    };
-    let track = track.ok_or_else(|| CommandError::Device("empty queue".into()))?;
-    start_track_at(&track, &state)?;
-    let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(queue_dto(&queue))
-}
-
-// ---------------------------------------------------------------------------
-// Seek + live DSP
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub fn seek(position_s: f64, state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.seek(position_s);
-    Ok(status_of(&engine))
-}
-
-#[tauri::command]
-pub fn playback_position(state: State<AppState>) -> Result<f64, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(engine.position_s())
+pub fn get_dsp(state: K<'_>) -> Result<aurora_dsp::DspConfig, CommandError> {
+    state.kernel.get_dsp().map_err(map_err)
 }
 
 #[tauri::command]
 pub fn set_dsp(
     config: aurora_dsp::DspConfig,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<aurora_dsp::DspConfig, CommandError> {
-    // Persisted for future streams...
-    {
-        let mut dsp = state.dsp.lock().map_err(|_| CommandError::Poisoned)?;
-        *dsp = config.clone();
-    }
-    // ...and applied live to the playing stream. When the stream runs on
-    // the native (bit-exact) path and DSP just became active, the worker
-    // flags a restart: the native path has no pipeline, the track re-plays
-    // through the DSP path.
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.set_dsp_config(config.clone());
-    if engine.take_dsp_transition() {
-        tracing::info!("restarting stream through the DSP path");
-        let _ = engine.restart_for_dsp();
-    }
-    Ok(config)
+    state.kernel.set_dsp(config).map_err(map_err)
 }
 
 /// Phase 5: probe WASAPI exclusive-mode support for the playing format.
-///
-/// Returns the honest ADR 0002 classification: what the device's
-/// exclusive path can do for this exact stream.
 #[tauri::command]
-pub fn probe_exclusive(state: State<AppState>) -> Result<ExclusiveProbe, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let (Some(source), Some(device_key)) =
-        (engine.source_format_clone(), engine.device_key_clone())
-    else {
-        return Ok(ExclusiveProbe {
-            playing: false,
-            exclusive_capable: None,
-            integrity: "unverified".into(),
-            note: "nothing playing".into(),
-        });
-    };
-    let transformations = engine.transformations().to_vec();
-    let integrity = aurora_audio::exclusive_integrity(&device_key, source, &transformations)?;
-    Ok(ExclusiveProbe {
-        playing: true,
-        exclusive_capable: Some(matches!(
-            integrity,
-            aurora_core::OutputIntegrity::Unverified
-        )),
-        integrity: match integrity {
-            aurora_core::OutputIntegrity::Verified => "verified",
-            aurora_core::OutputIntegrity::Transformed => "transformed",
-            aurora_core::OutputIntegrity::Unverified => "unverified",
-        }
-        .into(),
-        note: if transformations.is_empty() {
-            "no transformations; software chain is bit-exact".into()
-        } else {
-            "active transformations make the path non-identical".into()
-        },
-    })
+pub fn probe_exclusive(state: K<'_>) -> Result<ExclusiveProbe, CommandError> {
+    state.kernel.probe_exclusive().map_err(map_err)
 }
 
-#[derive(Debug, Serialize)]
-pub struct ExclusiveProbe {
-    pub playing: bool,
-    /// Some(true): the device accepts the format in exclusive mode.
-    pub exclusive_capable: Option<bool>,
-    pub integrity: String,
-    pub note: String,
-}
-
-/// Phase 8: stop a faulted stream and optionally replay the current
-/// queue track on the (new) default device — the recovery path for
-/// device loss. The engine itself never restarts on its own: recovery is
-/// an explicit, honest action.
 #[tauri::command]
-pub fn recover_playback(
-    replay: bool,
-    state: State<AppState>,
-) -> Result<PlaybackStatus, CommandError> {
-    {
-        let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-        engine.stop();
-    }
-    if replay {
-        let track = {
-            let queue = state.queue.lock().map_err(|_| CommandError::Poisoned)?;
-            queue.current.and_then(|i| queue.tracks.get(i).cloned())
-        };
-        if let Some(track) = track {
-            return start_track_at(&track, &state);
-        }
-    }
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(status_of(&engine))
+pub fn recover_playback(replay: bool, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.recover_playback(replay).map_err(map_err)
 }
 
-// ---------------------------------------------------------------------------
-// Exclusive bit-perfect path (Windows/WASAPI)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-pub struct ExclusivePlayResult {
-    /// True when the exclusive path was taken; false = fell back to the
-    /// shared path (device refused the format — reported honestly).
-    pub exclusive: bool,
-    /// Why the fallback happened, when it did.
-    pub fallback_reason: Option<String>,
-    pub status: PlaybackStatus,
-}
-
-/// Play a track through WASAPI exclusive mode: no mixer, no DSP, the
-/// source's exact bytes to the endpoint.
-///
-/// If the device rejects the format, we fall back to the normal shared
-/// path and say so — never silently claim exclusive.
 #[tauri::command]
 pub fn play_exclusive_track(
     request: PlayRequest,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<ExclusivePlayResult, CommandError> {
-    let device = match request.device.as_deref() {
-        None | Some("") => aurora_audio::default_output_device()?,
-        Some(key) => aurora_audio::output_devices()?
-            .into_iter()
-            .find(|d| d.key() == key)
-            .ok_or_else(|| CommandError::Device(key.to_string()))?,
-    };
-
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let path = std::path::PathBuf::from(&request.path);
-    match engine.play_exclusive(path, &device) {
-        Ok(()) => Ok(ExclusivePlayResult {
-            exclusive: true,
-            fallback_reason: None,
-            status: status_of(&engine),
-        }),
-        Err(aurora_audio::EngineError::FormatUnsupported(reason)) => {
-            // Honest fallback: the device cannot take this format
-            // exclusively; play the normal way and report it.
-            tracing::warn!(%reason, "exclusive refused, falling back to shared");
-            engine.play_with_replaygain(
-                std::path::PathBuf::from(&request.path),
-                &device,
-                aurora_dsp::DspConfig::default(),
-                request
-                    .replaygain_track_db
-                    .map(|t| (t, request.replaygain_album_db)),
-            )?;
-            Ok(ExclusivePlayResult {
-                exclusive: false,
-                fallback_reason: Some(reason),
-                status: status_of(&engine),
-            })
-        }
-        Err(e) => Err(e.into()),
-    }
+    state.kernel.play_exclusive_track(request).map_err(map_err)
 }
 
-#[derive(Debug, Serialize)]
-pub struct BitPerfectVerdict {
-    /// True when an exclusive stream is playing.
-    pub exclusive_active: bool,
-    /// The physical measurement, when it ran.
-    pub identity: Option<f64>,
-    pub frames_compared: Option<u64>,
-    /// Honest ADR 0002 verdict ("verified" / "transformed" /
-    /// "unverified" — unverified = measurement failed, never assumed).
-    pub integrity: String,
-    pub note: String,
-}
-
-/// Run the physical loopback verification on the playing exclusive
-/// stream: capture what the endpoint rendered, compare byte-for-byte
-/// with the reference the engine pushed.
 #[tauri::command]
 pub fn verify_bit_perfect(
     seconds: Option<f64>,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<BitPerfectVerdict, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let duration = std::time::Duration::from_secs_f64(seconds.unwrap_or(2.0).clamp(0.5, 5.0));
-    match engine.verify_loopback(duration) {
-        Ok(v) => Ok(BitPerfectVerdict {
-            exclusive_active: true,
-            identity: Some(v.identity),
-            frames_compared: Some(v.frames_compared),
-            integrity: match v.integrity {
-                aurora_core::OutputIntegrity::Verified => "verified".into(),
-                aurora_core::OutputIntegrity::Transformed => "transformed".into(),
-                aurora_core::OutputIntegrity::Unverified => "unverified".into(),
-            },
-            note: format!(
-                "{:.2}% byte-identical frames over {} frames measured",
-                v.identity * 100.0,
-                v.frames_compared
-            ),
-        }),
-        Err(e) => Ok(BitPerfectVerdict {
-            exclusive_active: false,
-            identity: None,
-            frames_compared: None,
-            integrity: "unverified".into(),
-            note: e.to_string(),
-        }),
-    }
+    state.kernel.verify_bit_perfect(seconds).map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
 // VST3 plugin hosting (ADR 0004, Phase 9)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub struct VstPluginDto {
-    pub path: String,
-    pub name: String,
-    pub vendor: String,
-    pub version: String,
-    pub category: String,
-    pub class_id: String,
-    pub input_channels: i32,
-    pub output_channels: i32,
-}
-
-/// Scan standard VST3 directories (plus an optional extra folder) with the
-/// crash-resistant out-of-process probe. Blocking — run from a thread.
 #[tauri::command]
 pub fn scan_vst_plugins(extra_folder: Option<String>) -> Result<Vec<VstPluginDto>, CommandError> {
     let extra = extra_folder
@@ -1155,121 +438,107 @@ pub fn scan_vst_plugins(extra_folder: Option<String>) -> Result<Vec<VstPluginDto
         .collect())
 }
 
-/// Set the active VST3 plugin chain (live: reloads without interrupting
-/// playback). Empty slots = chain off. Plugins run out-of-process; the
-/// transformation list reports them honestly (ADR 0002/0004).
 #[tauri::command]
-pub fn set_vst_chain(
-    slots: Vec<VstSlotDto>,
-    state: State<AppState>,
-) -> Result<PlaybackStatus, CommandError> {
-    let list = aurora_vst::VstPluginList {
-        slots: slots.into_iter().map(|s| (s.path, s.class_id)).collect(),
-    };
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.set_vst(list);
-    Ok(status_of(&engine))
+pub fn set_vst_chain(slots: Vec<VstSlotDto>, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
+    state.kernel.set_vst_chain(slots).map_err(map_err)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VstSlotDto {
-    pub path: String,
-    pub class_id: String,
-}
-
-/// The currently-configured VST3 chain (path + class id per slot).
 #[tauri::command]
-pub fn get_vst_chain(state: State<AppState>) -> Result<Vec<VstSlotDto>, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let list = engine.vst_chain();
-    Ok(list
-        .slots
-        .into_iter()
-        .map(|(path, class_id)| VstSlotDto { path, class_id })
-        .collect())
+pub fn get_vst_chain(state: K<'_>) -> Result<Vec<VstSlotDto>, CommandError> {
+    state.kernel.get_vst_chain().map_err(map_err)
 }
 
-/// Load one plugin out-of-process and run a silent block through it:
-/// the honest "does this plugin actually work here" verdict, surfaced to
-/// the UI instead of a silent skip when playback starts.
 #[tauri::command]
 pub fn test_vst_plugin(path: String, class_id: String) -> Result<String, CommandError> {
     aurora_vst::test_plugin_load(&path, &class_id)
         .map_err(|reason| CommandError::Engine { message: reason })
 }
 
-/// Open the plugin's editor window (its own GUI thread + Win32 message
-/// pump; the audio chain stays out-of-process). Parameter changes made
-/// in the editor flow into the chain live. One editor at a time.
 #[tauri::command]
-pub fn open_vst_editor(
+pub fn open_vst_editor(path: String, class_id: String, state: K<'_>) -> Result<(), CommandError> {
+    state
+        .kernel
+        .open_vst_editor(&path, &class_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn close_vst_editor(state: K<'_>) -> Result<(), CommandError> {
+    state.kernel.close_vst_editor().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn list_vst_params(path: String, class_id: String) -> Result<Vec<VstParamDto>, CommandError> {
+    let params = aurora_vst::probe_params(&path, &class_id)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(params
+        .into_iter()
+        .map(|p| VstParamDto {
+            id: p.id,
+            title: p.title,
+            value: p.value,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn set_vst_param(
     path: String,
     class_id: String,
-    state: State<AppState>,
+    id: u32,
+    value: f64,
+    state: K<'_>,
 ) -> Result<(), CommandError> {
-    let mut gui_slot = state.vst_gui.lock().map_err(|_| CommandError::Poisoned)?;
-    // One editor at a time: close the previous session first.
-    if let Some(mut old) = gui_slot.take() {
-        old.close();
-    }
-    // The GUI thread forwards editor parameter snapshots into the
-    // engine's live param slot; the worker applies them to the chain
-    // between chunks.
-    let engine = {
-        let guard = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-        let ptr: *const PlaybackEngine = &*guard;
-        // SAFETY: the engine lives in AppState for the whole app
-        // lifetime (managed state is never dropped before commands end);
-        // the GUI thread only calls set_vst_params, which locks the
-        // shared mutex, so the borrow is read-only and synchronized.
-        unsafe { &*ptr }
-    };
-    // Which chain slot this editor drives: the index of (path, class_id)
-    // in the configured chain — multi-slot GUI support. Slot indices
-    // count attached plugins on the audio side (skipped slots shift), so
-    // a missing plugin file simply leaves the editor without a target.
-    let slot = state
-        .engine
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .vst_chain()
-        .slots
-        .iter()
-        .position(|(p, c)| p == &path && c == &class_id)
-        .unwrap_or(0);
-    let gui = aurora_vst::open_gui(
-        &path,
-        &class_id,
-        Box::new(move |params| {
-            engine.set_vst_params(slot, params.into_iter().collect());
-        }),
-    )
-    .map_err(|reason| CommandError::Engine { message: reason })?;
-    *gui_slot = Some(gui);
-    tracing::info!(%path, slot, "vst editor window opened");
-    Ok(())
+    state
+        .kernel
+        .set_vst_param(&path, &class_id, id, value)
+        .map_err(map_err)
 }
 
-/// Close the open plugin editor window, if any.
 #[tauri::command]
-pub fn close_vst_editor(state: State<AppState>) -> Result<(), CommandError> {
-    let mut gui_slot = state.vst_gui.lock().map_err(|_| CommandError::Poisoned)?;
-    if let Some(mut gui) = gui_slot.take() {
-        gui.close();
-    }
-    Ok(())
+pub fn save_vst_preset(
+    path: String,
+    class_id: String,
+    name: String,
+) -> Result<String, CommandError> {
+    let file = aurora_vst::save_preset_file(&path, &class_id, &name)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(file.display().to_string())
+}
+
+#[tauri::command]
+pub fn load_vst_preset(
+    path: String,
+    class_id: String,
+    preset_path: String,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .load_vst_preset(&path, &class_id, &preset_path)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn list_vst_presets(path: String) -> Result<Vec<VstPresetDto>, CommandError> {
+    let presets = aurora_vst::list_preset_files(&path)
+        .map_err(|reason| CommandError::Engine { message: reason })?;
+    Ok(presets
+        .into_iter()
+        .map(|(name, file)| VstPresetDto {
+            name,
+            path: file.display().to_string(),
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
-// Spectrum / waveform / A-B loop / VST bypass / chain persistence
+// Spectrum / waveform / loop / bypass / chain persistence
 // ---------------------------------------------------------------------------
 
-/// Live spectrum: 16 log-spaced band energies (0..1), post-DSP/post-VST
-/// (what the wire carries). Display-only, coarse.
 #[tauri::command]
-pub fn playback_spectrum(state: State<AppState>) -> Result<Vec<f32>, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(engine.metrics().spectrum())
+pub fn playback_spectrum(state: K<'_>) -> Result<Vec<f32>, CommandError> {
+    state.kernel.playback_spectrum().map_err(map_err)
 }
 
 /// Waveform peaks for the seek bar: `bins` absolute values (0..1) across
@@ -1303,587 +572,134 @@ pub fn waveform(path: String, bins: u32) -> Result<Vec<f32>, CommandError> {
     Ok(peaks)
 }
 
-/// Set / clear the A/B loop region (seconds). `loop_start`/`loop_end` of
-/// null clears it.
 #[tauri::command]
 pub fn set_loop(
     loop_start: Option<f64>,
     loop_end: Option<f64>,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<Option<(f64, f64)>, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let region = match (loop_start, loop_end) {
-        (Some(s), Some(e)) if e > s => Some((s, e)),
-        _ => None,
-    };
-    engine.set_loop(region);
-    Ok(engine.loop_region())
+    state.kernel.set_loop(loop_start, loop_end).map_err(map_err)
 }
 
-/// Bypass one VST chain slot (A/B comparison; the plugin stays live in
-/// its helper process, toggling back is instant).
 #[tauri::command]
-pub fn set_vst_slot_bypass(
-    slot: usize,
-    bypassed: bool,
-    state: State<AppState>,
-) -> Result<(), CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.set_vst_slot_bypass(slot, bypassed);
-    Ok(())
+pub fn set_vst_slot_bypass(slot: usize, bypassed: bool, state: K<'_>) -> Result<(), CommandError> {
+    state
+        .kernel
+        .set_vst_slot_bypass(slot, bypassed)
+        .map_err(map_err)
 }
 
-/// Which VST chain slots are currently bypassed.
 #[tauri::command]
-pub fn vst_bypassed_slots(state: State<AppState>) -> Result<Vec<usize>, CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok(engine.vst_bypassed_slots())
+pub fn vst_bypassed_slots(state: K<'_>) -> Result<Vec<usize>, CommandError> {
+    state.kernel.vst_bypassed_slots().map_err(map_err)
 }
 
-/// Persist the VST chain (slots) into the library settings so it
-/// survives restarts. `None` clears the stored chain.
 #[tauri::command]
 pub async fn save_vst_chain_setting(
     slots: Option<Vec<VstSlotDto>>,
-    state: State<'_, AppState>,
+    state: K<'_>,
 ) -> Result<(), CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let value = slots.map(|s| serde_json::to_string(&s).unwrap_or_else(|_| "[]".to_string()));
-    match value {
-        Some(v) => {
-            aurora_storage::set_setting(service.pool(), "vst_chain", &v)
-                .await
-                .map_err(CommandError::from)?;
-        }
-        None => {
-            let _ = aurora_storage::delete_setting(service.pool(), "vst_chain").await;
-        }
-    }
-    Ok(())
-}
-
-/// The persisted VST chain, restored at app start.
-#[tauri::command]
-pub async fn load_vst_chain_setting(
-    state: State<'_, AppState>,
-) -> Result<Option<Vec<VstSlotDto>>, CommandError> {
-    let library = state.library.lock().await;
-    let service = library.as_ref().ok_or(CommandError::LibraryNotOpen)?;
-    let value = aurora_storage::get_setting(service.pool(), "vst_chain")
+    state
+        .kernel
+        .save_vst_chain_setting(slots)
         .await
-        .map_err(CommandError::from)?;
-    Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
-}
-
-/// One automatable plugin parameter (normalized 0..1 value).
-#[derive(Debug, Serialize)]
-pub struct VstParamDto {
-    pub id: u32,
-    pub title: String,
-    pub value: f64,
-}
-
-/// List a chain slot's parameters without opening the native editor —
-/// the generic parameter panel (works for every plugin, even ones whose
-/// editor refuses to open). Loads a throwaway isolated instance; the
-/// playing chain is untouched.
-#[tauri::command]
-pub fn list_vst_params(path: String, class_id: String) -> Result<Vec<VstParamDto>, CommandError> {
-    let params = aurora_vst::probe_params(&path, &class_id)
-        .map_err(|reason| CommandError::Engine { message: reason })?;
-    Ok(params
-        .into_iter()
-        .map(|p| VstParamDto {
-            id: p.id,
-            title: p.title,
-            value: p.value,
-        })
-        .collect())
-}
-
-/// Set one parameter on a chain slot from the generic panel (normalized
-/// 0..1). Rides the worker's between-chunks param path — no restart.
-#[tauri::command]
-pub fn set_vst_param(
-    path: String,
-    class_id: String,
-    id: u32,
-    value: f64,
-    state: State<AppState>,
-) -> Result<(), CommandError> {
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let slot = engine
-        .vst_chain()
-        .slots
-        .iter()
-        .position(|(p, c)| p == &path && c == &class_id)
-        .unwrap_or(0);
-    // Merge into the live param map: the worker applies the whole map on
-    // its next pass; other slots' editor sessions are untouched (each
-    // editor session replaces the map only when the slot matches).
-    engine.set_vst_param_value(slot, id, value);
-    Ok(())
-}
-
-/// Save a chain slot's current state as a preset file (JSON, next to the
-/// library in app data). Returns the file path for the UI to show.
-#[tauri::command]
-pub fn save_vst_preset(
-    path: String,
-    class_id: String,
-    name: String,
-) -> Result<String, CommandError> {
-    let file = aurora_vst::save_preset_file(&path, &class_id, &name)
-        .map_err(|reason| CommandError::Engine { message: reason })?;
-    Ok(file.display().to_string())
-}
-
-/// Apply a preset file to a chain slot (loads an isolated instance,
-/// applies the state, and pushes the resulting parameter values into the
-/// live chain so playback hears it without a restart).
-#[tauri::command]
-pub fn load_vst_preset(
-    path: String,
-    class_id: String,
-    preset_path: String,
-    state: State<AppState>,
-) -> Result<(), CommandError> {
-    let params = aurora_vst::load_preset_and_params(&path, &class_id, &preset_path)
-        .map_err(|reason| CommandError::Engine { message: reason })?;
-    let engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    let slot = engine
-        .vst_chain()
-        .slots
-        .iter()
-        .position(|(p, c)| p == &path && c == &class_id)
-        .unwrap_or(0);
-    let mut map = engine.vst_param_map(slot);
-    for p in params {
-        map.insert(p.id, p.value);
-    }
-    engine.set_vst_params(slot, map);
-    Ok(())
-}
-
-/// List saved preset files for a plugin (name, path).
-#[derive(Debug, Serialize)]
-pub struct VstPresetDto {
-    pub name: String,
-    pub path: String,
+        .map_err(map_err)
 }
 
 #[tauri::command]
-pub fn list_vst_presets(path: String) -> Result<Vec<VstPresetDto>, CommandError> {
-    let presets = aurora_vst::list_preset_files(&path)
-        .map_err(|reason| CommandError::Engine { message: reason })?;
-    Ok(presets
-        .into_iter()
-        .map(|(name, file)| VstPresetDto {
-            name,
-            path: file.display().to_string(),
-        })
-        .collect())
+pub async fn load_vst_chain_setting(state: K<'_>) -> Result<Option<Vec<VstSlotDto>>, CommandError> {
+    state.kernel.load_vst_chain_setting().await.map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
-// Artwork (embedded cover art from tags, cache in app temp)
+// Artwork
 // ---------------------------------------------------------------------------
 
-/// In-memory artwork cache: track path -> data URL. Bounded by the
-/// library size; one entry per track actually displayed.
-fn artwork_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Get the embedded cover art of a track as a data URL (for <img src>).
-/// `Ok(None)` = no artwork in tags (the UI shows its placeholder).
 #[tauri::command]
 pub fn get_track_artwork(path: String) -> Result<Option<String>, CommandError> {
-    // Cache hit (the library re-asks for the now-playing art on every
-    // status poll's title update).
-    if let Some(hit) = artwork_cache()
-        .lock()
-        .ok()
-        .and_then(|c| c.get(&path).cloned())
-    {
-        return Ok(Some(hit));
-    }
-    let bytes = aurora_metadata::read_cover_art(std::path::Path::new(&path))?;
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    let mime = sniff_image_mime(&bytes);
-    let data = base64_encode(&bytes);
-    let url = format!("data:{mime};base64,{data}");
-    if let Ok(mut cache) = artwork_cache().lock() {
-        // Bound the cache: drop the oldest entries past 64.
-        if cache.len() >= 64 {
-            cache.clear();
-        }
-        cache.insert(path, url.clone());
-    }
-    Ok(Some(url))
-}
-
-fn sniff_image_mime(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        "image/png"
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "image/jpeg"
-    } else if bytes.starts_with(b"BM") {
-        "image/bmp"
-    } else if bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
-        "image/webp"
-    } else {
-        "application/octet-stream"
-    }
-}
-
-/// Minimal base64 (std lib has none; keep it local and simple).
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-#[tauri::command]
-pub fn pause_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.pause()?;
-    Ok(status_of(&engine))
-}
-
-#[tauri::command]
-pub fn resume_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.resume()?;
-    Ok(status_of(&engine))
-}
-
-#[tauri::command]
-pub fn stop_playback(state: State<AppState>) -> Result<PlaybackStatus, CommandError> {
-    let mut engine = state.engine.lock().map_err(|_| CommandError::Poisoned)?;
-    engine.stop();
-    Ok(status_of(&engine))
+    aurora_kernel::artwork::track_artwork(&path).map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
 // DJ decks (Pioneer DDJ-1000-style, Phase 10)
 // ---------------------------------------------------------------------------
 
-/// Deck status snapshot for the /decks page.
-#[derive(Debug, Serialize)]
-pub struct DeckDto {
-    pub index: usize,
-    /// Deck letter "A"/"B".
-    pub name: String,
-    pub loaded: Option<QueueTrack>,
-    pub state: String,
-    pub position_s: f64,
-    pub duration_s: Option<f64>,
-    /// Channel fader 0..1 (pre-crossfader).
-    pub channel_fader: f64,
-    /// Applied gain (fader + crossfader), dB.
-    pub gain_db: f64,
-    /// Hot cue positions (seconds), 8 slots.
-    pub cues: Vec<Option<f64>>,
-    /// Tempo multiplier (DspConfig.speed).
-    pub speed: f64,
-}
-
-fn deck_dto(index: usize, deck: &Deck, crossfader: f64) -> DeckDto {
-    let state = match deck.engine.state() {
-        aurora_audio::EngineState::Idle => "idle",
-        aurora_audio::EngineState::Playing => "playing",
-        aurora_audio::EngineState::Paused => "paused",
-        aurora_audio::EngineState::Draining => "draining",
-    };
-    DeckDto {
-        index,
-        name: if index == 0 { "A".into() } else { "B".into() },
-        loaded: deck.loaded.clone(),
-        state: state.into(),
-        position_s: deck.engine.position_s(),
-        duration_s: deck.engine.duration_s(),
-        channel_fader: deck.channel_fader,
-        gain_db: Deck::gain_db(deck.channel_fader, crossfader, index == 1),
-        cues: deck.cues.to_vec(),
-        speed: f64::from(deck.dsp.speed),
-    }
-}
-
-/// Load a track onto a deck (does not start it — like pressing LOAD on a
-/// CDJ). The deck's DSP (EQ/tempo/fader gain) applies from the start.
 #[tauri::command]
-pub fn deck_load(
+pub async fn deck_load(
     deck: usize,
     path: String,
     title: Option<String>,
     artist: Option<String>,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<DeckDto, CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let device_key = state
-        .device_key
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .clone();
-    let device = resolve_device(device_key.as_deref())?;
-    let track = QueueTrack {
-        path,
-        title,
-        artist,
-        replaygain_track_db: None,
-        replaygain_album_db: None,
-    };
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    d.engine.stop();
-    d.cues = std::array::from_fn(|_| None);
-    let rg = track
-        .replaygain_track_db
-        .map(|t| (t, track.replaygain_album_db));
-    d.engine
-        .play_with_replaygain(PathBuf::from(&track.path), &device, d.dsp.clone(), rg)?;
-    // Loading pauses at position 0 (CUE standby): pause immediately so
-    // the DJ starts it on purpose.
-    let _ = d.engine.pause();
-    d.loaded = Some(track);
-    Ok(deck_dto(idx, d, crossfader))
+    state
+        .kernel
+        .deck_load(deck, path, title, artist)
+        .await
+        .map_err(map_err)
 }
 
-/// Press PLAY/PAUSE on a deck.
 #[tauri::command]
-pub fn deck_play(deck: usize, state: State<AppState>) -> Result<DeckDto, CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    match d.engine.state() {
-        aurora_audio::EngineState::Playing => {
-            d.engine.pause()?;
-        }
-        aurora_audio::EngineState::Paused => {
-            d.engine.resume()?;
-        }
-        _ => {
-            // Idle: re-play the loaded track.
-            if let Some(t) = d.loaded.clone() {
-                let device = resolve_device(
-                    state
-                        .device_key
-                        .lock()
-                        .map_err(|_| CommandError::Poisoned)?
-                        .as_deref(),
-                )?;
-                let rg = t.replaygain_track_db.map(|v| (v, t.replaygain_album_db));
-                d.engine.play_with_replaygain(
-                    PathBuf::from(&t.path),
-                    &device,
-                    d.dsp.clone(),
-                    rg,
-                )?;
-            }
-        }
-    }
-    Ok(deck_dto(idx, d, crossfader))
+pub fn deck_play(deck: usize, state: K<'_>) -> Result<DeckDto, CommandError> {
+    state.kernel.deck_play(deck).map_err(map_err)
 }
 
-/// Stop the deck (back to standby).
 #[tauri::command]
-pub fn deck_stop(deck: usize, state: State<AppState>) -> Result<DeckDto, CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    decks[idx].engine.stop();
-    Ok(deck_dto(idx, &decks[idx], crossfader))
+pub fn deck_stop(deck: usize, state: K<'_>) -> Result<DeckDto, CommandError> {
+    state.kernel.deck_stop(deck).map_err(map_err)
 }
 
-/// Seek a deck (jog wheel / needle drop).
 #[tauri::command]
-pub fn deck_seek(deck: usize, position_s: f64, state: State<AppState>) -> Result<(), CommandError> {
-    let idx = deck.min(1);
-    let decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    decks[idx].engine.seek(position_s.max(0.0));
-    Ok(())
+pub fn deck_seek(deck: usize, position_s: f64, state: K<'_>) -> Result<(), CommandError> {
+    state.kernel.deck_seek(deck, position_s).map_err(map_err)
 }
 
-/// Set a deck's channel fader (0..1, pre-crossfader). Applies the
-/// combined fader+crossfader gain live.
 #[tauri::command]
-pub fn deck_fader(
-    deck: usize,
-    value: f64,
-    state: State<AppState>,
-) -> Result<DeckDto, CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    d.channel_fader = value.clamp(0.0, 1.0);
-    let gain = Deck::gain_db(d.channel_fader, crossfader, idx == 1);
-    d.apply_volume(gain);
-    Ok(deck_dto(idx, d, crossfader))
+pub fn deck_fader(deck: usize, value: f64, state: K<'_>) -> Result<DeckDto, CommandError> {
+    state.kernel.deck_fader(deck, value).map_err(map_err)
 }
 
-/// Move the crossfader (0 = deck A, 1 = deck B). Both decks' gains
-/// update live (equal-power curve).
 #[tauri::command]
-pub fn set_crossfader(value: f64, state: State<AppState>) -> Result<[DeckDto; 2], CommandError> {
-    let x = value.clamp(0.0, 1.0);
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let (fa, fb) = (decks[0].channel_fader, decks[1].channel_fader);
-    let ga = Deck::gain_db(fa, x, false);
-    let gb = Deck::gain_db(fb, x, true);
-    decks[0].apply_volume(ga);
-    decks[1].apply_volume(gb);
-    *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)? = x;
-    Ok([deck_dto(0, &decks[0], x), deck_dto(1, &decks[1], x)])
+pub fn set_crossfader(value: f64, state: K<'_>) -> Result<[DeckDto; 2], CommandError> {
+    state.kernel.set_crossfader(value).map_err(map_err)
 }
 
-/// Set a hot cue (slot 0..7) at a position; `position: null` clears it.
-/// Jump: when the deck plays, `deck_jump_cue` seeks there.
 #[tauri::command]
 pub fn deck_set_cue(
     deck: usize,
     slot: usize,
     position: Option<f64>,
-    state: State<AppState>,
+    state: K<'_>,
 ) -> Result<Vec<Option<f64>>, CommandError> {
-    let idx = deck.min(1);
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    if slot < 8 {
-        d.cues[slot] = position;
-    }
-    Ok(d.cues.to_vec())
+    state
+        .kernel
+        .deck_set_cue(deck, slot, position)
+        .map_err(map_err)
 }
 
-/// Jump to a hot cue: seek there and play (the CDJ behavior).
 #[tauri::command]
-pub fn deck_jump_cue(deck: usize, slot: usize, state: State<AppState>) -> Result<(), CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let device_key = state
-        .device_key
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?
-        .clone();
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    let Some(&Some(pos)) = d.cues.get(slot) else {
-        return Ok(());
-    };
-    // Idle deck: start the track first, then seek.
-    if d.engine.state() == aurora_audio::EngineState::Idle
-        && let Some(t) = d.loaded.clone()
-    {
-        let device = resolve_device(device_key.as_deref())?;
-        let rg = t.replaygain_track_db.map(|v| (v, t.replaygain_album_db));
-        d.engine
-            .play_with_replaygain(PathBuf::from(&t.path), &device, d.dsp.clone(), rg)?;
-        let _ = d.engine.pause();
-    }
-    d.engine.seek(pos);
-    let _ = d.engine.resume();
-    let _ = crossfader;
-    Ok(())
+pub fn deck_jump_cue(deck: usize, slot: usize, state: K<'_>) -> Result<(), CommandError> {
+    state.kernel.deck_jump_cue(deck, slot).map_err(map_err)
 }
 
-/// Set the deck's tempo (pitch) multiplier, e.g. 1.0 = normal, 1.08 =
-/// +8%. Live DSP change, no restart.
 #[tauri::command]
-pub fn deck_tempo(
-    deck: usize,
-    speed: f64,
-    state: State<AppState>,
-) -> Result<DeckDto, CommandError> {
-    let idx = deck.min(1);
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let mut decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    let d = &mut decks[idx];
-    d.dsp.speed = speed.clamp(0.5, 2.0) as f32;
-    d.engine.set_dsp_config(d.dsp.clone());
-    Ok(deck_dto(idx, d, crossfader))
+pub fn deck_tempo(deck: usize, speed: f64, state: K<'_>) -> Result<DeckDto, CommandError> {
+    state.kernel.deck_tempo(deck, speed).map_err(map_err)
 }
 
-/// Full deck status snapshot (poll from the UI).
 #[tauri::command]
-pub fn deck_status(state: State<AppState>) -> Result<[DeckDto; 2], CommandError> {
-    let crossfader = *state
-        .crossfader
-        .lock()
-        .map_err(|_| CommandError::Poisoned)?;
-    let decks = state.decks.lock().map_err(|_| CommandError::Poisoned)?;
-    Ok([
-        deck_dto(0, &decks[0], crossfader),
-        deck_dto(1, &decks[1], crossfader),
-    ])
+pub fn deck_status(state: K<'_>) -> Result<[DeckDto; 2], CommandError> {
+    state.kernel.deck_status().map_err(map_err)
 }
 
-/// Common device resolution for decks.
-fn resolve_device(key: Option<&str>) -> Result<aurora_audio::OutputDevice, CommandError> {
-    match key {
-        None | Some("") => {
-            aurora_audio::default_output_device().map_err(|e| CommandError::Engine {
-                message: e.to_string(),
-            })
-        }
-        Some(k) => aurora_audio::output_devices()
-            .map_err(|e| CommandError::Engine {
-                message: e.to_string(),
-            })?
-            .into_iter()
-            .find(|d| d.key() == k)
-            .ok_or_else(|| CommandError::Device(k.to_string()))
-            .or_else(|e| aurora_audio::default_output_device().map_err(|_| e)),
-    }
+#[tauri::command]
+pub async fn track_bpm(path: String, state: K<'_>) -> Result<Option<f64>, CommandError> {
+    state.kernel.track_bpm(&path).await.map_err(map_err)
 }
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
 
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
@@ -1912,29 +728,26 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     };
                     tauri::async_runtime::spawn(async move {
                         let state = app_state.state::<AppState>();
-                        let Ok(mut engine) = state.engine.lock() else {
-                            return;
-                        };
+                        let kernel = state.kernel.clone();
                         match task {
                             "stop" => {
-                                engine.stop();
+                                let _ = kernel.stop_playback();
                             }
                             "playpause" => {
-                                let playing = engine.state() == aurora_audio::EngineState::Playing;
+                                let playing = kernel.engine.lock().map(|e| e.state()).ok()
+                                    == Some(aurora_audio::EngineState::Playing);
                                 if playing {
-                                    let _ = engine.pause();
+                                    let _ = kernel.pause_playback();
                                 } else {
-                                    let _ = engine.resume();
+                                    let _ = kernel.resume_playback();
                                 }
                             }
                             "next" => {
                                 // The queue order is frontend state; ask it
                                 // to advance (the frontend calls next_track).
-                                drop(engine);
                                 let _ = app_state.emit("media-next", ());
                             }
                             "prev" => {
-                                drop(engine);
                                 let _ = app_state.emit("media-prev", ());
                             }
                             _ => {}
@@ -1973,6 +786,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             delete_playlist,
             set_playlist_tracks,
             playlist_tracks,
+            import_playlist,
+            export_playlist,
             list_output_devices,
             playback_status,
             playback_position,
@@ -2017,6 +832,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             deck_jump_cue,
             deck_tempo,
             deck_status,
+            track_bpm,
             get_track_artwork,
             pause_playback,
             resume_playback,
@@ -2040,13 +856,28 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     let handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
                         let state = handle.state::<AppState>();
+                        let kernel = state.kernel.clone();
                         match aurora_library::LibraryService::open(&db_path).await {
                             Ok(service) => {
                                 let count = aurora_storage::track_count(service.pool())
                                     .await
                                     .unwrap_or(0);
-                                *state.library.lock().await = Some(service);
-                                *state.library_path_slot.lock().expect("path slot") =
+                                // Start the folder watcher BEFORE the pool
+                                // moves into the kernel: it clones the pool
+                                // and never touches the kernel's library slot.
+                                let roots = aurora_storage::library_roots(service.pool())
+                                    .await
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect::<Vec<_>>();
+                                aurora_kernel::watch::spawn_library_watcher(
+                                    service.pool().clone(),
+                                    roots,
+                                    kernel.events.clone(),
+                                );
+                                *kernel.library.lock().await = Some(service);
+                                *kernel.library_path_slot.lock().expect("path slot") =
                                     Some(db_path.clone());
                                 tracing::info!(
                                     path = %db_path.display(),
@@ -2062,9 +893,41 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                                 );
                             }
                         }
+                        // Restore the persisted VST chain + output device.
+                        if let Ok(Some(slots)) = kernel.load_vst_chain_setting().await {
+                            let empty = slots.is_empty();
+                            if !empty {
+                                let _ = kernel.set_vst_chain(slots);
+                                tracing::info!("vst chain restored");
+                            }
+                        }
+                        if let Ok(Some(key)) = kernel.get_setting("output_device").await {
+                            *kernel.device_key.lock().expect("device key") = Some(key);
+                        }
                     });
                 }
             }
+
+            // Forward kernel events to the frontend (Tauri events).
+            let handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            let kernel = state.kernel.clone();
+            let _ = kernel.events.subscribe(move |event| match event {
+                aurora_kernel::KernelEvent::LibraryChanged {
+                    added,
+                    pruned,
+                    updated,
+                } => {
+                    let _ = handle.emit(
+                        "library-changed",
+                        serde_json::json!({
+                            "added": added,
+                            "pruned": pruned,
+                            "updated": updated,
+                        }),
+                    );
+                }
+            });
             Ok(())
         })
 }

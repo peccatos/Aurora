@@ -12,7 +12,12 @@ import type { TrackDto } from "../types";
 interface DeckDto {
   index: number;
   name: string;
-  loaded: { path: string; title: string | null; artist: string | null } | null;
+  loaded: {
+    path: string;
+    title: string | null;
+    artist: string | null;
+    bpm: number | null;
+  } | null;
   state: string;
   position_s: number;
   duration_s: number | null;
@@ -20,6 +25,7 @@ interface DeckDto {
   gain_db: number;
   cues: (number | null)[];
   speed: number;
+  bpm: number | null;
 }
 
 /** Waveform per deck path (cache, 160 bins). */
@@ -112,6 +118,7 @@ function renderDeck(root: HTMLElement, idx: number) {
         <span class="deck-title" id="dk-${idx}-title">No track loaded</span>
         <span class="deck-artist" id="dk-${idx}-artist"></span>
       </div>
+      <span class="deck-bpm" id="dk-${idx}-bpm" title="Measured tempo of the loaded track">--</span>
       <div class="deck-transport">
         <button class="btn deck-load-btn" id="dk-${idx}-load" type="button">Load</button>
         <button class="btn deck-play-btn" id="dk-${idx}-play" type="button">▶</button>
@@ -141,6 +148,7 @@ function renderDeck(root: HTMLElement, idx: number) {
           <span class="overline">Tempo</span>
           <input id="dk-${idx}-tempo" type="range" min="0.5" max="1.5" step="0.005" value="1" />
           <b id="dk-${idx}-tempo-v">1.00x</b>
+          <b class="bpm-live" id="dk-${idx}-bpm-live" hidden></b>
         </label>
         <div class="cue-grid" id="dk-${idx}-cuegrid"></div>
       </div>
@@ -207,6 +215,15 @@ function renderDeck(root: HTMLElement, idx: number) {
   tempoEl?.addEventListener("input", () => {
     const v = Number.parseFloat(tempoEl.value);
     if (tempoV) tempoV.textContent = `${v.toFixed(2)}x`;
+    // Live effective BPM (bpm × speed) without waiting for the poll.
+    const bpmLive = el.querySelector<HTMLElement>(`#dk-${idx}-bpm-live`);
+    const bpmEl = el.querySelector<HTMLElement>(`#dk-${idx}-bpm`);
+    const bpmText = bpmEl?.textContent ?? "";
+    const bpm = Number.parseFloat(bpmText);
+    if (bpmLive && Number.isFinite(bpm)) {
+      bpmLive.hidden = false;
+      bpmLive.textContent = `${(bpm * v).toFixed(1)} BPM`;
+    }
     void invoke("deck_tempo", { deck: idx, speed: v });
   });
 
@@ -256,6 +273,24 @@ async function refresh(root: HTMLElement, quiet = false): Promise<DeckDto[]> {
 
     if (titleEl && d.loaded) titleEl.textContent = d.loaded.title ?? stem(d.loaded.path);
     if (artistEl && d.loaded) artistEl.textContent = d.loaded.artist ?? "";
+
+    // Measured BPM: the number is the file's own tempo; the live value
+    // next to the tempo slider shows bpm × speed (what you actually hear).
+    const bpmEl = root.querySelector<HTMLElement>(`#dk-${idx}-bpm`);
+    const bpmLive = root.querySelector<HTMLElement>(`#dk-${idx}-bpm-live`);
+    const bpm = d.loaded?.bpm ?? null;
+    if (bpmEl) bpmEl.textContent = bpm != null ? `${bpm.toFixed(1)}` : "--";
+    if (bpmLive) {
+      if (bpm != null && Math.abs(d.speed - 1) > 0.004) {
+        bpmLive.hidden = false;
+        bpmLive.textContent = `${(bpm * d.speed).toFixed(1)} BPM`;
+      } else if (bpm != null) {
+        bpmLive.hidden = false;
+        bpmLive.textContent = `${bpm.toFixed(1)} BPM`;
+      } else {
+        bpmLive.hidden = true;
+      }
+    }
 
     if (playBtn) {
       playBtn.textContent = d.state === "playing" ? "⏸" : "▶";

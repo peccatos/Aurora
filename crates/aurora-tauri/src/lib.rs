@@ -1,9 +1,8 @@
-//! Tauri adapter: exposes application use cases to the frontend as typed
-//! commands and events.
+//! Tauri adapter: a thin shell over the kernel (ADR 0005).
 //!
-//! This crate is a boundary, not a composition root: it wires the invoke
-//! handler and publishes builder hooks, while `aurora-app` decides what
-//! services exist.
+//! One command = one kernel call + DTO translation; kernel events are
+//! forwarded to the frontend. No business logic lives here — the music
+//! player is `aurora-kernel`.
 
 pub mod commands;
 pub mod error;

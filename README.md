@@ -6,6 +6,15 @@ Aurora's core idea (ADR 0002): **bit-perfect is a measured property, not a claim
 Every transformation in the signal path is reported honestly — and when the path
 is clean, physical loopback verification can prove it byte-for-byte.
 
+## Kernel / shells (ADR 0005)
+
+The music player itself lives in `aurora-kernel`: a shell-free crate with zero
+Tauri/UI dependencies. The desktop app is one shell over it; a web shell (and
+any third-party player built on Aurora) composes the same kernel with its own
+transport. Honesty contracts (bit-perfect verdicts, transformation reports,
+"measured, never fabricated" BPM) travel with the kernel — a shell can display
+them, never fake them.
+
 ## What it does
 
 - **Playback**: FLAC/WAV/MP3/M4A/AAC/OGG/Opus/AIFF/WavPack via Symphonia; gapless
@@ -24,8 +33,16 @@ is clean, physical loopback verification can prove it byte-for-byte.
 - **DJ decks** (Pioneer DDJ-1000-style): two independent playback streams, each
   with its own engine, jog waveform, 8 hot cues, tempo and channel fader;
   equal-power crossfader for live mixing.
+- **Measured BPM**: the decks know each track's tempo — detected from the
+  content (onset envelope + autocorrelation), persisted per track, shown as
+  native and effective (× tempo) values. No confident beat = honestly `--`.
 - **Library**: SQLite (WAL) with content-hash idempotent rescans, search,
-  playlists, embedded cover art.
+  playlists, embedded cover art — plus a **folder watcher**: added/removed
+  files rescan automatically and the UI updates in place.
+- **Playlists in/out**: export as M3U8 (universal); import M3U/M3U8, PLS,
+  Spotify JSON exports and CSV (Last.fm, Apple Music, generic) — service
+  lists match the local library by title/artist, with an honest
+  matched/unmatched report.
 - **Player page**: waveform seek bar, real-time 16-band spectrum (true FFT of
   what the wire carries), A/B loop, full signal-path diagnostics.
 - **System media keys** work globally (keyboard, Bluetooth headphones, remotes).
@@ -35,16 +52,18 @@ is clean, physical loopback verification can prove it byte-for-byte.
 ```
 aurora-core      domain types; AudioTransformation; integrity contracts
 aurora-decoder   Symphonia decoding; native format detection (F32 MP3/FLAC!);
-                 whole-file waveform peaks
+                 waveform peaks; measured tempo (BPM)
 aurora-dsp       EQ/Freeverb/gain/TPDF-dither/resampler/speed; live recompilation
 aurora-vst       VST3 hosting: scan/load/chain, editor GUI (own process),
                  probe instances for params/presets
 aurora-audio     engine: worker -> SPSC ring -> CPAL; WASAPI exclusive;
                  loopback verification; spectrum (FFT, worker-side); A/B loop
 aurora-metadata  lofty tags; embedded artwork
-aurora-storage   SQLite WAL, idempotent rescans, settings
+aurora-storage   SQLite WAL, idempotent rescans, settings, measured BPM
 aurora-library   scanner/search/playlists
-aurora-tauri     commands: engine, queue, decks, library, VST, artwork
+aurora-kernel    THE MUSIC PLAYER: engine, decks, queue, DSP, VST chain,
+                 library, watcher, playlist import/export, events — no UI deps
+aurora-tauri     thin Tauri shell: command = one kernel call + DTO translation
 aurora-app       composition root; crash-safe file logging
 apps/desktop     Tauri binary (Wry)
 frontend/        modular TS: router + pages (player/queue/library/decks/eq/
@@ -52,7 +71,8 @@ frontend/        modular TS: router + pages (player/queue/library/decks/eq/
 ```
 
 Detailed docs: `docs/ARCHITECTURE.md`, `docs/AUDIO_PIPELINE.md`, ADRs in
-`docs/ADR/` (output model, bit-perfect claims, library identity, VST3 hosting).
+`docs/ADR/` (output model, bit-perfect claims, library identity, VST3 hosting,
+kernel/shell split).
 
 ## Requirements
 
@@ -86,6 +106,14 @@ Installers: `.msi`/NSIS on Windows, `.deb`/`.AppImage` on Linux, `.app`/`.dmg`
 on macOS.
 
 ## Validation gate (required before commits)
+
+One command runs everything (fmt + clippy + tests + tsc + vite build):
+
+```bash
+powershell -ExecutionPolicy Bypass -File check.ps1
+```
+
+Or the long form:
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace

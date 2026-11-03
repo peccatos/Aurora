@@ -52,6 +52,15 @@ pub struct Track {
     pub replaygain_track_db: Option<f64>,
     /// ReplayGain album gain tag in dB, when present.
     pub replaygain_album_db: Option<f64>,
+    /// Detected tempo in beats per minute, when measured.
+    ///
+    /// Measured (not guessed from tags): the analyzer decodes the content
+    /// and derives the beat grid from onset energy. It is `None` until the
+    /// first measurement of this file's content; a rescan never fabricates
+    /// a value. The measurement is honest: a half/double-tempo ambiguity
+    /// is NOT silently resolved — the analyzer keeps the range it actually
+    /// observed (see `aurora-decoder`'s tempo analyzer).
+    pub bpm: Option<f64>,
 }
 
 impl Track {
@@ -73,6 +82,7 @@ impl Track {
             duration_ms: None,
             replaygain_track_db: None,
             replaygain_album_db: None,
+            bpm: None,
         }
     }
 

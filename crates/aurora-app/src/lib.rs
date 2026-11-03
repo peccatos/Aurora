@@ -110,7 +110,7 @@ pub fn compose() -> tauri::Builder<tauri::Wry> {
 async fn shutdown_library(app: &tauri::AppHandle) {
     use tauri::Manager;
     let state = app.state::<aurora_tauri::commands::AppState>();
-    let service = state.library.lock().await.take();
+    let service = state.kernel.library.lock().await.take();
     if let Some(service) = service {
         service.pool().close().await;
         tracing::info!("library closed cleanly (WAL checkpointed)");

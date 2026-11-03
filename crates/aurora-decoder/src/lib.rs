@@ -6,7 +6,9 @@
 pub mod error;
 pub mod pcm;
 pub mod source;
+pub mod tempo;
 
 pub use error::{DecodeError, SourceError};
 pub use pcm::{PcmChunk, frame_size_bytes};
 pub use source::{AudioSource, SourceInfo, waveform_peaks};
+pub use tempo::detect_bpm;

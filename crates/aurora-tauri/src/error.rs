@@ -1,4 +1,8 @@
 //! Error surface for Tauri commands: serializable, never panicking.
+//!
+//! With the kernel split (ADR 0005) the adapter's errors are translations
+//! of `KernelError` — this enum is the wire shape, the kernel owns the
+//! taxonomy.
 
 use serde::Serialize;
 
@@ -37,29 +41,15 @@ impl std::fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-impl From<aurora_audio::EngineError> for CommandError {
-    fn from(err: aurora_audio::EngineError) -> Self {
-        CommandError::Engine {
-            message: err.to_string(),
+impl From<aurora_kernel::KernelError> for CommandError {
+    fn from(err: aurora_kernel::KernelError) -> Self {
+        match err {
+            aurora_kernel::KernelError::Poisoned => CommandError::Poisoned,
+            aurora_kernel::KernelError::Engine { message } => CommandError::Engine { message },
+            aurora_kernel::KernelError::Device(key) => CommandError::Device(key),
+            aurora_kernel::KernelError::Library { message } => CommandError::Library { message },
+            aurora_kernel::KernelError::LibraryNotOpen => CommandError::LibraryNotOpen,
+            aurora_kernel::KernelError::Metadata { message } => CommandError::Metadata { message },
         }
     }
 }
-
-impl From<aurora_storage::StorageError> for CommandError {
-    fn from(err: aurora_storage::StorageError) -> Self {
-        CommandError::Library {
-            message: err.to_string(),
-        }
-    }
-}
-
-impl From<aurora_metadata::MetadataError> for CommandError {
-    fn from(err: aurora_metadata::MetadataError) -> Self {
-        CommandError::Metadata {
-            message: err.to_string(),
-        }
-    }
-}
-
-// Tauri requires errors to implement Serialize (already derived) — no
-// From<std::io::Error> needed since commands do not do IO directly.

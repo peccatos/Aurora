@@ -330,6 +330,24 @@ void listen("media-prev", () => {
   void prevTrack();
 });
 
+// Library watcher (backend): a rescan added/removed tracks on disk —
+// refresh the rail count and re-render whatever page is showing.
+void listen<{ added: number; pruned: number; updated: number }>(
+  "library-changed",
+  (ev) => {
+    const { added, pruned } = ev.payload;
+    setToast(
+      added > 0
+        ? `Library: ${added} new track${added === 1 ? "" : "s"}`
+        : pruned > 0
+          ? `Library: ${pruned} removed`
+          : "Library updated",
+    );
+    refreshActive();
+    void updateRailCount();
+  },
+);
+
 // External file drops (Explorer -> window).
 void registerDrop();
 
@@ -366,7 +384,7 @@ void loadDsp();
 void pollStatus();
 
 // Keep the library count in the rail fresh.
-setInterval(async () => {
+async function updateRailCount(): Promise<void> {
   try {
     const st = await invoke<{ open: boolean; track_count: number }>("library_status");
     const el = document.getElementById("rail-count");
@@ -374,4 +392,5 @@ setInterval(async () => {
   } catch {
     /* not ready */
   }
-}, 5000);
+}
+setInterval(() => void updateRailCount(), 5000);

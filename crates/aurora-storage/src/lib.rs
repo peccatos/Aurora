@@ -170,6 +170,7 @@ fn row_to_track(row: &sqlx::sqlite::SqliteRow) -> Track {
         .try_get::<Option<f64>, _>("replaygain_album_db")
         .ok()
         .flatten();
+    track.bpm = row.try_get::<Option<f64>, _>("bpm").ok().flatten();
     track
 }
 
@@ -188,8 +189,8 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
         r#"
         INSERT INTO tracks (
             id, path, title, artist, album, genre, year, track_number,
-            format, duration_ms, replaygain_track_db, replaygain_album_db
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            format, duration_ms, replaygain_track_db, replaygain_album_db, bpm
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             path = excluded.path,
             title = excluded.title,
@@ -201,7 +202,8 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
             format = excluded.format,
             duration_ms = excluded.duration_ms,
             replaygain_track_db = excluded.replaygain_track_db,
-            replaygain_album_db = excluded.replaygain_album_db
+            replaygain_album_db = excluded.replaygain_album_db,
+            bpm = COALESCE(excluded.bpm, tracks.bpm)
         "#,
     )
     .bind(track.id.0.to_string())
@@ -216,6 +218,7 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
     .bind(track.duration_ms.map(|d| d as i64))
     .bind(track.replaygain_track_db)
     .bind(track.replaygain_album_db)
+    .bind(track.bpm)
     .execute(pool)
     .await?;
     Ok(was_new)
@@ -277,9 +280,43 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<Track>,
 }
 
 // ---------------------------------------------------------------------------
-// Playlists
+// Measured tempo
 // ---------------------------------------------------------------------------
 
+/// Find a track by its library path (the deck flow knows the path).
+///
+/// Returns the domain Track (with id and current bpm) when present.
+pub async fn track_by_path(pool: &SqlitePool, path: &str) -> Result<Option<Track>, StorageError> {
+    let row = sqlx::query("SELECT * FROM tracks WHERE path = ?")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_track))
+}
+
+/// Persist a measured BPM for one track.
+///
+/// Write-only from the analyzer side: this records a measurement that was
+/// actually performed on the content. A NULL `bpm` is a no-op (the
+/// measurement failed; we do not store guesses).
+pub async fn set_track_bpm(
+    pool: &SqlitePool,
+    path: &str,
+    bpm: Option<f64>,
+) -> Result<(), StorageError> {
+    if let Some(bpm) = bpm {
+        sqlx::query("UPDATE tracks SET bpm = ? WHERE path = ?")
+            .bind(bpm)
+            .bind(path)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Playlists
+// ---------------------------------------------------------------------------
 /// Create a playlist; returns its id.
 pub async fn create_playlist(pool: &SqlitePool, name: &str) -> Result<String, StorageError> {
     let id = uuid::Uuid::new_v4().to_string();

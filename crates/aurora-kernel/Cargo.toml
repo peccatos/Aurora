@@ -1,0 +1,26 @@
+[package]
+name = "aurora-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+aurora-decoder.workspace = true
+aurora-dsp.workspace = true
+aurora-vst.workspace = true
+aurora-audio.workspace = true
+aurora-metadata.workspace = true
+aurora-storage.workspace = true
+aurora-library.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+notify.workspace = true
+
+[lints]
+workspace = true

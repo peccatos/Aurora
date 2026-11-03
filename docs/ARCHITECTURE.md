@@ -9,8 +9,13 @@ CPAL, filesystem scanners, or UI code.
 - Audio composes decoder, DSP and CPAL output.
 - Metadata and storage depend on core.
 - Library composes metadata and storage.
-- Tauri adapter exposes application use cases to the frontend.
-- App is the composition root.
+- **Kernel** (ADR 0005) composes the audio crates into the music player —
+  engine, decks, queue, VST chain, library orchestration, events. It has no
+  UI/Tauri/HTTP dependencies; shells (Tauri, future web, third-party players)
+  call it and translate its DTOs.
+- Tauri adapter is a thin shell: one command = one kernel call + DTO
+  translation; kernel events forward to the frontend.
+- App is the composition root (kernel + Tauri shell).
 - Desktop owns the Tauri executable and generated application context.
 
 ## Invariants
@@ -25,6 +30,9 @@ CPAL, filesystem scanners, or UI code.
 8. Device loss is recoverable and must not panic the process.
 9. Every schema change is a migration.
 10. Cross-platform behavior is tested on Windows, Linux and macOS.
+11. Business logic lives in the kernel, never in a shell (ADR 0005): two
+    shells cannot drift apart on what `next_track` means — there is one
+    answer, in the kernel.
 
 ## Audio modes
 

@@ -10,6 +10,7 @@ aurora-core.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+rustfft.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 hound.workspace = true

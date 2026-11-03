@@ -76,6 +76,15 @@ impl LibraryService {
         })
     }
 
+    /// Build a service over an already-open pool (the watcher uses this
+    /// to run scans without going through the managed-state mutex).
+    pub fn from_pool(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            scan_lock: Mutex::new(()),
+        }
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
