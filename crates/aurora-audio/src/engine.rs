@@ -13,11 +13,19 @@ use std::thread::JoinHandle;
 
 use aurora_core::PcmFormat;
 use aurora_decoder::{AudioSource, DecodeError};
-use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Data, OutputCallbackInfo, Stream};
 use ringbuf::{HeapRb, traits::Consumer, traits::Producer, traits::Split};
 
-use crate::device::{OutputDevice, find_by_key, negotiate};
+#[cfg(target_family = "wasm")]
+use crate::vst_stub as vst_host;
+#[cfg(not(target_family = "wasm"))]
+use aurora_vst as vst_host;
+
+#[cfg(not(target_family = "wasm"))]
+use cpal::traits::{DeviceTrait, StreamTrait};
+#[cfg(not(target_family = "wasm"))]
+use cpal::{Data, OutputCallbackInfo, Stream};
+
+use crate::device::OutputDevice;
 use crate::error::EngineError;
 use crate::metrics::PlaybackMetrics;
 
@@ -101,7 +109,7 @@ struct Shared {
 
 /// Live VST chain state shared with the worker.
 pub struct LiveVst {
-    pub list: aurora_vst::VstPluginList,
+    pub list: vst_host::VstPluginList,
     /// Bumped by set_vst; the worker reloads when it differs.
     pub version: u64,
     /// Parameter updates from the editor GUI (id -> normalized value),
@@ -130,7 +138,14 @@ pub struct PlaybackEngine {
     shared: Arc<Shared>,
     metrics: Arc<PlaybackMetrics>,
     state: Mutex<EngineState>,
+    /// Native output stream (CPAL). On wasm the browser-side worklet
+    /// drives output instead — the ring is drained from JS.
+    #[cfg(not(target_family = "wasm"))]
     stream: Option<Stream>,
+    /// Wasm: the ring consumer handed to the JS shell (the AudioWorklet
+    /// side polls it). `None` when not playing.
+    #[cfg(target_family = "wasm")]
+    web_cons: Option<ringbuf::wrap::caching::CachingCons<Arc<HeapRb<u8>>>>,
     /// Wire bytes pushed by the exclusive worker (loopback reference).
     /// Only populated on the exclusive path.
     exclusive_reference: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
@@ -174,7 +189,7 @@ impl PlaybackEngine {
                 seek_rebase: Arc::new(Mutex::new(None)),
                 worker_panicked: Arc::new(AtomicBool::new(false)),
                 vst: Arc::new(Mutex::new(LiveVst {
-                    list: aurora_vst::VstPluginList::default(),
+                    list: vst_host::VstPluginList::default(),
                     version: 0,
                     param_updates: std::collections::HashMap::new(),
                     param_slot: None,
@@ -184,7 +199,10 @@ impl PlaybackEngine {
             }),
             metrics: Arc::new(PlaybackMetrics::new()),
             state: Mutex::new(EngineState::Idle),
+            #[cfg(not(target_family = "wasm"))]
             stream: None,
+            #[cfg(target_family = "wasm")]
+            web_cons: None,
             #[cfg(feature = "win-wasapi")]
             exclusive_stream: None,
             exclusive_reference: None,
@@ -277,12 +295,19 @@ impl PlaybackEngine {
         // output mode, not an error: clicking "Bit-perfect" while a
         // shared-mode stream is playing must switch modes gracefully.
         self.stop_internal();
-        let cpal_device = find_by_key(device.key())?;
         let mut source = AudioSource::open(&path)?;
         let source_format = source.pcm_format();
         // Restart semantics: switching to exclusive while shared-mode
         // playback is running must restart the stream, not error out.
-        let negotiated = negotiate(&cpal_device, source_format)?;
+        // Native: negotiate against the CPAL device. Wasm: the browser
+        // worklet takes f32 at the source rate (see device::imp).
+        #[cfg(not(target_family = "wasm"))]
+        let (negotiated, native_stream_config) = {
+            let device = crate::device::imp::find_by_key(device.key())?;
+            crate::device::imp::negotiate(&device, source_format)?
+        };
+        #[cfg(target_family = "wasm")]
+        let negotiated = crate::device::imp::negotiate(source_format)?;
 
         // The native (untouched) path requires: DSP fully bypassed AND a
         // byte-exact device format match AND no VST3 plugin chain (an
@@ -358,7 +383,7 @@ impl PlaybackEngine {
         let vst_chain = if vst_list.is_empty() {
             None
         } else {
-            match aurora_vst::VstPluginChain::load(&vst_list, &source_format) {
+            match vst_host::VstPluginChain::load(&vst_list, &source_format) {
                 Ok(chain) if !chain.is_passthrough() => {
                     tracing::info!(plugins = ?chain.active_plugin_names(), "vst3 chain attached");
                     Some(chain)
@@ -526,7 +551,7 @@ impl PlaybackEngine {
                                 if new_list.is_empty() || plays_native && compiled_pipeline.as_ref().is_none() {
                                     None
                                 } else {
-                                    match aurora_vst::VstPluginChain::load(&new_list, &source_format)
+                                    match vst_host::VstPluginChain::load(&new_list, &source_format)
                                     {
                                         Ok(c) if !c.is_passthrough() => Some(c),
                                         Ok(_) => None,
@@ -856,21 +881,36 @@ impl PlaybackEngine {
         self.shared.running.store(true, Ordering::Release);
         self.shared.stream_error.store(false, Ordering::Release);
         self.shared.worker_panicked.store(false, Ordering::Release);
-        let stream = build_stream(
-            &cpal_device,
-            &negotiated,
-            cons,
-            cb_metrics,
-            cb_state_finished,
-            cb_stream_error,
-        )?;
 
-        stream
-            .play()
-            .map_err(|e| EngineError::StreamBuild(e.to_string()))?;
+        // Native: build the CPAL stream that drains the ring in its
+        // real-time callback. Wasm: the ring's consumer is handed to the
+        // JS shell (AudioWorklet drains it; see web_output).
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let cpal_device = crate::device::imp::find_by_key(device.key())?;
+            let stream = build_stream(
+                &cpal_device,
+                negotiated.pcm,
+                native_stream_config,
+                cons,
+                cb_metrics,
+                cb_state_finished,
+                cb_stream_error,
+            )?;
+
+            stream
+                .play()
+                .map_err(|e| EngineError::StreamBuild(e.to_string()))?;
+
+            self.stream = Some(stream);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (cb_metrics, cb_state_finished, cb_stream_error);
+            self.web_cons = Some(cons);
+        }
 
         self.metrics.reset();
-        self.stream = Some(stream);
         self.worker = Some(worker);
         self.source_duration_ms = source_duration_ms;
         self.negotiated = Some(negotiated.pcm);
@@ -1061,13 +1101,16 @@ impl PlaybackEngine {
     /// starve live-DSP updates and seek.
     pub fn pause(&mut self) -> Result<(), EngineError> {
         self.shared.paused.store(true, Ordering::Release);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(stream) = &self.stream {
             stream
                 .pause()
                 .map_err(|e| EngineError::StreamBuild(e.to_string()))?;
-            *self.state.lock().expect("state mutex") = EngineState::Paused;
-            tracing::info!("playback paused");
         }
+        // Wasm: the worklet checks the shared paused flag; no stream to
+        // pause natively.
+        *self.state.lock().expect("state mutex") = EngineState::Paused;
+        tracing::info!("playback paused");
         Ok(())
     }
 
@@ -1075,13 +1118,14 @@ impl PlaybackEngine {
     pub fn resume(&mut self) -> Result<(), EngineError> {
         self.shared.paused.store(false, Ordering::Release);
         self.shared.drain.store(false, Ordering::Release);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(stream) = &self.stream {
             stream
                 .play()
                 .map_err(|e| EngineError::StreamBuild(e.to_string()))?;
-            *self.state.lock().expect("state mutex") = EngineState::Playing;
-            tracing::info!("playback resumed");
         }
+        *self.state.lock().expect("state mutex") = EngineState::Playing;
+        tracing::info!("playback resumed");
         Ok(())
     }
 
@@ -1143,7 +1187,7 @@ impl PlaybackEngine {
     /// isolated helper processes, so a crashing plugin never touches the
     /// player. Takes effect on the DSP path; exclusive mode refuses while
     /// a chain is configured.
-    pub fn set_vst(&self, list: aurora_vst::VstPluginList) {
+    pub fn set_vst(&self, list: vst_host::VstPluginList) {
         if let Ok(mut live) = self.shared.vst.lock() {
             live.list = list;
             live.version = live.version.wrapping_add(1);
@@ -1151,7 +1195,7 @@ impl PlaybackEngine {
     }
 
     /// The currently-configured VST3 plugin chain (paths + class ids).
-    pub fn vst_chain(&self) -> aurora_vst::VstPluginList {
+    pub fn vst_chain(&self) -> vst_host::VstPluginList {
         self.shared
             .vst
             .lock()
@@ -1345,7 +1389,14 @@ impl PlaybackEngine {
         self.exclusive_reference = None;
         // Drop the stream (stops the callback); the worker dropped its
         // producer on exit, closing the ring for writes.
-        self.stream = None;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.stream = None;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            self.web_cons = None;
+        }
         self.shared.finished.store(false, Ordering::Release);
         self.shared.track_ended.store(false, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
@@ -1368,16 +1419,18 @@ impl Default for PlaybackEngine {
 }
 
 /// Build the output stream with the real-time callback.
+#[cfg(not(target_family = "wasm"))]
 fn build_stream(
     device: &cpal::Device,
-    config: &crate::device::NegotiatedConfig,
+    pcm: aurora_core::PcmFormat,
+    native: crate::device::imp::NativeConfig,
     mut cons: ringbuf::wrap::caching::CachingCons<Arc<HeapRb<u8>>>,
     metrics: Arc<PlaybackMetrics>,
     finished: Arc<AtomicBool>,
     stream_error: Arc<AtomicBool>,
 ) -> Result<Stream, EngineError> {
-    let pcm = config.pcm;
-    let device_format = config.device_sample_format;
+    let pcm = pcm;
+    let device_format = native.device_sample_format;
 
     // Phase 8 device-loss path: the error callback flags the failure; the
     // app layer polls `take_stream_error` and recovers (stop + optional
@@ -1397,7 +1450,7 @@ fn build_stream(
     // which is representation-agnostic and never allocates.
     let stream = device
         .build_output_stream_raw(
-            config.stream_config,
+            native.stream_config,
             device_format,
             move |data: &mut Data, _info: &OutputCallbackInfo| {
                 callback(&mut cons, data.bytes_mut(), &metrics, &finished, pcm);

@@ -9,24 +9,34 @@ license.workspace = true
 aurora-core.workspace = true
 aurora-decoder.workspace = true
 aurora-dsp.workspace = true
-aurora-vst.workspace = true
 aurora-metadata.workspace = true
-aurora-storage.workspace = true
-aurora-library.workspace = true
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Native (desktop) extras: VST hosting, SQLite persistence, folder
+# watcher, full tokio. The wasm build (Aurora Web) keeps the music core
+# (engine/DSP/BPM/queue/metadata); storage is IndexedDB on the JS side,
+# VST is impossible in a browser, and FS watching has no filesystem.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+aurora-vst.workspace = true
+aurora-storage.workspace = true
+aurora-library.workspace = true
 notify.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "time"] }
+aurora-audio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI exclusive path on Windows builds (default on for the desktop
 # app; off on other platforms — see aurora-audio's win-wasapi feature).
 aurora-audio = { workspace = true, features = ["win-wasapi"] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(all(not(windows), not(target_family = "wasm")))'.dependencies]
 aurora-audio.workspace = true
 
 [features]

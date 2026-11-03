@@ -22,6 +22,18 @@ pub mod exclusive_stream;
 #[cfg(feature = "win-wasapi")]
 pub mod loopback;
 
+/// No-op VST3 stand-in for the wasm build (Aurora Web): native plugins
+/// cannot load in a browser. Identity processing, honest empty chains.
+#[cfg(target_family = "wasm")]
+pub(crate) mod vst_stub;
+
+/// The VST chain types the engine integrates with: the real host
+/// natively, the no-op stub on wasm. Same wire shape on both.
+#[cfg(not(target_family = "wasm"))]
+pub use aurora_vst::VstPluginList;
+#[cfg(target_family = "wasm")]
+pub use vst_stub::VstPluginList;
+
 pub use device::{OutputDevice, default_output_device, output_devices};
 pub use engine::{EngineState, PlaybackEngine};
 pub use error::EngineError;

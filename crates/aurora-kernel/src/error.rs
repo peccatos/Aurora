@@ -35,6 +35,7 @@ impl From<aurora_metadata::MetadataError> for KernelError {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<aurora_storage::StorageError> for KernelError {
     fn from(e: aurora_storage::StorageError) -> Self {
         KernelError::Library {

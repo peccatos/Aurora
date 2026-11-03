@@ -5,6 +5,11 @@
 //! crates (decoder, DSP, VST, audio engine, metadata, storage, library)
 //! and owns no UI, no Tauri, no HTTP. Honesty contracts (ADR 0002)
 //! travel with it: a shell can display verdicts, never fake them.
+//!
+//! The wasm build (Aurora Web) keeps the music core — engine, DSP,
+//! decks, queue, BPM, metadata, playlist formats. SQLite persistence,
+//! the folder watcher and native VST hosting are native-only; on wasm
+//! the JS shell owns storage (IndexedDB) and there is no filesystem.
 
 pub mod artwork;
 pub mod decks;
@@ -14,6 +19,8 @@ pub mod events;
 pub mod kernel;
 pub mod playlist_io;
 pub mod queue;
+
+#[cfg(not(target_family = "wasm"))]
 pub mod watch;
 
 pub use decks::Deck;

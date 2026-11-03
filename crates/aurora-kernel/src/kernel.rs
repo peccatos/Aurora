@@ -34,13 +34,16 @@ pub struct PlayerKernel {
     /// Playback queue with the current index.
     pub queue: Mutex<TrackQueue>,
     /// Track library (SQLite + scanner). None until `open_library` runs.
+    /// Native only: the wasm build has no SQLite (JS shell owns storage).
+    #[cfg(not(target_family = "wasm"))]
     pub library: tokio::sync::Mutex<Option<aurora_library::LibraryService>>,
     /// Library database path (None = library not opened yet).
     pub library_path_slot: Mutex<Option<PathBuf>>,
     /// Selected output device key ("" = default). Persisted to settings.
     pub device_key: Mutex<Option<String>>,
     /// Open plugin editor GUI session (one at a time; the window owns
-    /// its own GUI thread with a Win32 message pump).
+    /// its own GUI thread with a Win32 message pump). Native only.
+    #[cfg(not(target_family = "wasm"))]
     pub vst_gui: Mutex<Option<aurora_vst::PluginGui>>,
     /// DJ decks (Pioneer DDJ-1000-style): each deck is a fully
     /// independent playback stream — own engine, own DSP, own cue
@@ -65,9 +68,11 @@ impl PlayerKernel {
             engine: Mutex::new(PlaybackEngine::new()),
             dsp: Mutex::new(aurora_dsp::DspConfig::default()),
             queue: Mutex::new(TrackQueue::default()),
+            #[cfg(not(target_family = "wasm"))]
             library: tokio::sync::Mutex::new(None),
             library_path_slot: Mutex::new(None),
             device_key: Mutex::new(None),
+            #[cfg(not(target_family = "wasm"))]
             vst_gui: Mutex::new(None),
             decks: Mutex::new([Deck::new(), Deck::new()]),
             crossfader: Mutex::new(0.0),
@@ -509,7 +514,9 @@ impl PlayerKernel {
     }
 
     pub fn set_vst_chain(&self, slots: Vec<VstSlotDto>) -> Result<PlaybackStatus, KernelError> {
-        let list = aurora_vst::VstPluginList {
+        // The engine's VST types come from the real host natively and from
+        // the no-op stub on wasm; the wire shape (slots) is identical.
+        let list = aurora_audio::VstPluginList {
             slots: slots.into_iter().map(|s| (s.path, s.class_id)).collect(),
         };
         let engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
@@ -558,6 +565,7 @@ impl PlayerKernel {
     }
 
     /// Apply a preset file to a chain slot (live, no restart).
+    #[cfg(not(target_family = "wasm"))]
     pub fn load_vst_preset(
         &self,
         path: &str,
@@ -587,6 +595,7 @@ impl PlayerKernel {
     /// is captured for the GUI callback thread. The engine lives in the
     /// kernel for the whole app lifetime; the callback only calls
     /// `set_vst_params`, which locks the shared mutex.
+    #[cfg(not(target_family = "wasm"))]
     pub fn open_vst_editor(&self, path: &str, class_id: &str) -> Result<(), KernelError> {
         let mut gui_slot = self.vst_gui.lock().map_err(|_| KernelError::Poisoned)?;
         if let Some(mut old) = gui_slot.take() {
@@ -619,6 +628,7 @@ impl PlayerKernel {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn close_vst_editor(&self) -> Result<(), KernelError> {
         let mut gui_slot = self.vst_gui.lock().map_err(|_| KernelError::Poisoned)?;
         if let Some(mut gui) = gui_slot.take() {
@@ -847,6 +857,7 @@ impl PlayerKernel {
     /// analyzer (spawn_blocking — it decodes the file) and persist the
     /// measurement. `None` both when the track has no confident beat and
     /// when the library is not open (decks work without a library too).
+    #[cfg(not(target_family = "wasm"))]
     pub async fn measure_track_bpm(&self, path: &str) -> Option<f64> {
         let library = self.library.lock().await;
         let service = library.as_ref()?;
@@ -876,6 +887,19 @@ impl PlayerKernel {
         }
     }
 
+    /// Wasm: measure without the SQLite cache — the analyzer runs (the
+    /// decoder is pure Rust, works in the browser); persistence is the
+    /// JS shell's business (IndexedDB).
+    #[cfg(target_family = "wasm")]
+    pub async fn measure_track_bpm(&self, path: &str) -> Option<f64> {
+        let path_owned = path.to_string();
+        // spawn_blocking is unavailable on single-threaded wasm; the
+        // analyzer runs inline (it is CPU-bound but bounded by duration).
+        aurora_decoder::detect_bpm(std::path::Path::new(&path_owned))
+            .ok()
+            .flatten()
+    }
+
     /// Measured tempo of a track by library path (cache-first; runs the
     /// analyzer when not yet measured). `None` = no confident periodic
     /// beat, which is a measurement result, not an error.
@@ -887,6 +911,7 @@ impl PlayerKernel {
     // Library
     // -----------------------------------------------------------------
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn library_status(&self) -> Result<LibraryStatus, KernelError> {
         let count = {
             let slot = self.library.lock().await;
@@ -911,6 +936,7 @@ impl PlayerKernel {
     }
 
     /// Open (or create) the library database at `path`.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn open_library(&self, path: &str) -> Result<LibraryStatus, KernelError> {
         let service = aurora_library::LibraryService::open(std::path::Path::new(path))
             .await
@@ -934,6 +960,7 @@ impl PlayerKernel {
     }
 
     /// Scan a folder into the library; remembers the root.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn scan_folder(
         &self,
         root: &str,
@@ -954,6 +981,7 @@ impl PlayerKernel {
     }
 
     /// Rescan every known library root.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn rescan_all(&self) -> Result<aurora_library::ScanSummary, KernelError> {
         let library = self.library.lock().await;
         let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -978,6 +1006,7 @@ impl PlayerKernel {
         Ok(total)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn list_tracks(&self) -> Result<Vec<TrackDto>, KernelError> {
         let library = self.library.lock().await;
         let tracks = library
@@ -992,6 +1021,7 @@ impl PlayerKernel {
         Ok(tracks.iter().map(TrackDto::from_track).collect())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn search_library(&self, query: &str) -> Result<Vec<TrackDto>, KernelError> {
         let library = self.library.lock().await;
         let tracks = library
@@ -1010,6 +1040,7 @@ impl PlayerKernel {
     // Settings
     // -----------------------------------------------------------------
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, KernelError> {
         let library = self.library.lock().await;
         let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -1020,6 +1051,7 @@ impl PlayerKernel {
         Ok(value)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), KernelError> {
         let library = self.library.lock().await;
         let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -1040,11 +1072,13 @@ impl PlayerKernel {
     }
 
     /// The library pool (for watcher startup; None when not open).
+    #[cfg(not(target_family = "wasm"))]
     pub async fn library_pool(&self) -> Option<aurora_storage::SqlitePool> {
         self.library.lock().await.as_ref().map(|s| s.pool().clone())
     }
 
     /// Library roots as PathBufs (watcher startup).
+    #[cfg(not(target_family = "wasm"))]
     pub async fn library_roots(&self) -> Result<Vec<PathBuf>, KernelError> {
         let library = self.library.lock().await;
         let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -1060,6 +1094,7 @@ impl PlayerKernel {
     // -----------------------------------------------------------------
 
     /// Create a playlist; returns its id.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn create_playlist(&self, name: &str) -> Result<String, KernelError> {
         let library = self.library.lock().await;
         let lib = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -1072,6 +1107,7 @@ impl PlayerKernel {
         Ok(id)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn rename_playlist(
         &self,
         playlist_id: &str,
@@ -1088,6 +1124,7 @@ impl PlayerKernel {
         res
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn delete_playlist(&self, playlist_id: &str) -> Result<(), KernelError> {
         let library = self.library.lock().await;
         let lib = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
@@ -1100,6 +1137,7 @@ impl PlayerKernel {
         res
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn list_playlists(&self) -> Result<Vec<aurora_core::Playlist>, KernelError> {
         let library = self.library.lock().await;
         let playlists = {
@@ -1115,6 +1153,7 @@ impl PlayerKernel {
     }
 
     /// Set playlist contents (track ids, order preserved).
+    #[cfg(not(target_family = "wasm"))]
     pub async fn set_playlist_tracks(
         &self,
         playlist_id: &str,
@@ -1137,6 +1176,7 @@ impl PlayerKernel {
     }
 
     /// Playlist tracks as full DTOs, in saved order.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TrackDto>, KernelError> {
         let library = self.library.lock().await;
         let tracks = {
@@ -1158,6 +1198,7 @@ impl PlayerKernel {
     /// own folder; service entries match the local library by (title,
     /// artist), case-insensitive on both. Unmatched entries are
     /// reported, never fabricated as tracks.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn import_playlist(&self, path: &str) -> Result<ImportReport, KernelError> {
         let path_buf = PathBuf::from(path);
         let raw = tokio::fs::read_to_string(&path_buf)
@@ -1286,6 +1327,7 @@ impl PlayerKernel {
     }
 
     /// Export a playlist as M3U8 to `dest` (absolute paths + EXTINF).
+    #[cfg(not(target_family = "wasm"))]
     pub async fn export_playlist(&self, playlist_id: &str, dest: &str) -> Result<(), KernelError> {
         let library = self.library.lock().await;
         let tracks = {
@@ -1321,6 +1363,7 @@ impl PlayerKernel {
 
     /// Persist the VST chain (slots) into the library settings so it
     /// survives restarts. `None` clears the stored chain.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn save_vst_chain_setting(
         &self,
         slots: Option<Vec<VstSlotDto>>,
@@ -1341,6 +1384,7 @@ impl PlayerKernel {
     }
 
     /// The persisted VST chain, restored at app start.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn load_vst_chain_setting(&self) -> Result<Option<Vec<VstSlotDto>>, KernelError> {
         let library = self.library.lock().await;
         let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;

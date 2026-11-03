@@ -9,15 +9,19 @@ license.workspace = true
 aurora-core.workspace = true
 aurora-decoder.workspace = true
 aurora-dsp.workspace = true
-aurora-vst.workspace = true
-cpal.workspace = true
 ringbuf.workspace = true
 rustfft.workspace = true
 serde.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing.workspace = true
+
+# Native (non-wasm) audio path: CPAL output + VST3 hosting.
+# The wasm build (Aurora Web) drives output from an AudioWorklet on the
+# JS side and has no native plugins — both are off there.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+cpal.workspace = true
+aurora-vst.workspace = true
 
 [dev-dependencies]
 hound.workspace = true
@@ -26,7 +30,7 @@ tempfile.workspace = true
 
 [features]
 # WASAPI exclusive output + loopback verification. Defaulted ON for
-# Windows targets via the workspace default-members mechanism; other
+# Windows targets via the platform dependency in aurora-kernel; other
 # platforms build the shared CPAL path (the exclusive APIs honestly
 # return "unavailable" — ADR 0002, never a fake verdict).
 default = []
