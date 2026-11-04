@@ -113,6 +113,10 @@ pub struct DspPipeline {
     resample_inbuf: Vec<f32>,
     /// Channels of the stream (for frame<->sample math on the buffer).
     channels: u16,
+    /// Output channel count after the final remix stage (W7 gapless:
+    /// mono<->stereo must convert ENGINE-side so track changes never
+    /// restart the JS bridge). Equals `channels` when no remix.
+    target_channels: u16,
     /// ReplayGain tag value for the current track (dB), if a mode uses it.
     replaygain_db: Option<f32>,
     resampler: Option<Resampler>,
@@ -133,6 +137,27 @@ impl DspPipeline {
         source_format: PcmFormat,
         target_rate: Option<u32>,
         replaygain_db: Option<f32>,
+    ) -> Result<Self, DspError> {
+        Self::compile_channels(
+            config,
+            source_format,
+            target_rate,
+            replaygain_db,
+            source_format.channels,
+        )
+    }
+
+    /// Like [`compile`], with an explicit output channel count (the
+    /// wasm negotiator targets the DEVICE channels so mixed-channel
+    /// libraries never restart the output bridge; the remix is a
+    /// reported ChannelRemapping transformation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_channels(
+        config: &DspConfig,
+        source_format: PcmFormat,
+        target_rate: Option<u32>,
+        replaygain_db: Option<f32>,
+        target_channels: u16,
     ) -> Result<Self, DspError> {
         let eq_chain = if config.eq.is_bypassed() {
             None
@@ -211,6 +236,7 @@ impl DspPipeline {
             resampler,
             resample_inbuf: Vec::new(),
             channels: source_format.channels,
+            target_channels,
             source_format,
             target_rate: target_rate.filter(|_t| needs_resample),
             clipped: false,
@@ -240,7 +266,12 @@ impl DspPipeline {
         self.clipped |= self.volume.process_interleaved(interleaved);
 
         let Some(rs) = self.resampler.as_mut() else {
-            return std::mem::take(interleaved);
+            let taken = std::mem::take(interleaved);
+            return remix_channels(
+                taken,
+                usize::from(self.channels),
+                usize::from(self.target_channels),
+            );
         };
 
         // Feed the carry-over buffer, then emit every complete block the
@@ -269,7 +300,11 @@ impl DspPipeline {
                 }
             }
         }
-        out
+        remix_channels(
+            out,
+            usize::from(self.channels),
+            usize::from(self.target_channels),
+        )
     }
 
     /// Drop samples buffered from before a seek: pre-seek audio inside
@@ -306,7 +341,11 @@ impl DspPipeline {
             out.extend(tail);
         }
         self.resample_inbuf.clear();
-        out
+        remix_channels(
+            out,
+            usize::from(self.channels),
+            usize::from(self.target_channels),
+        )
     }
 
     /// Whether clipping protection engaged since the last call.
@@ -352,6 +391,54 @@ impl DspPipeline {
             && self.replaygain_db.is_none()
             && self.resampler.is_none()
     }
+}
+
+/// Interleaved channel remix: up-mix (mono -> N: duplicate) or
+/// down-mix (N -> mono: equal-weight average; N -> 2: pairs averaged).
+/// Identity when the counts match. Honest DSP: linear, reported as
+/// ChannelRemapping by the caller.
+fn remix_channels(mut samples: Vec<f32>, from: usize, to: usize) -> Vec<f32> {
+    if from == to || from == 0 || to == 0 || samples.is_empty() {
+        return samples;
+    }
+    if !samples.len().is_multiple_of(from) {
+        // Partial frame (should not happen post-resampler): drop it
+        // rather than misalign channels.
+        samples.truncate(samples.len() - samples.len() % from);
+    }
+    let frames = samples.len() / from;
+    let mut out = Vec::with_capacity(frames * to);
+    for f in 0..frames {
+        let frame = &samples[f * from..(f + 1) * from];
+        if to > from {
+            // Up-mix: mono -> stereo duplicates; any -> N spreads mono.
+            if from == 1 {
+                for _ in 0..to {
+                    out.push(frame[0]);
+                }
+            } else {
+                // Channel growth beyond duplication is not a real case
+                // (browser outputs are 2ch); pass frame + zero pad.
+                for ch in 0..to {
+                    out.push(frame.get(ch).copied().unwrap_or(0.0));
+                }
+            }
+        } else {
+            // Down-mix: equal-weight average across the source channels.
+            let sum: f32 = frame.iter().sum();
+            let avg = sum / from as f32;
+            if to == 1 {
+                out.push(avg);
+            } else {
+                // N -> 2: fold pairs, preserve balance.
+                for ch in 0..to {
+                    let idx = ch * from / to;
+                    out.push(frame.get(idx).copied().unwrap_or(avg));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

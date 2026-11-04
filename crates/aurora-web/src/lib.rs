@@ -116,6 +116,51 @@ impl WebKernel {
         aurora_audio::device::set_output_rate(rate);
     }
 
+    /// The browser output channel count (W7 gapless): with it, the
+    /// engine remixes mono<->stereo itself, so a mixed-channel queue
+    /// never changes the bridge's stream format (a format change would
+    /// restart the loop = an audible gap between tracks).
+    pub fn set_output_channels(&self, channels: u32) {
+        aurora_audio::device::set_output_channels(channels);
+    }
+
+    /// R128 loudness measurement (W8): integrated LUFS of decoded
+    /// audio bytes. The JS shell runs this at ingest and stores the
+    /// value; playback feeds it through the existing ReplayGain gain
+    /// stage (mode "track") — normalized loudness with zero new
+    /// audio-path code. Returns None honestly when the audio is too
+    /// short/quiet to measure.
+    pub fn analyze_lufs(&self, bytes: &[u8], extension: &str) -> Result<Option<f64>, JsValue> {
+        let source = aurora_decoder::AudioSource::open_from_bytes(bytes.to_vec(), extension)
+            .map_err(|e| JsValue::from_str(&format!("decode for lufs: {e}")))?;
+        let format = source.pcm_format();
+        let channels = usize::from(format.channels.max(1));
+        let mut decoded = Vec::new();
+        let mut source = source;
+        loop {
+            match source.next_chunk() {
+                Ok(chunk) => {
+                    let s = chunk.to_f32_interleaved();
+                    if !s.is_empty() {
+                        decoded.extend(s);
+                        // Bound the analysis: 60 s of audio is plenty
+                        // for a stable integrated value.
+                        let cap = format.sample_rate as usize * 60 * channels;
+                        if decoded.len() >= cap {
+                            break;
+                        }
+                    }
+                }
+                Err(aurora_decoder::DecodeError::EndOfStream) => break,
+                Err(_) => break, // honest: measure what we got
+            }
+        }
+        Ok(
+            aurora_dsp::lufs::integrated_lufs(&decoded, channels, format.sample_rate)
+                .map(f64::from),
+        )
+    }
+
     // -----------------------------------------------------------------
     // Queue
     // -----------------------------------------------------------------

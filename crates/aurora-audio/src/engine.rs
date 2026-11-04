@@ -390,11 +390,12 @@ impl PlaybackEngine {
                 None
             };
             Some(
-                aurora_dsp::DspPipeline::compile(
+                aurora_dsp::DspPipeline::compile_channels(
                     &dsp,
                     source_format,
                     rate_target,
                     rg_tag_for_mode(&dsp, rg_track_db, rg_album_db),
+                    negotiated.pcm.channels,
                 )
                 .map_err(EngineError::from)?,
             )

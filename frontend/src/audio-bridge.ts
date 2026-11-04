@@ -58,15 +58,18 @@ export async function startOutput(rate: number, ch: number): Promise<void> {
     deviceRateTold = true;
     try {
       k0.set_output_rate(ctx.sampleRate);
+      k0.set_output_channels(2);
     } catch {
       /* older binary without the API — browser resampling remains */
     }
   }
-  if (running && (rate !== sampleRate || ch !== channels)) {
-    // Format change (track with a different rate/channels): the old
-    // loop's scheduled buffers carry OLD-format bytes — playing them
-    // at the new rate is pitch-shift ("frequencies jumping"). Full
-    // restart: drop everything, re-claim with the new parameters.
+  if (running && rate !== sampleRate) {
+    // RATE change is impossible now (the engine always outputs the
+    // device rate) — but if a stale binary passes source rate through,
+    // a rate change still means a full restart (old buffers at a new
+    // rate = pitch shift). Channel changes do NOT restart: the engine
+    // remixes to the device channel count, the bridge format never
+    // changes (W7 gapless).
     stopOutput();
   }
   sampleRate = rate;

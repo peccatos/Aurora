@@ -29,8 +29,17 @@ export interface TrackTags {
 }
 
 export async function readTrackTags(file: File): Promise<TrackTags> {
+  // Bounded parse: music-metadata can hang indefinitely on some files
+  // in browser streams (a deadlock in the duration pass). A tag read
+  // that cannot finish in 5s is worth nothing — the filename fallback
+  // covers it (honest degradation, never a stuck ingest).
   try {
-    const mm = await parseBlob(file, { duration: true });
+    const mm = await Promise.race([
+      parseBlob(file, { duration: true }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("tag parse timeout")), 5000),
+      ),
+    ]);
     const c = mm.common;
     return {
       title: c.title?.trim() || null,

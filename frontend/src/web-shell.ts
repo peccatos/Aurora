@@ -1,14 +1,22 @@
-/** YTM-style web shell (Aurora Web).
+/** Aurora Web shell — YTM-faithful layout (design direction winner).
  *
- * When the app runs in a plain browser (no Tauri), this shell renders
- * the YouTube Music layout one-to-one: sidebar + shelves + player bar
- * (desktop), bottom tabs + miniplayer (mobile). The pages mounted
- * inside are the SAME page modules the desktop shell uses — the router
- * doesn't care which shell hosts it.
+ * Anatomy (YTM): left guide rail + collapsible sidebar, top bar with
+ * search pill, routed content, bottom player bar (72px) with volume +
+ * quality badge, right queue drawer (340px), mobile tabs + miniplayer.
+ * The one deliberate deviation: Braun-orange accent instead of YTM red
+ * (owner's veto on a literal Google look — one-file swap if reverted).
  */
 
 import { platform, invoke } from "./invoke";
-import { app, loadStatus, nextTrack, playQueueIndex, prevTrack, setQueue, setToast } from "./state";
+import {
+  app,
+  loadStatus,
+  nextTrack,
+  playQueueIndex,
+  prevTrack,
+  setToast,
+  subscribe,
+} from "./state";
 import { unlockAudio, flushOutput } from "./audio-bridge";
 import { icon, type IconName } from "./styles/ytm-icons";
 import "./styles/ytm.css";
@@ -28,22 +36,24 @@ const NAV: NavEntry[] = [
   { route: "home", label: "Home", icon: "home" },
   { route: "library", label: "Explore", icon: "explore" },
   { route: "queue", label: "Queue", icon: "queue" },
-  { route: "eq", label: "EQ", icon: "more" },
+];
+
+const LIBRARY_NAV: NavEntry[] = [
+  { route: "eq", label: "Equalizer", icon: "more" },
   { route: "settings", label: "Settings", icon: "more" },
 ];
 
 // Decks are NATIVE-ONLY for now: the wasm bridge drains only the main
-// engine's ring — deck engines (Deck::engine) have no consumer on the
-// web, so deck_play would report "playing" with permanent silence
-// (a dishonest status per ADR 0002). Hidden until the ring mixer lands.
+// engine's ring — deck engines have no consumer on the web, so
+// deck_play would report "playing" with permanent silence (a dishonest
+// status per ADR 0002). Hidden until the ring mixer lands.
 const MOBILE_TABS: NavEntry[] = [
   { route: "home", label: "Home", icon: "home" },
   { route: "library", label: "Explore", icon: "explore" },
   { route: "queue", label: "Queue", icon: "queue" },
 ];
 
-/** Render the YTM shell into #app. Returns the content root + nav
- *  elements the router needs. */
+/** Render the shell into #app. Returns the content root + nav elements. */
 export function renderWebShell(root: HTMLElement): {
   content: HTMLElement;
   sidebar: HTMLElement;
@@ -60,11 +70,26 @@ export function renderWebShell(root: HTMLElement): {
           </svg>
           <span>Aurora</span>
         </div>
+        <p class="ytm-nav-section">Main</p>
         ${NAV.map(
           (n) =>
             `<button class="ytm-nav-item" data-route="${n.route}" type="button">${icon(n.icon)}<span>${n.label}</span></button>`,
         ).join("\n        ")}
+        <p class="ytm-nav-section">Library</p>
+        ${LIBRARY_NAV.map(
+          (n) =>
+            `<button class="ytm-nav-item" data-route="${n.route}" type="button">${icon(n.icon)}<span>${n.label}</span></button>`,
+        ).join("\n        ")}
       </nav>
+
+      <header class="ytm-topbar" id="ytm-topbar">
+        <button class="ytm-btn-icon" id="ytm-guide-toggle" type="button" title="Toggle menu">${icon("more")}</button>
+        <div class="ytm-search" id="ytm-topbar-search">
+          ${icon("search", 20)}
+          <input id="ytm-search-input" type="search" placeholder="Search songs, artists" autocomplete="off" />
+          <button class="ytm-btn-icon" id="ytm-search-clear" type="button" title="Clear" hidden>${icon("close", 18)}</button>
+        </div>
+      </header>
 
       <main class="ytm-content" id="ytm-content"></main>
 
@@ -83,6 +108,14 @@ export function renderWebShell(root: HTMLElement): {
             `<button class="ytm-tab" data-route="${t.route}" type="button">${icon(t.icon)}<span>${t.label}</span></button>`,
         ).join("\n        ")}
       </nav>
+
+      <aside class="ytm-drawer" id="ytm-drawer" aria-label="Queue">
+        <header class="ytm-drawer-head">
+          <span class="ytm-drawer-title">Queue</span>
+          <button class="ytm-btn-icon" id="ytm-drawer-close" type="button" title="Close">${icon("close", 20)}</button>
+        </header>
+        <div class="ytm-drawer-body" id="ytm-drawer-body"></div>
+      </aside>
 
       <footer class="ytm-player">
         <div class="ytm-player-now" id="ytm-now">
@@ -106,12 +139,63 @@ export function renderWebShell(root: HTMLElement): {
           </div>
         </div>
         <div class="ytm-player-right">
+          <button class="ytm-btn-icon" id="ytm-drawer-toggle" type="button" title="Queue">${icon("queue")}</button>
+          <span class="ytm-quality" id="ytm-quality" hidden></span>
           <span class="ytm-player-artist" id="ytm-state">IDLE</span>
         </div>
       </footer>
     </div>
     <p class="toast" id="toast" role="status"></p>
   `;
+
+  // Guide collapse (YTM hamburger): persisted.
+  const guideToggle = document.getElementById("ytm-guide-toggle");
+  guideToggle?.addEventListener("click", () => {
+    const el = document.querySelector<HTMLElement>(".ytm-app");
+    if (!el) return;
+    const collapsed = el.classList.toggle("guide-collapsed");
+    try {
+      localStorage.setItem("aw:guide-collapsed", collapsed ? "1" : "0");
+    } catch {
+      /* private mode */
+    }
+  });
+  try {
+    if (localStorage.getItem("aw:guide-collapsed") === "1") {
+      document.querySelector<HTMLElement>(".ytm-app")?.classList.add("guide-collapsed");
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Topbar search: routes to home and drives its search input.
+  const topSearch = document.getElementById("ytm-search-input") as HTMLInputElement | null;
+  const forward = (value: string) => {
+    const homeInput = document.querySelector<HTMLInputElement>("#home-search-input");
+    if (homeInput) homeInput.value = value;
+    homeInput?.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  topSearch?.addEventListener("input", () => {
+    const clear = document.getElementById("ytm-search-clear");
+    if (clear) clear.hidden = topSearch.value.length === 0;
+    if (window.location.hash !== "#/home") window.location.hash = "#/home";
+    forward(topSearch.value);
+  });
+  document.getElementById("ytm-search-clear")?.addEventListener("click", () => {
+    if (topSearch) topSearch.value = "";
+    const clear = document.getElementById("ytm-search-clear");
+    if (clear) clear.hidden = true;
+    forward("");
+  });
+
+  // Drawer open/close.
+  const drawer = document.getElementById("ytm-drawer");
+  document.getElementById("ytm-drawer-toggle")?.addEventListener("click", () => {
+    drawer?.classList.toggle("open");
+  });
+  document.getElementById("ytm-drawer-close")?.addEventListener("click", () => {
+    drawer?.classList.remove("open");
+  });
 
   return {
     content: document.getElementById("ytm-content")!,
@@ -121,7 +205,7 @@ export function renderWebShell(root: HTMLElement): {
 }
 
 // ---------------------------------------------------------------------------
-// YTM player bar behavior (bound after the shell renders)
+// Player bar behavior (bound after the shell renders)
 // ---------------------------------------------------------------------------
 
 function fmtTime(s: number): string {
@@ -171,7 +255,12 @@ export function bindWebPlayerBar(): void {
     }
   });
   now?.addEventListener("click", () => {
-    // Fullscreen now-playing: swap the content for the player page.
+    window.location.hash = "#/player";
+  });
+  // Mobile miniplayer tap -> fullscreen (same route; CSS handles the
+  // mobile presentation).
+  document.getElementById("ytm-mini")?.addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest("button")) return; // transport btn
     window.location.hash = "#/player";
   });
 
@@ -188,9 +277,16 @@ export function bindWebPlayerBar(): void {
       seeking = false;
     }
   });
+
+  // Esc closes the drawer (and the fullscreen player back).
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      document.getElementById("ytm-drawer")?.classList.remove("open");
+    }
+  });
 }
 
-/** Update the YTM bar from status (called from the status poll). */
+/** Update the player bar from status (status poll). */
 export function renderWebBar(): void {
   const s = app.status;
   const current = app.queueCurrent != null ? app.queueTracks[app.queueCurrent] : null;
@@ -219,9 +315,57 @@ export function renderWebBar(): void {
   // Seek bar: enabled whenever a duration is known.
   const seek = document.getElementById("ytm-seek") as HTMLInputElement | null;
   if (seek) seek.disabled = !(app.durationS > 0);
+
+  renderDrawer();
 }
 
-/** Update the YTM progress bar (from the position poll). */
+/** Quality badge: honest format facts from the kernel's negotiated
+ *  output (ADR 0002 in the UI — facts, not marketing). */
+export function renderWebQuality(): void {
+  const el = document.getElementById("ytm-quality");
+  const s = app.status;
+  if (!el) return;
+  if (s?.sample_rate) {
+    const bits = s.bits_per_sample ?? 32;
+    el.hidden = false;
+    el.textContent = `${(s.sample_rate / 1000).toFixed(1)}k/${bits}`;
+  } else {
+    el.hidden = true;
+  }
+}
+
+/** Queue drawer body: current + up next (click to jump). */
+export function renderDrawer(): void {
+  const body = document.getElementById("ytm-drawer-body");
+  if (!body) return;
+  body.innerHTML = "";
+  const head = document.createElement("p");
+  head.className = "ytm-drawer-section";
+  head.textContent = app.queueCurrent != null ? "Now playing" : "Queue";
+  body.appendChild(head);
+
+  app.queueTracks.forEach((t, idx) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "ytm-drawer-row" + (idx === app.queueCurrent ? " current" : "");
+    const title = document.createElement("span");
+    title.textContent = t.title ?? t.path;
+    const sub = document.createElement("span");
+    sub.className = "sub";
+    sub.textContent = t.artist ?? "";
+    row.append(title, sub);
+    row.addEventListener("click", () => void playQueueIndex(idx));
+    body.appendChild(row);
+  });
+  if (!app.queueTracks.length) {
+    const empty = document.createElement("p");
+    empty.className = "ytm-drawer-empty";
+    empty.textContent = "Queue is empty";
+    body.appendChild(empty);
+  }
+}
+
+/** Update the progress bar (position poll). */
 export function renderWebProgress(positionS: number): void {
   const seek = document.getElementById("ytm-seek") as HTMLInputElement | null;
   const cur = document.getElementById("ytm-cur");
@@ -231,6 +375,11 @@ export function renderWebProgress(positionS: number): void {
   }
   if (cur) cur.textContent = fmtTime(positionS);
   if (dur && app.durationS > 0) dur.textContent = fmtTime(app.durationS);
+  // Miniplayer progress hairline.
+  const mini = document.getElementById("ytm-mini");
+  if (mini && app.durationS > 0) {
+    mini.style.setProperty("--mini-progress", `${Math.min(100, (positionS / app.durationS) * 100)}%`);
+  }
 }
 
 /** Register the web-only routes (home). Call before startRouter. */

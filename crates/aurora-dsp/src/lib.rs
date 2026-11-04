@@ -12,6 +12,7 @@ pub mod biquad;
 pub mod eq;
 pub mod error;
 pub mod gain;
+pub mod lufs;
 pub mod pipeline;
 pub mod resample;
 pub mod reverb;

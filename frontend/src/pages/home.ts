@@ -1,7 +1,7 @@
 /** YTM Home page: shelves of cards (your music, quick mix).
  *  Web-shell-only route; the desktop shell keeps its own player page. */
 
-import { invoke, platform, registerWebFile, registerWebBytes } from "../invoke";
+import { invoke, platform, registerWebFile, registerWebBytes, analyzeLufs } from "../invoke";
 import { app, playQueueIndex, setQueue, setToast } from "../state";
 import { unlockAudio } from "../audio-bridge";
 import { searchTracks, addPreviewToQueue, type SearchHit } from "../search-service";
@@ -16,6 +16,7 @@ import {
   type StoredTrack,
 } from "../library-db";
 import { readTrackTags } from "../tag-reader";
+import { recordPlay, recentPlays } from "../history-service";
 
 /** Fetch one stored track by id (byte-loading helper). */
 async function getStoredTrack(id: string): Promise<StoredTrack | null> {
@@ -34,15 +35,21 @@ interface WebTrack {
   file: File | null;
   /** File extension (no dot) — needed when bytes come from the store. */
   extension: string;
+  /** R128 integrated loudness (LUFS) measured at ingest (W8): feeds the
+   *  kernel's ReplayGain stage for track-normalized loudness. */
+  lufs: number | null;
   /** The web:// path registered with the kernel (after first play). */
   kernelPath: string | null;
 }
 
 const webTracks = new Map<string, WebTrack>();
 
-export function registerWebTrack(t: Omit<WebTrack, "kernelPath" | "extension"> & { extension?: string }) {
+export function registerWebTrack(
+  t: Omit<WebTrack, "kernelPath" | "extension" | "lufs"> & { extension?: string; lufs?: number | null },
+) {
   webTracks.set(t.id, {
     ...t,
+    lufs: t.lufs ?? null,
     extension: t.extension ?? (t.file ? (t.file.name.split(".").pop() ?? "").toLowerCase() : ""),
     kernelPath: null,
   });
@@ -66,6 +73,34 @@ async function loadStoredBytes(id: string): Promise<ArrayBuffer | null> {
   } catch {
     storedBytesCache.set(id, null);
     return null;
+  }
+}
+
+/** Render the "Continue listening" shelf into the given root
+ *  (draw() and update() share this — one card renderer, no drift). */
+async function renderHistory(root: HTMLElement): Promise<void> {
+  const entries = await recentPlays(8);
+  const container = root.querySelector("#ytm-history");
+  if (!container) return; // re-render raced us
+  container.innerHTML = "";
+  for (const e of entries) {
+    const track = webTracks.get(e.id);
+    const card = document.createElement("div");
+    card.className = "ytm-card";
+    const art = document.createElement("div");
+    art.className = "ytm-card-art";
+    art.innerHTML = `${icon("library", 48)}<button class="ytm-card-play" type="button" title="Play">${icon("play")}</button>`;
+    const ct = document.createElement("div");
+    ct.className = "ytm-card-title";
+    ct.textContent = e.title;
+    const cs = document.createElement("div");
+    cs.className = "ytm-card-sub";
+    cs.textContent = e.artist ?? "Unknown artist";
+    card.append(art, ct, cs);
+    card.addEventListener("click", () => {
+      if (track) void playWebTracks([track], 0);
+    });
+    container.appendChild(card);
   }
 }
 
@@ -94,8 +129,18 @@ function fmtDur(ms: number | null): string {
 async function playWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   if (!tracks.length) return;
   unlockAudio(); // the click that got here is the user gesture
+  // History first (YTM "continue listening" shelf): the track that
+  // STARTS playing is the one logged, even if the user skips later.
+  const start = tracks[index];
+  if (start) {
+    void recordPlay({ id: start.id, title: start.name, artist: start.artist });
+  }
   await doPlayWebTracks(tracks, index);
 }
+
+/** ReplayGain target equivalent: the LUFS level normalized playback
+ *  aims at (-14 LUFS is the streaming-platform convention). */
+const NORMALIZE_TARGET_LUFS = -14;
 
 async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   const queue = [];
@@ -103,11 +148,14 @@ async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
     t.kernelPath = t.file
       ? await registerWebFile(t.file)
       : await registerWebBytes(t.id, new Uint8Array((await loadStoredBytes(t.id)) ?? []), t.extension);
+    // W8: measured LUFS feeds the ReplayGain track gain when the DSP
+    // mode is on; the kernel treats it exactly like a file tag.
+    const rg = t.lufs != null ? NORMALIZE_TARGET_LUFS - t.lufs : null;
     queue.push({
       path: t.kernelPath,
       title: t.name,
       artist: t.artist,
-      replaygain_track_db: null as number | null,
+      replaygain_track_db: rg,
       replaygain_album_db: null as number | null,
       bpm: null as number | null,
     });
@@ -120,7 +168,7 @@ async function render(root: HTMLElement) {
   root.innerHTML = `
     <div class="ytm-search">
       ${icon("search", 22)}
-      <input id="ytm-search-input" type="search" placeholder="Search" />
+      <input id="home-search-input" type="search" placeholder="Search" />
     </div>
     <div id="ytm-shelves"></div>
     <p class="hint" id="ytm-empty"></p>
@@ -128,7 +176,7 @@ async function render(root: HTMLElement) {
 
   const shelves = root.querySelector<HTMLElement>("#ytm-shelves")!;
   const empty = root.querySelector<HTMLElement>("#ytm-empty")!;
-  const search = root.querySelector<HTMLInputElement>("#ytm-search-input");
+  const search = root.querySelector<HTMLInputElement>("#home-search-input");
 
   function draw(query: string): void {
     const all = [...webTracks.values()].filter(
@@ -151,6 +199,18 @@ async function render(root: HTMLElement) {
       return;
     }
     empty.textContent = "";
+
+    // Shelf 0: "Continue listening" (local play history, graft from the
+    // design judges). Rendered async — the shelf appears when history
+    // resolves; empty history leaves nothing (honest).
+    void renderHistory(shelves);
+    shelves.insertAdjacentHTML(
+      "afterbegin",
+      `<div class="ytm-shelf">
+         <div class="ytm-shelf-head"><span class="ytm-shelf-title">Continue listening</span></div>
+         <div class="ytm-shelf-row" id="ytm-history"></div>
+       </div>`,
+    );
 
     // Shelf 1: all tracks as YTM song rows.
     shelves.insertAdjacentHTML(
@@ -329,7 +389,18 @@ async function render(root: HTMLElement) {
       const artist = tags.artist ?? (dashIdx > 0 ? stem.slice(0, dashIdx) : null);
       const album = tags.album;
       const durationMs = tags.durationMs;
-      registerWebTrack({ id, name, artist, album, durationMs, file });
+      // W8 loudness: measure R128 LUFS from the file bytes (the SAME
+      // decode path playback uses — the measurement is honest by
+      // construction). Best-effort: a failure leaves the track
+      // un-normalized, never blocks the ingest.
+      let lufs: number | null = null;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        lufs = await analyzeLufs(bytes, (file.name.split(".").pop() ?? "").toLowerCase());
+      } catch {
+        lufs = null;
+      }
+      registerWebTrack({ id, name, artist, album, durationMs, file, lufs });
       // Persist (async, best-effort): the library must survive reloads.
       try {
         await putTrack({
@@ -341,6 +412,7 @@ async function render(root: HTMLElement) {
           extension: (file.name.split(".").pop() ?? "").toLowerCase(),
           bytes: await file.arrayBuffer(),
           addedAt: Date.now(),
+          lufs,
         });
       } catch (e) {
         // Storage failure is LOUD: the user believes their library is
@@ -368,6 +440,7 @@ async function render(root: HTMLElement) {
           durationMs: t.durationMs,
           file: null,
           extension: t.extension,
+          lufs: t.lufs ?? null,
         });
       }
       draw(search?.value.toLowerCase() ?? "");
@@ -393,12 +466,19 @@ function update(root: HTMLElement) {
   const list = root.querySelector("#ytm-list");
   const rows = list ? list.querySelectorAll(".ytm-track-row").length : 0;
   if (rows !== webTracks.size) {
-    const input = root.querySelector<HTMLInputElement>("#ytm-search-input");
+    const input = root.querySelector<HTMLInputElement>("#home-search-input");
     // Re-draw preserving the current query.
     void render(root).then(() => {
-      const again = root.querySelector<HTMLInputElement>("#ytm-search-input");
+      const again = root.querySelector<HTMLInputElement>("#home-search-input");
       if (again && input?.value) again.value = input.value;
     });
+    return;
+  }
+  // Same track count: still refresh the history shelf — a play just
+  // recorded changes it without changing the row count.
+  const historyRow = root.querySelector("#ytm-history");
+  if (historyRow) {
+    void renderHistory(root);
   }
 }
 

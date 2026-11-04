@@ -28,6 +28,7 @@ import {
   renderWebShell,
   bindWebPlayerBar,
   renderWebBar,
+  renderWebQuality,
   renderWebProgress,
   homePage,
 } from "./web-shell";
@@ -66,11 +67,98 @@ if (isWebShell()) {
   sidebar.addEventListener("click", clickNav);
   tabs.addEventListener("click", clickNav);
 
+  // MediaSession (W6): lock-screen / hardware media keys — metadata +
+  // transport handlers. Guarded: Safari/older browsers lack it.
+  if ("mediaSession" in navigator) {
+    const ms = navigator.mediaSession;
+    ms.setActionHandler("play", () => void resumeOrPlay());
+    ms.setActionHandler("pause", () => void invoke("pause_playback").then(() => loadStatus()));
+    ms.setActionHandler("previoustrack", () => void prevTrack());
+    ms.setActionHandler("nexttrack", () =>
+      void nextTrack().then((q) => {
+        if (!q && app.queueTracks.length === 1) void playQueueIndex(0);
+      }),
+    );
+  }
+
+  async function resumeOrPlay(): Promise<void> {
+    try {
+      if (app.status?.state === "paused") {
+        await invoke("resume_playback");
+      } else if (app.queueTracks.length && app.status?.state !== "playing") {
+        await playQueueIndex(app.queueCurrent ?? 0);
+      }
+      await loadStatus();
+    } catch (e) {
+      setToast(String(e));
+    }
+  }
+
+  // Update MediaSession metadata when the current track changes.
+  const updateMediaMetadata = () => {
+    if (!("mediaSession" in navigator)) return;
+    const cur = app.queueCurrent != null ? app.queueTracks[app.queueCurrent] : null;
+    if (!cur) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: cur.title ?? "Unknown",
+        artist: cur.artist ?? "",
+        album: "",
+      });
+    } catch {
+      /* unsupported metadata shape */
+    }
+  };
+  subscribe(updateMediaMetadata);
+
+  // Keyboard shortcuts (W6): space play/pause, arrows seek/volume, /
+  // focuses search.
+  document.addEventListener("keydown", (e) => {
+    const inField = (e.target as HTMLElement)?.matches?.("input, select, textarea");
+    if (inField) return;
+    if (e.code === "Space") {
+      e.preventDefault();
+      void (async () => {
+        try {
+          if (app.status?.state === "playing") {
+            app.status = await invoke("pause_playback");
+          } else {
+            await resumeOrPlay();
+          }
+          await loadStatus();
+        } catch {
+          /* ignore */
+        }
+      })();
+    } else if (e.key === "ArrowRight") {
+      void invoke("seek", { positionS: Math.min(app.durationS, (app.status ? 0 : 0) + posFromSeek() + 5) });
+    } else if (e.key === "ArrowLeft") {
+      void invoke("seek", { positionS: Math.max(0, posFromSeek() - 5) });
+    } else if (e.key === "n") {
+      void nextTrack();
+    } else if (e.key === "p") {
+      void prevTrack();
+    } else if (e.key === "/") {
+      e.preventDefault();
+      const inp = document.querySelector<HTMLInputElement>("#ytm-search-input");
+      inp?.focus();
+    }
+  });
+
+  function posFromSeek(): number {
+    const bar = document.getElementById("ytm-seek") as HTMLInputElement | null;
+    if (bar && app.durationS > 0) {
+      return (Number.parseFloat(bar.value) / 1000) * app.durationS;
+    }
+    return 0;
+  }
+
   // Web polls: status + progress through the YTM bar.
   setInterval(async () => {
     try {
       await loadStatus();
       renderWebBar();
+      renderWebQuality();
       refreshActive();
     } catch {
       /* kernel busy */
@@ -101,7 +189,10 @@ if (isWebShell()) {
     }
   }, 400);
 
-  void loadStatus().then(() => renderWebBar());
+  void loadStatus().then(() => {
+    renderWebBar();
+    renderWebQuality();
+  });
 
   // Player page animation (web shell too — the desktop branch had its
   // own ticker; without this the fullscreen player's waveform/lyrics

@@ -49,6 +49,8 @@ type WebKernel = {
   seek(position_s: number): unknown;
   position_correction_s(seconds: number): void;
   set_output_rate(rate: number): void;
+  set_output_channels(channels: number): void;
+  analyze_lufs(bytes: Uint8Array, extension: string): number | null;
   set_queue(tracks: unknown): unknown;
   get_queue(): unknown;
   play_queue_index(index: number): unknown;
@@ -97,6 +99,11 @@ async function loadKernel(): Promise<WebKernel> {
       try {
         const probe = new AudioContext();
         kernel.set_output_rate(probe.sampleRate);
+        try {
+          kernel.set_output_channels(2); // browser outputs are stereo
+        } catch {
+          /* older binary — rate alone still fixes resampling */
+        }
         void probe.close();
       } catch {
         // No audio yet (rare): the engine falls back to source-rate
@@ -273,4 +280,18 @@ export async function registerWebBytes(
   const k = await loadKernel();
   k.register_file(id, bytes, extension);
   return `web://${id}`;
+}
+
+/** R128 loudness measurement (W8): integrated LUFS of the track's
+ *  bytes, computed by the kernel (same decode path as playback). None
+ *  when unmeasurable. JS holds no DSP — the measurement is honest
+ *  because it measures exactly what will play. */
+export async function analyzeLufs(bytes: Uint8Array, extension: string): Promise<number | null> {
+  if (platform !== "web") return null;
+  const k = await loadKernel();
+  try {
+    return k.analyze_lufs(bytes, extension) ?? null;
+  } catch {
+    return null; // honest: no measurement, no normalization
+  }
 }

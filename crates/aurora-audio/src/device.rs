@@ -276,11 +276,21 @@ pub(crate) mod imp {
     /// resampler converts to the device rate as ONE continuous stream and
     /// reports the `Resampling` transformation honestly (ADR 0002).
     static DEVICE_RATE: AtomicU32 = AtomicU32::new(0);
+    /// The browser output channel count (2 for stereo endpoints). 0 =
+    /// unknown; the source channel count passes through.
+    static DEVICE_CHANNELS: AtomicU32 = AtomicU32::new(0);
 
     /// Called by the wasm shell (WebKernel::set_output_rate) at startup.
     pub fn set_device_rate(rate: u32) {
         if rate > 0 {
             DEVICE_RATE.store(rate, Ordering::Release);
+        }
+    }
+
+    /// Called by the wasm shell with the AudioContext's channel count.
+    pub fn set_device_channels(channels: u32) {
+        if channels > 0 {
+            DEVICE_CHANNELS.store(channels, Ordering::Release);
         }
     }
 
@@ -297,21 +307,32 @@ pub(crate) mod imp {
     }
 
     /// Honest "negotiation": the JS bridge consumes f32 interleaved at
-    /// the DEVICE rate when known (the engine resamples through its DSP
-    /// pipeline — one continuous stream, reported as `Resampling`).
-    /// Without a known rate the source rate passes through and the
-    /// browser resamples per-buffer (phase-discontinuous; kept as the
-    /// honest fallback and reported). Every conversion is listed.
+    /// the DEVICE rate and channel count when known (the engine
+    /// resamples/remixes through its DSP pipeline — one continuous
+    /// stream, reported). Channel conversion happens ENGINE-side too:
+    /// mono<->stereo track changes must not restart the bridge (a
+    /// restart at a track boundary = an audible gap; W7 gapless).
+    /// Without a known rate the source rate passes through (browser
+    /// resamples per-buffer; the honest fallback). Every conversion is
+    /// listed.
     pub fn negotiate(source: PcmFormat) -> Result<NegotiatedConfig, EngineError> {
         let device_rate = DEVICE_RATE.load(Ordering::Acquire);
+        let device_channels = DEVICE_CHANNELS.load(Ordering::Acquire);
         let target_rate = if device_rate > 0 {
             device_rate
         } else {
             source.sample_rate
         };
+        // Channel target: the device count when the shell reported it,
+        // else the source's (identity).
+        let target_channels: u16 = if device_channels > 0 {
+            device_channels as u16
+        } else {
+            source.channels
+        };
         let pcm = PcmFormat {
             sample_rate: target_rate,
-            channels: source.channels,
+            channels: target_channels,
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
             channel_layout: ChannelLayout::Interleaved,
@@ -319,6 +340,9 @@ pub(crate) mod imp {
         let mut transformations = Vec::new();
         if pcm.sample_rate != source.sample_rate {
             transformations.push(aurora_core::AudioTransformation::Resampling);
+        }
+        if pcm.channels != source.channels {
+            transformations.push(aurora_core::AudioTransformation::ChannelRemapping);
         }
         if source.sample_format != SampleFormat::Float || source.bits_per_sample != 32 {
             transformations.push(aurora_core::AudioTransformation::SampleFormatConversion);
@@ -334,10 +358,12 @@ pub(crate) mod imp {
 pub use imp::find_by_key;
 pub use imp::{default_output_device, output_devices};
 
-/// Wasm: JS shell reports the AudioContext's device rate once at
-/// startup so the engine resamples as one continuous stream. Native:
-/// no-op (CPAL negotiates against the real device) — the function
-/// exists on BOTH targets so callers compile identically everywhere.
+/// Wasm: JS shell reports the AudioContext's device rate and channel
+/// count once at startup so the engine resamples/remixes as one
+/// continuous stream (mono<->stereo track changes never restart the
+/// bridge — W7 gapless). Native: no-op (CPAL negotiates against the
+/// real device) — the functions exist on BOTH targets so callers
+/// compile identically everywhere.
 pub fn set_output_rate(rate: u32) {
     #[cfg(target_family = "wasm")]
     {
@@ -348,5 +374,17 @@ pub fn set_output_rate(rate: u32) {
         // Native: the device rate is negotiated per-stream via CPAL;
         // a browser-reported rate is meaningless here.
         let _ = rate;
+    }
+}
+
+/// Wasm: the browser output channel count (see set_output_rate).
+pub fn set_output_channels(channels: u32) {
+    #[cfg(target_family = "wasm")]
+    {
+        imp::set_device_channels(channels);
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = channels;
     }
 }

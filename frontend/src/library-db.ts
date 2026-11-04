@@ -26,6 +26,8 @@ export interface StoredTrack {
   extension: string;
   bytes: ArrayBuffer;
   addedAt: number;
+  /** R128 integrated loudness (LUFS), measured at ingest (W8). */
+  lufs?: number | null;
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null;
