@@ -102,6 +102,13 @@ if (isWebShell()) {
   }, 400);
 
   void loadStatus().then(() => renderWebBar());
+
+  // Player page animation (web shell too — the desktop branch had its
+  // own ticker; without this the fullscreen player's waveform/lyrics
+  // sync never ticked on the web).
+  setInterval(() => {
+    if (activeRoute() === "player") animatePlayer();
+  }, 120);
 } else {
   mainDesktop();
 }

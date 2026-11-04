@@ -1,11 +1,17 @@
-/** Now Playing page: big art, waveform seek, spectrum, A/B loop,
- *  honest signal-path report. */
+/** Now Playing fullscreen (YTM-style): big art, blurred-art background,
+ *  tabs — Lyrics (synced, LRCLIB) / Up next / Signal path (honest ADR
+ *  0002 report). Waveform seek, spectrum, A/B loop stay. */
 
 import { invoke } from "../invoke";
 import type { Page } from "../router";
 import { app, setToast } from "../state";
 import { renderArtwork } from "../artwork";
 import type { PlaybackStatus } from "../types";
+import {
+  getLyrics,
+  activeLineIndex,
+  type LyricsResult,
+} from "../lyrics-service";
 
 const SIGNAL_FIELDS: Array<[string, (s: PlaybackStatus | null) => string]> = [
   ["state", (s) => s?.state ?? "idle"],
@@ -24,6 +30,13 @@ const WAVE_BINS = 160;
 const waveCache = new Map<string, number[]>();
 let waveBars: number[] | null = null;
 let loopRegion: { start: number; end: number } | null = null;
+
+/** Lyrics state: loaded for one (artist, title) pair; auto-scroll. */
+let lyrics: LyricsResult | null = null;
+let lyricsKey: string | null = null;
+let lyricsState: "loading" | "none" | "ready" = "loading";
+let lyricsAutoScroll = true;
+let lyricsUserScrollUntil = 0;
 
 async function loadWave(path: string) {
   if (waveCache.has(path)) {
@@ -46,9 +59,81 @@ function fmtTime(s: number): string {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
+async function loadLyrics(root: HTMLElement, artist: string | null, title: string | null) {
+  if (!title) {
+    lyrics = null;
+    lyricsState = "none";
+    drawLyrics(root);
+    return;
+  }
+  const key = `${artist ?? ""}|${title}`;
+  if (key === lyricsKey) return;
+  lyricsKey = key;
+  lyrics = null;
+  lyricsState = "loading";
+  drawLyrics(root);
+  const res = await getLyrics(artist, title);
+  if (lyricsKey !== key) return; // track changed mid-fetch
+  lyrics = res;
+  lyricsState = res ? "ready" : "none";
+  drawLyrics(root);
+}
+
+function drawLyrics(root: HTMLElement) {
+  const box = root.querySelector<HTMLElement>("#np-lyrics");
+  if (!box) return;
+  box.innerHTML = "";
+  if (lyricsState === "loading") {
+    const p = document.createElement("p");
+    p.className = "np-lyrics-hint";
+    p.textContent = "Searching lyrics…";
+    box.appendChild(p);
+    return;
+  }
+  if (lyricsState === "none" || !lyrics) {
+    const p = document.createElement("p");
+    p.className = "np-lyrics-hint";
+    p.textContent = "No lyrics found — drop a .lrc file on the page to add one.";
+    box.appendChild(p);
+    return;
+  }
+  lyrics.lines.forEach((line, i) => {
+    const el = document.createElement("p");
+    el.className = "np-lyrics-line";
+    el.dataset.lineIdx = String(i);
+    el.textContent = line.text || "♪";
+    box.appendChild(el);
+  });
+  void 0;
+  const src = document.createElement("p");
+  src.className = "np-lyrics-source";
+  src.textContent = `${lyrics.synced ? "Synced" : "Plain"} lyrics · LRCLIB · ${lyrics.trackName}`;
+  box.appendChild(src);
+}
+
+function scrollLyrics(root: HTMLElement, posS: number) {
+  if (!lyrics || !lyrics.synced) return;
+  const box = root.querySelector<HTMLElement>("#np-lyrics");
+  if (!box) return;
+  const idx = activeLineIndex(lyrics.lines, posS);
+  box.querySelectorAll<HTMLElement>(".np-lyrics-line").forEach((el) => {
+    el.classList.toggle("active", Number(el.dataset.lineIdx) === idx);
+  });
+  if (!lyricsAutoScroll) return;
+  if (Date.now() < lyricsUserScrollUntil) return; // user is reading
+  const active = box.querySelector<HTMLElement>(".np-lyrics-line.active");
+  if (active) {
+    box.scrollTo({ top: active.offsetTop - box.clientHeight / 2 + active.clientHeight / 2, behavior: "smooth" });
+  }
+}
+
 function render(root: HTMLElement) {
   root.innerHTML = `
-    <div class="np-page">
+    <div class="np-page" id="np-page">
+      <div class="np-bg" id="np-bg" aria-hidden="true"></div>
+      <div class="np-close">
+        <button class="btn" id="np-close-btn" type="button" title="Back">✕ Close</button>
+      </div>
       <div class="np-art" id="np-art"><span class="art-glyph">♪</span></div>
       <div class="np-side">
         <p class="overline">Now playing</p>
@@ -72,11 +157,41 @@ function render(root: HTMLElement) {
 
         <div class="spectrum" id="spectrum"></div>
 
-        <dl class="signal-grid" id="signal-grid"></dl>
-        <p class="hint" id="np-toast"></p>
+        <nav class="np-tabs" id="np-tabs">
+          <button class="np-tab active" data-tab="lyrics" type="button">Lyrics</button>
+          <button class="np-tab" data-tab="queue" type="button">Up next</button>
+          <button class="np-tab" data-tab="signal" type="button">Signal path</button>
+        </nav>
+
+        <section class="np-tab-body" id="tab-lyrics">
+          <div class="np-lyrics" id="np-lyrics"></div>
+        </section>
+        <section class="np-tab-body" id="tab-queue" hidden>
+          <ul class="np-queue" id="np-queue"></ul>
+        </section>
+        <section class="np-tab-body" id="tab-signal" hidden>
+          <dl class="signal-grid" id="signal-grid"></dl>
+          <p class="hint" id="np-toast"></p>
+        </section>
       </div>
     </div>
   `;
+
+  // Tabs.
+  root.querySelector("#np-tabs")?.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>(".np-tab");
+    if (!btn?.dataset.tab) return;
+    root.querySelectorAll<HTMLElement>(".np-tab").forEach((t) => t.classList.toggle("active", t === btn));
+    for (const name of ["lyrics", "queue", "signal"]) {
+      const body = root.querySelector<HTMLElement>(`#tab-${name}`);
+      if (body) body.hidden = name !== btn.dataset.tab;
+    }
+  });
+
+  // Close: back to home (web shell) / queue (desktop keeps old nav).
+  root.querySelector<HTMLButtonElement>("#np-close-btn")?.addEventListener("click", () => {
+    window.location.hash = "#/home";
+  });
 
   // Seek by clicking/dragging on the waveform.
   const seekEl = root.querySelector<HTMLElement>("#wave-seek");
@@ -112,6 +227,19 @@ function render(root: HTMLElement) {
     setToast("Loop off");
   });
 
+  // Lyrics user-scroll pauses auto-scroll 4s (YTM behavior).
+  const lyricsBox = root.querySelector<HTMLElement>("#np-lyrics");
+  lyricsBox?.addEventListener(
+    "wheel",
+    () => {
+      lyricsUserScrollUntil = Date.now() + 4000;
+    },
+    { passive: true },
+  );
+  lyricsBox?.addEventListener("touchmove", () => {
+    lyricsUserScrollUntil = Date.now() + 4000;
+  }, { passive: true });
+
   // Spectrum bars skeleton.
   const spec = root.querySelector<HTMLElement>("#spectrum");
   if (spec) {
@@ -143,7 +271,6 @@ function drawWave(root: HTMLElement) {
   const canvas = root.querySelector<HTMLCanvasElement>("#wave-canvas");
   const prog = root.querySelector<HTMLElement>("#wave-progress");
   const loopEl = root.querySelector<HTMLElement>("#wave-loop");
-  const curEl = root.querySelector<HTMLElement>("#wave-cur");
   const durEl = root.querySelector<HTMLElement>("#wave-dur");
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
@@ -156,8 +283,7 @@ function drawWave(root: HTMLElement) {
   const bars = waveBars ?? Array<number>(WAVE_BINS).fill(0.15);
   const n = bars.length;
   const barW = w / n;
-  const posFrac =
-    app.durationS > 0 ? Math.min(1, posFromBar() / app.durationS) : 0;
+  const posFrac = app.durationS > 0 ? Math.min(1, posFromBar() / app.durationS) : 0;
 
   for (let i = 0; i < n; i++) {
     const v = bars[i];
@@ -183,13 +309,12 @@ function drawWave(root: HTMLElement) {
   }
 
   if (durEl && app.durationS > 0) durEl.textContent = fmtTime(app.durationS);
-  void curEl;
 }
 
 function posFromBar(): number {
-  const bar = document.getElementById("seek") as HTMLInputElement | null;
+  const bar = document.getElementById("ytm-seek") as HTMLInputElement | null;
   if (bar && app.durationS > 0) {
-    return (Number.parseFloat(bar.value) / 100) * app.durationS;
+    return (Number.parseFloat(bar.value) / 1000) * app.durationS;
   }
   return 0;
 }
@@ -207,6 +332,23 @@ function drawSpectrum(root: HTMLElement) {
       });
     })
     .catch(() => {});
+}
+
+function drawQueueTab(root: HTMLElement) {
+  const ul = root.querySelector<HTMLElement>("#np-queue");
+  if (!ul) return;
+  ul.innerHTML = "";
+  app.queueTracks.forEach((t, idx) => {
+    const li = document.createElement("li");
+    li.className = "np-queue-item" + (idx === app.queueCurrent ? " current" : "");
+    const tEl = document.createElement("span");
+    tEl.textContent = t.title ?? t.path;
+    const aEl = document.createElement("span");
+    aEl.className = "sub";
+    aEl.textContent = t.artist ?? "";
+    li.append(tEl, aEl);
+    ul.appendChild(li);
+  });
 }
 
 function update(root: HTMLElement) {
@@ -229,15 +371,23 @@ function update(root: HTMLElement) {
 
   const art = root.querySelector<HTMLElement>("#np-art");
   if (art) void renderArtwork(art, current?.path ?? app.selectedPath);
+  // Blurred art as page background (YTM-style atmosphere).
+  const bg = root.querySelector<HTMLElement>("#np-bg");
+  if (bg) void renderArtworkBg(bg, current?.path ?? app.selectedPath);
 
   // Load the waveform for this track (once, cached).
   const wavePath = current?.path ?? app.selectedPath;
-  if (wavePath && waveCache.size === 0 || (wavePath && !waveCache.has(wavePath))) {
-    if (wavePath) void loadWave(wavePath);
+  if (wavePath && !waveCache.has(wavePath)) {
+    void loadWave(wavePath);
   }
+
+  // Lyrics load + synced scroll for the current track.
+  void loadLyrics(root, current?.artist ?? null, current?.title ?? null);
+  scrollLyrics(root, posFromBar());
 
   drawWave(root);
   drawSpectrum(root);
+  drawQueueTab(root);
 
   const grid = root.querySelector<HTMLElement>("#signal-grid");
   if (grid) {
@@ -258,17 +408,48 @@ function update(root: HTMLElement) {
   if (toastEl) toastEl.textContent = app.toast;
 }
 
-/** Continuous animation: waveform progress + spectrum while visible. */
+/** Blurred artwork background: the same artwork URL, CSS blur. */
+async function renderArtworkBg(el: HTMLElement, path: string | null) {
+  // Reuse the artwork module's URL resolution; blur via CSS.
+  const img = el.querySelector("img");
+  if (img?.dataset.path === path) return;
+  el.innerHTML = "";
+  if (!path) return;
+  const tmp = document.createElement("div");
+  tmp.style.display = "none";
+  el.append(tmp);
+  try {
+    await renderArtwork(tmp, path);
+    const url = tmp.querySelector("img")?.getAttribute("src");
+    if (url) {
+      const bgImg = document.createElement("img");
+      bgImg.src = url;
+      bgImg.dataset.path = path;
+      el.innerHTML = "";
+      el.appendChild(bgImg);
+      return;
+    }
+  } catch {
+    /* no artwork — gradient stays */
+  }
+  el.innerHTML = "";
+}
+
+/** Continuous animation: waveform progress + spectrum + lyrics sync
+ *  while visible (called from the 120ms ticker). Works in BOTH shells:
+ *  the desktop mounts pages under #page-root, the web shell under
+ *  #ytm-content — animate looks for the player markup in either. */
 export function animatePlayer() {
-  const root = document.getElementById("page-root");
-  if (!root) return;
+  const root =
+    document.getElementById("page-root") ?? document.getElementById("ytm-content");
+  if (!root?.querySelector("#np-title")) return;
   const curEl = root.querySelector<HTMLElement>("#wave-cur");
-  const seekBar = document.getElementById("seek") as HTMLInputElement | null;
-  if (curEl && seekBar && app.durationS > 0) {
-    curEl.textContent = fmtTime((Number.parseFloat(seekBar.value) / 100) * app.durationS);
+  if (curEl && app.durationS > 0) {
+    curEl.textContent = fmtTime(posFromBar());
   }
   drawWave(root);
   drawSpectrum(root);
+  scrollLyrics(root, posFromBar());
 }
 
 export const playerPage: Page = {

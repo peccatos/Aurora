@@ -15,6 +15,7 @@ import {
   kvPut,
   type StoredTrack,
 } from "../library-db";
+import { readTrackTags } from "../tag-reader";
 
 /** Fetch one stored track by id (byte-loading helper). */
 async function getStoredTrack(id: string): Promise<StoredTrack | null> {
@@ -320,17 +321,23 @@ async function render(root: HTMLElement) {
       const id = crypto.randomUUID();
       const stem = file.name.replace(/\.[^.]+$/, "");
       const dashIdx = stem.indexOf(" - ");
-      const name = dashIdx > 0 ? stem.slice(dashIdx + 3) : stem;
-      const artist = dashIdx > 0 ? stem.slice(0, dashIdx) : null;
-      registerWebTrack({ id, name, artist, album: null, durationMs: null, file });
+      // Tags FIRST: real metadata beats filename guessing. The stem
+      // pattern ("Artist - Title") stays as the fallback for untagged
+      // files — never shown when the file says otherwise.
+      const tags = await readTrackTags(file);
+      const name = tags.title ?? (dashIdx > 0 ? stem.slice(dashIdx + 3) : stem);
+      const artist = tags.artist ?? (dashIdx > 0 ? stem.slice(0, dashIdx) : null);
+      const album = tags.album;
+      const durationMs = tags.durationMs;
+      registerWebTrack({ id, name, artist, album, durationMs, file });
       // Persist (async, best-effort): the library must survive reloads.
       try {
         await putTrack({
           id,
           name,
           artist,
-          album: null,
-          durationMs: null,
+          album,
+          durationMs,
           extension: (file.name.split(".").pop() ?? "").toLowerCase(),
           bytes: await file.arrayBuffer(),
           addedAt: Date.now(),
