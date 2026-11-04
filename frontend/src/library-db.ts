@@ -15,7 +15,7 @@
  */
 
 const DB_NAME = "aurora-web";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export interface StoredTrack {
   id: string;
@@ -43,6 +43,10 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains("kv")) {
         db.createObjectStore("kv");
+      }
+      // v2: embedded cover art extracted from tags at ingest.
+      if (!db.objectStoreNames.contains("artwork")) {
+        db.createObjectStore("artwork", { keyPath: "trackId" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -86,6 +90,27 @@ export async function deleteTrack(id: string): Promise<void> {
 
 export async function clearTracks(): Promise<void> {
   await tx("tracks", "readwrite", (s) => s.clear());
+}
+
+// ---------------------------------------------------------------------------
+// Artwork (v2): embedded cover art blobs keyed by track id
+// ----------------------------------------------------------------------------
+
+/** Stored artwork record: one Blob per track ("trackId" is the keyPath). */
+export interface StoredArtwork {
+  trackId: string;
+  blob: Blob;
+}
+
+export async function getArtwork(trackId: string): Promise<Blob | null> {
+  const rec = await tx<StoredArtwork | undefined>("artwork", "readonly", (s) =>
+    s.get(trackId),
+  );
+  return rec?.blob ?? null;
+}
+
+export async function putArtwork(trackId: string, blob: Blob): Promise<void> {
+  await tx("artwork", "readwrite", (s) => s.put({ trackId, blob }));
 }
 
 // ---------------------------------------------------------------------------

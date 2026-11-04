@@ -13,7 +13,7 @@ import "./styles/player.css";
 import "./styles/pages.css";
 
 import { navigate, refreshActive, registerPage, startRouter, activeRoute } from "./router";
-import { app, loadStatus, nextTrack, playQueueIndex, prevTrack, setQueue, setToast, subscribe } from "./state";
+import { app, loadStatus, loadTransportModes, nextTrack, playQueueIndex, prevTrack, setQueue, setToast, subscribe } from "./state";
 import { registerDrop } from "./drop";
 import { loadDsp } from "./pages/eq";
 import { playerPage, animatePlayer } from "./pages/player";
@@ -24,6 +24,7 @@ import { pluginsPage } from "./pages/plugins";
 import { settingsPage } from "./pages/settings";
 import { decksPage } from "./pages/decks";
 import { playlistsPage, playlistDetailPage } from "./pages/playlists";
+import { searchPage } from "./pages/search";
 import {
   isWebShell,
   renderWebShell,
@@ -49,6 +50,7 @@ if (isWebShell()) {
   registerPage(homePage);
   registerPage(playlistsPage);
   registerPage(playlistDetailPage);
+  registerPage(searchPage);
 }
 
 const shell = document.querySelector<HTMLDivElement>("#app");
@@ -60,6 +62,8 @@ if (!shell) throw new Error("Application root #app was not found");
 if (isWebShell()) {
   const { content, sidebar, tabs } = renderWebShell(shell);
   bindWebPlayerBar();
+  // Persisted repeat/shuffle (kv) — restore before the first render.
+  void loadTransportModes();
 
   // Default route: Home.
   if (!window.location.hash) window.location.hash = "#/home";
@@ -180,13 +184,22 @@ if (isWebShell()) {
       // Wait for the scheduled audio to have sounded.
       const AHEAD_S = 0.25; // bridge schedule window + scheduling slack
       if (app.durationS > 0 && pos >= app.durationS - 0.3 + AHEAD_S) {
-        const q = await nextTrack();
-        if (!q && app.queueTracks.length === 1) {
-          // Single-track queue replay: use the WRAPPER (restores
-          // queueCurrent/selectedPath + refreshes status), not the raw
-          // invoke — the raw call left the UI showing defaults while
-          // the track actually replayed.
-          await playQueueIndex(0);
+        // nextTrack() nulls queueCurrent on end-of-queue — capture the
+        // finished track's index first (repeat-one needs it).
+        const endedIdx = app.queueCurrent;
+        if (app.repeat === "one") {
+          // Repeat-one: the SAME track restarts, mid-queue included
+          // (spec 3.1) — no advance, just replay.
+          await playQueueIndex(endedIdx ?? 0);
+        } else {
+          const q = await nextTrack();
+          if (!q && (app.repeat === "all" || app.queueTracks.length === 1)) {
+            // Repeat-all wraps to the first track; a single-track
+            // queue replays regardless. Use the WRAPPER (restores
+            // queueCurrent/selectedPath + refreshes status) — the raw
+            // invoke left the UI showing defaults while replaying.
+            await playQueueIndex(0);
+          }
         }
       }
     } catch {

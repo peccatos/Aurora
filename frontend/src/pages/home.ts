@@ -13,8 +13,10 @@ import {
   deleteTrack,
   kvGet,
   kvPut,
+  putArtwork,
   type StoredTrack,
 } from "../library-db";
+import { trackArtworkUrl } from "../artwork-store";
 import { readTrackTags } from "../tag-reader";
 import { recordPlay, recentPlays } from "../history-service";
 
@@ -57,6 +59,12 @@ export function registerWebTrack(
 
 export function webTrackCount(): number {
   return webTracks.size;
+}
+
+/** Snapshot of the session's web tracks (search page reads the library
+ *  without touching the Map itself). */
+export function getWebTracks(): WebTrack[] {
+  return [...webTracks.values()];
 }
 
 /** Lazy byte loading for restored tracks: only fetched from IndexedDB
@@ -341,6 +349,16 @@ async function render(root: HTMLElement) {
       const thumb = document.createElement("div");
       thumb.className = "ytm-track-thumb";
       thumb.innerHTML = icon("library", 18); // trusted constant
+      // Embedded artwork (async): replace the placeholder icon only if
+      // this row is still on screen when the URL resolves (a re-draw
+      // may have replaced the list meanwhile).
+      void trackArtworkUrl(t.id).then((url) => {
+        if (!url || !thumb.isConnected) return;
+        thumb.style.backgroundImage = `url("${url}")`;
+        thumb.style.backgroundSize = "cover";
+        thumb.style.backgroundPosition = "center";
+        thumb.innerHTML = "";
+      });
       const main = document.createElement("div");
       main.className = "ytm-track-main";
       const title = document.createElement("div");
@@ -521,6 +539,14 @@ async function render(root: HTMLElement) {
         lufs = null;
       }
       registerWebTrack({ id, name, artist, album, durationMs, file, lufs });
+      // Embedded cover art (best-effort): extracted from the tags, stored
+      // as a Blob; a storage failure never blocks the ingest.
+      if (tags.picture) {
+        // Browser picture bytes always sit in a plain ArrayBuffer; the
+        // library's looser type just spans Node buffers too.
+        const bytes = tags.picture.data as Uint8Array<ArrayBuffer>;
+        putArtwork(id, new Blob([bytes], { type: tags.picture.format })).catch(() => {});
+      }
       // Persist (async, best-effort): the library must survive reloads.
       try {
         await putTrack({

@@ -26,6 +26,9 @@ export interface TrackTags {
   codec: string | null;
   /** Bitrate in kbps for lossy, when reported. */
   bitrateKbps: number | null;
+  /** Embedded cover art (ID3v2 APIC / FLAC picture / MP4 covr), when
+   *  present: MIME format + raw picture bytes. */
+  picture: { format: string; data: Uint8Array } | null;
 }
 
 export async function readTrackTags(file: File): Promise<TrackTags> {
@@ -54,6 +57,9 @@ export async function readTrackTags(file: File): Promise<TrackTags> {
       bitsPerSample: mm.format.bitsPerSample ?? null,
       codec: mm.format.container?.toLowerCase() ?? null,
       bitrateKbps: mm.format.bitrate ? Math.round(mm.format.bitrate / 1000) : null,
+      picture: c.picture?.[0]?.data
+        ? { format: c.picture[0].format, data: c.picture[0].data }
+        : null,
     };
   } catch {
     // Corrupt/unknown tags: honest empties, filename fallback stays.
@@ -70,6 +76,7 @@ export async function readTrackTags(file: File): Promise<TrackTags> {
       bitsPerSample: null,
       codec: null,
       bitrateKbps: null,
+      picture: null,
     };
   }
 }

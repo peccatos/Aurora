@@ -385,10 +385,53 @@
   color: var(--ytm-text);
 }
 
+.ytm-btn-icon.active {
+  color: var(--ytm-accent);
+}
+
+.ytm-btn-icon[disabled] {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .ytm-btn-icon svg {
   width: 24px;
   height: 24px;
   fill: currentColor;
+}
+
+/* Repeat-one "1" indicator: small numeral pinned to the icon's corner */
+.ytm-repeat-one {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  font-size: 9px;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--ytm-accent);
+  font-variant-numeric: tabular-nums;
+}
+
+#ytm-repeat {
+  position: relative;
+}
+
+/* Like/dislike pair in the now-playing slot */
+.ytm-player-like {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+}
+
+.ytm-player-like .ytm-btn-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.ytm-player-like .ytm-btn-icon svg {
+  width: 18px;
+  height: 18px;
 }
 
 .ytm-btn-play {

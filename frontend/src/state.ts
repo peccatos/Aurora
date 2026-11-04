@@ -23,9 +23,14 @@ import type {
 // Mutable state
 // ---------------------------------------------------------------------------
 
+export type RepeatMode = "off" | "all" | "one";
+
 export const app = {
   /** Path of the track the transport acts on (file picker / queue current). */
   selectedPath: null as string | null,
+  /** Transport modes (persisted in kv — spec 3.1). */
+  repeat: "off" as RepeatMode,
+  shuffle: false,
   /** Current queue (frontend copy; backend owns the truth). */
   queueTracks: [] as QueueTrack[],
   queueCurrent: null as number | null,
@@ -70,6 +75,46 @@ export function setToast(text: string) {
   app.toast = text;
   const el = document.getElementById("toast");
   if (el) el.textContent = text;
+}
+
+// ---------------------------------------------------------------------------
+// Transport modes: repeat / shuffle (spec 3.1) — persisted to kv
+// ---------------------------------------------------------------------------
+
+/** Saved-state boot: call once at startup, before the first render. */
+export async function loadTransportModes(): Promise<void> {
+  try {
+    const { kvGet } = await import("./library-db");
+    const r = await kvGet<RepeatMode>("aw:repeat");
+    if (r === "off" || r === "all" || r === "one") app.repeat = r;
+    const sh = await kvGet<boolean>("aw:shuffle");
+    if (typeof sh === "boolean") app.shuffle = sh;
+  } catch {
+    /* storage unavailable — defaults stand */
+  }
+  notify();
+}
+
+export async function setRepeat(mode: RepeatMode): Promise<void> {
+  app.repeat = mode;
+  notify();
+  try {
+    const { kvPut } = await import("./library-db");
+    await kvPut("aw:repeat", mode);
+  } catch {
+    /* best-effort persistence */
+  }
+}
+
+export async function setShuffle(on: boolean): Promise<void> {
+  app.shuffle = on;
+  notify();
+  try {
+    const { kvPut } = await import("./library-db");
+    await kvPut("aw:shuffle", on);
+  } catch {
+    /* best-effort persistence */
+  }
 }
 
 // ---------------------------------------------------------------------------

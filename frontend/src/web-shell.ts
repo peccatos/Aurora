@@ -12,11 +12,17 @@ import {
   app,
   loadStatus,
   nextTrack,
+  notify,
   playQueueIndex,
   prevTrack,
+  setQueue,
+  setRepeat,
+  setShuffle,
   setToast,
   subscribe,
+  type RepeatMode,
 } from "./state";
+import { getLike, setLike, type LikeValue } from "./likes-service";
 import { unlockAudio, flushOutput } from "./audio-bridge";
 import { icon, type IconName } from "./styles/ytm-icons";
 import "./styles/ytm.css";
@@ -125,12 +131,18 @@ export function renderWebShell(root: HTMLElement): {
             <div class="ytm-player-title" id="ytm-title">Aurora Web</div>
             <div class="ytm-player-artist" id="ytm-artist">Drop music to begin</div>
           </div>
+          <div class="ytm-player-like">
+            <button class="ytm-btn-icon" id="ytm-like" type="button" title="Like">${icon("like")}</button>
+            <button class="ytm-btn-icon" id="ytm-dislike" type="button" title="Dislike">${icon("dislike")}</button>
+          </div>
         </div>
         <div class="ytm-player-center">
           <div class="ytm-transport">
+            <button class="ytm-btn-icon" id="ytm-shuffle" type="button" title="Shuffle">${icon("shuffle")}</button>
             <button class="ytm-btn-icon" id="ytm-prev" type="button" title="Previous">${icon("prev")}</button>
             <button class="ytm-btn-icon ytm-btn-play" id="ytm-play" type="button" title="Play / Pause">${icon("play")}</button>
             <button class="ytm-btn-icon" id="ytm-next" type="button" title="Next">${icon("next")}</button>
+            <button class="ytm-btn-icon" id="ytm-repeat" type="button" title="Repeat off">${icon("repeat")}</button>
             <button class="ytm-btn-icon" id="ytm-stop" type="button" title="Stop">${icon("close")}</button>
           </div>
           <div class="ytm-progress">
@@ -185,6 +197,13 @@ export function renderWebShell(root: HTMLElement): {
     if (clear) clear.hidden = topSearch.value.length === 0;
     if (window.location.hash !== "#/home") window.location.hash = "#/home";
     forward(topSearch.value);
+  });
+  // Enter: full search page with the query — live-forwarding stays as
+  // the type-ahead behavior on Home.
+  topSearch?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && topSearch.value.trim()) {
+      window.location.hash = `#/search?q=${encodeURIComponent(topSearch.value)}`;
+    }
   });
   document.getElementById("ytm-search-clear")?.addEventListener("click", () => {
     if (topSearch) topSearch.value = "";
@@ -251,6 +270,79 @@ export function bindWebPlayerBar(): void {
   });
   next?.addEventListener("click", () => void nextTrack());
   prev?.addEventListener("click", () => void prevTrack());
+
+  // Repeat: cycles off -> all -> one -> off (spec 3.1).
+  document.getElementById("ytm-repeat")?.addEventListener("click", () => {
+    const order: RepeatMode[] = ["off", "all", "one"];
+    const nextMode = order[(order.indexOf(app.repeat) + 1) % order.length];
+    void setRepeat(nextMode).then(() => renderTransportModes());
+  });
+
+  // Shuffle: toggles + reshuffles the queue tail (the actual queue
+  // reorder lives in main.ts' setShuffle handler — state only persists).
+  document.getElementById("ytm-shuffle")?.addEventListener("click", () => {
+    void setShuffle(!app.shuffle).then(() => {
+      renderTransportModes();
+      void applyShuffle();
+    });
+  });
+
+  /** Shuffle ON: current track first, Fisher-Yates the tail (mirrors
+   *  the desktop shuffle handler). Shuffle OFF: no reorder (YTM keeps
+   *  the shuffled order — an unshuffle is a lie about "original"). */
+  async function applyShuffle(): Promise<void> {
+    if (!app.shuffle || app.queueTracks.length < 2) return;
+    const cur = app.queueCurrent ?? 0;
+    const head = app.queueTracks[cur];
+    if (!head) return;
+    const rest = app.queueTracks.filter((_, i) => i !== cur);
+    for (let i = rest.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    app.queueTracks = [head, ...rest];
+    app.queueCurrent = 0;
+    await setQueue(app.queueTracks);
+    notify();
+    renderTransportModes();
+  }
+
+  // Likes (spec 3.2): thumbs toggle — clicking the active rating clears it.
+  const likeBtn = document.getElementById("ytm-like");
+  const dislikeBtn = document.getElementById("ytm-dislike");
+  const currentTrackId = (): string | null => {
+    const cur = app.queueTracks[app.queueCurrent ?? 0];
+    return cur?.path.startsWith("web://") ? cur.path.slice(6) : null;
+  };
+  likeBtn?.addEventListener("click", async () => {
+    const id = currentTrackId();
+    if (!id) return;
+    const cur = await getLike(id);
+    await setLike(id, cur === "like" ? null : "like");
+    renderLikes();
+  });
+  dislikeBtn?.addEventListener("click", async () => {
+    const id = currentTrackId();
+    if (!id) return;
+    const cur = await getLike(id);
+    await setLike(id, cur === "dislike" ? null : "dislike");
+    renderLikes();
+  });
+
+  /** Active state for like/dislike on the current track. */
+  async function renderLikes(): Promise<void> {
+    const id = currentTrackId();
+    const val: LikeValue | null = id ? await getLike(id) : null;
+    likeBtn?.classList.toggle("active", val === "like");
+    dislikeBtn?.classList.toggle("active", val === "dislike");
+    likeBtn?.toggleAttribute("disabled", !id);
+    dislikeBtn?.toggleAttribute("disabled", !id);
+  }
+  void renderLikes();
+  subscribe(() => void renderLikes());
+  // Persisted-mode restore (loadTransportModes notifies) updates the
+  // transport immediately instead of waiting for the status poll.
+  subscribe(renderTransportModes);
   document.getElementById("ytm-stop")?.addEventListener("click", async () => {
     try {
       app.status = await invoke("stop_playback");
@@ -365,7 +457,35 @@ export function renderWebBar(): void {
   const seek = document.getElementById("ytm-seek") as HTMLInputElement | null;
   if (seek) seek.disabled = !(app.durationS > 0);
 
+  renderTransportModes();
   renderDrawer();
+}
+
+/** Repeat + shuffle button state (active class, titles, "1" badge). */
+export function renderTransportModes(): void {
+  const repeatBtn = document.getElementById("ytm-repeat");
+  if (repeatBtn) {
+    repeatBtn.classList.toggle("active", app.repeat !== "off");
+    repeatBtn.title =
+      app.repeat === "all" ? "Repeat all" : app.repeat === "one" ? "Repeat one" : "Repeat off";
+    // "1" indicator (repeat-one): a tnum numeral badge inside the button.
+    let badge = repeatBtn.querySelector<HTMLElement>(".ytm-repeat-one");
+    if (app.repeat === "one") {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "ytm-repeat-one";
+        badge.textContent = "1";
+        repeatBtn.appendChild(badge);
+      }
+    } else {
+      badge?.remove();
+    }
+  }
+  const shuffleBtn = document.getElementById("ytm-shuffle");
+  if (shuffleBtn) {
+    shuffleBtn.classList.toggle("active", app.shuffle);
+    shuffleBtn.title = app.shuffle ? "Shuffle on" : "Shuffle off";
+  }
 }
 
 /** Quality badge: honest format facts from the kernel's negotiated
