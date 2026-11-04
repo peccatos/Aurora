@@ -81,6 +81,13 @@ export async function startOutput(rate: number, ch: number): Promise<void> {
         if (msg.type === "state") {
           workletAvailable = msg.available;
           workletUnderruns = msg.underruns;
+        } else if (msg.type === "ack") {
+          workletAvailable = msg.frames;
+        } else if (msg.type === "flushed") {
+          // The worklet buffer is empty NOW — the main-thread fill loop
+          // must know, or it thinks the margin is full and leaves a
+          // gap of silence after every seek/pause (audible click).
+          workletAvailable = 0;
         }
       };
       node.connect(ctx.destination);
@@ -144,6 +151,7 @@ function dropScheduledAudio(reason: "pause" | "flush" | "stop"): void {
   }
   if (node) {
     node.port.postMessage({ type: "flush" });
+    workletAvailable = 0;
   }
   while (scheduled.length > 0) {
     const src = scheduled.pop();
@@ -173,8 +181,12 @@ function scheduleNext(token: number): void {
     if (usingWorklet && node) {
       const marginFrames = Math.round((MARGIN_MS / 1000) * sampleRate);
       // Top up in ~50ms pulls: bounded so one pull can't freeze the UI.
+      // Pull size never exceeds the free space: the worklet drops a
+      // full ring's tail (a click), and oversizing the transfer wastes
+      // copies.
       while (workletAvailable < marginFrames) {
-        const chunkFrames = 4096;
+        const free = marginFrames - workletAvailable;
+        const chunkFrames = Math.min(4096, free);
         const samples = k.web_pull(chunkFrames * channels * 4);
         const frames = Math.floor(samples.length / channels);
         if (frames === 0) break;

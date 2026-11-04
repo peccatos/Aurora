@@ -142,6 +142,88 @@ async function playWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
  *  aims at (-14 LUFS is the streaming-platform convention). */
 const NORMALIZE_TARGET_LUFS = -14;
 
+/** The track context menu (YTM ⋯): add to playlist (submenu of
+ *  existing playlists + create), play next. Anchored to the ⋯ button,
+ *  clamped to the viewport, closes on outside click/Esc. */
+function showTrackMenu(
+  anchor: HTMLElement,
+  trackId: string,
+  trackName: string,
+  all: WebTrack[],
+  index: number,
+): void {
+  document.querySelector(".ytm-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "ytm-menu";
+
+  const playNext = document.createElement("button");
+  playNext.type = "button";
+  playNext.textContent = "Play next";
+  playNext.addEventListener("click", () => {
+    // The current queue plus this track right after the playing one.
+    void (async () => {
+      const q = [...app.queueTracks];
+      const t = all[index];
+      if (!t) return;
+      const at = (app.queueCurrent ?? -1) + 1;
+      const path = t.kernelPath ?? (await registerWebBytes(t.id, new Uint8Array((await loadStoredBytes(t.id)) ?? []), t.extension));
+      const rg = t.lufs != null ? NORMALIZE_TARGET_LUFS - t.lufs : null;
+      q.splice(at, 0, { path, title: t.name, artist: t.artist, replaygain_track_db: rg, replaygain_album_db: null });
+      await setQueue(q);
+      setToast("Playing next");
+    })();
+    menu.remove();
+  });
+  menu.appendChild(playNext);
+
+  const addHeader = document.createElement("p");
+  addHeader.className = "ytm-menu-head";
+  addHeader.textContent = "Add to playlist";
+  menu.appendChild(addHeader);
+
+  void (async () => {
+    const { listPlaylists, addToPlaylist, createPlaylist } = await import("../playlist-service");
+    const lists = await listPlaylists();
+    for (const pl of lists) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = pl.name;
+      b.addEventListener("click", async () => {
+        await addToPlaylist(pl.id, [trackId]);
+        setToast(`Added to "${pl.name}"`);
+        menu.remove();
+      });
+      menu.appendChild(b);
+    }
+    const create = document.createElement("button");
+    create.type = "button";
+    create.className = "ytm-menu-create";
+    create.textContent = "＋ New playlist";
+    create.addEventListener("click", async () => {
+      const name = window.prompt(`Playlist name (for "${trackName}")`);
+      if (name === null) return;
+      const pl = await createPlaylist(name);
+      await addToPlaylist(pl.id, [trackId]);
+      setToast(`Added to "${pl.name}"`);
+      menu.remove();
+    });
+    menu.appendChild(create);
+  })();
+
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.min(rect.left, window.innerWidth - 260)}px`;
+  menu.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - 300)}px`;
+
+  const close = (e: Event) => {
+    if (!menu.contains(e.target as Node)) {
+      menu.remove();
+      document.removeEventListener("click", close, true);
+    }
+  };
+  document.addEventListener("click", close, true);
+}
+
 async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   const queue = [];
   for (const t of tracks) {
@@ -162,6 +244,33 @@ async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   }
   await setQueue(queue);
   await playQueueIndex(index);
+}
+
+/** Play a PLAYLIST by id: resolve stored tracks -> queue (lazy bytes,
+ *  persistent ids, LUFS normalization — the same pipeline as Home). */
+export async function playWebTracksByIds(playlistId: string, startIndex = 0): Promise<void> {
+  const { getPlaylist } = await import("../playlist-service");
+  const pl = await getPlaylist(playlistId);
+  if (!pl || !pl.trackIds.length) return;
+  const all = await getAllTracks();
+  const tracks: WebTrack[] = [];
+  for (const id of pl.trackIds) {
+    const stored = all.find((t) => t.id === id);
+    if (stored) {
+      tracks.push({
+        id: stored.id,
+        name: stored.name,
+        artist: stored.artist,
+        album: stored.album,
+        durationMs: stored.durationMs,
+        file: null,
+        extension: stored.extension,
+        lufs: stored.lufs ?? null,
+        kernelPath: null,
+      });
+    }
+  }
+  await playWebTracks(tracks, startIndex);
 }
 
 async function render(root: HTMLElement) {
@@ -245,6 +354,17 @@ async function render(root: HTMLElement) {
       dur.textContent = fmtDur(t.durationMs);
       main.append(title, meta);
       row.append(idx, thumb, main, dur);
+      // Context menu (YTM ⋯): add to playlist / play next.
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "ytm-track-more";
+      more.title = "More";
+      more.innerHTML = icon("more", 18);
+      more.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showTrackMenu(more, t.id, t.name, all, i);
+      });
+      row.appendChild(more);
       row.addEventListener("click", () => void playWebTracks(all, i));
       list.appendChild(row);
     });

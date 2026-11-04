@@ -23,6 +23,7 @@ import { eqPage } from "./pages/eq";
 import { pluginsPage } from "./pages/plugins";
 import { settingsPage } from "./pages/settings";
 import { decksPage } from "./pages/decks";
+import { playlistsPage, playlistDetailPage } from "./pages/playlists";
 import {
   isWebShell,
   renderWebShell,
@@ -44,7 +45,11 @@ registerPage(settingsPage);
 // ring consumer there — deck_play would be silent "playing"). The
 // page itself stays registered for the desktop shell.
 if (!isWebShell()) registerPage(decksPage);
-if (isWebShell()) registerPage(homePage);
+if (isWebShell()) {
+  registerPage(homePage);
+  registerPage(playlistsPage);
+  registerPage(playlistDetailPage);
+}
 
 const shell = document.querySelector<HTMLDivElement>("#app");
 if (!shell) throw new Error("Application root #app was not found");

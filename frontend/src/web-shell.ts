@@ -39,6 +39,7 @@ const NAV: NavEntry[] = [
 ];
 
 const LIBRARY_NAV: NavEntry[] = [
+  { route: "playlists", label: "Playlists", icon: "queue" },
   { route: "eq", label: "Equalizer", icon: "more" },
   { route: "settings", label: "Settings", icon: "more" },
 ];
@@ -141,6 +142,10 @@ export function renderWebShell(root: HTMLElement): {
         <div class="ytm-player-right">
           <button class="ytm-btn-icon" id="ytm-drawer-toggle" type="button" title="Queue">${icon("queue")}</button>
           <span class="ytm-quality" id="ytm-quality" hidden></span>
+          <div class="ytm-vol" id="ytm-vol">
+            <button class="ytm-btn-icon" id="ytm-vol-btn" type="button" title="Volume">${icon("volume")}</button>
+            <input id="ytm-vol-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
+          </div>
           <span class="ytm-player-artist" id="ytm-state">IDLE</span>
         </div>
       </footer>
@@ -262,6 +267,50 @@ export function bindWebPlayerBar(): void {
   document.getElementById("ytm-mini")?.addEventListener("click", (e) => {
     if ((e.target as HTMLElement).closest("button")) return; // transport btn
     window.location.hash = "#/player";
+  });
+
+  // Volume: through the kernel's DSP (volume_db) — the transformation
+  // stays visible in the Signal path (a JS GainNode would amplify
+  // invisibly, lying in the ADR 0002 report). Persisted in kv.
+  const volRange = document.getElementById("ytm-vol-range") as HTMLInputElement | null;
+  const volBtn = document.getElementById("ytm-vol-btn");
+  let lastVol = 100;
+  void (async () => {
+    try {
+      const { kvGet } = await import("./library-db");
+      const saved = await kvGet<number>("aw:volume");
+      if (typeof saved === "number" && volRange) {
+        volRange.value = String(saved);
+        lastVol = saved;
+        await applyVolume(saved);
+      }
+    } catch {
+      /* defaults */
+    }
+  })();
+  async function applyVolume(pct: number): Promise<void> {
+    // 0..100 -> dB: 100% = 0 dB (unity), 50% ~ -14 dB, 0% = -80 dB.
+    const db = pct <= 0 ? -80 : 60 * Math.log10(pct / 100);
+    try {
+      await invoke("set_dsp", { config: { ...(app.dsp ?? {}), volume_db: db } });
+    } catch {
+      /* kernel busy — retried on the next change */
+    }
+  }
+  volRange?.addEventListener("input", () => {
+    const pct = Number.parseFloat(volRange.value);
+    void applyVolume(pct);
+  });
+  volRange?.addEventListener("change", () => {
+    const pct = Number.parseFloat(volRange.value);
+    lastVol = pct;
+    void import("./library-db").then(({ kvPut }) => kvPut("aw:volume", pct)).catch(() => undefined);
+  });
+  volBtn?.addEventListener("click", () => {
+    if (!volRange) return;
+    const muted = Number.parseFloat(volRange.value) === 0;
+    volRange.value = muted ? String(lastVol || 100) : "0";
+    void applyVolume(muted ? lastVol || 100 : 0);
   });
 
   let seeking = false;

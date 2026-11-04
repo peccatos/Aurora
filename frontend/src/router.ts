@@ -65,8 +65,12 @@ function render() {
 }
 
 export function navigate(id: string) {
-  if (!pages.has(id)) return;
-  window.location.hash = `#/${id}`;
+  // id may carry a query (e.g. "playlist?id=…"): the page id is the
+  // part before "?" — the page re-reads the query from the hash at
+  // mount time.
+  const [pageId, query] = id.split("?");
+  if (!pages.has(pageId)) return;
+  window.location.hash = `#/${pageId}${query ? `?${query}` : ""}`;
 }
 
 export function startRouter(rootEl: HTMLElement, nav: HTMLElement) {
