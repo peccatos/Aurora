@@ -7,17 +7,20 @@
    Mobile (<=768px): bottom tabs + miniplayer. */
 
 :root {
-  /* Surfaces — deep graphite ladder, never pure black */
-  --ytm-bg: #101014;
-  --ytm-surface: #1a1a20;
-  --ytm-surface-hover: #23232b;
-  --ytm-surface-active: #2c2c36;
-  --ytm-raised: #26262e;
+  /* Surfaces — YTM dark ladder: page #030303, fields #121212,
+     cards #212121, menus #212121, hover #323232 (see ytm-menu). */
+  --ytm-bg: #030303;
+  --ytm-surface: #121212;
+  --ytm-surface-hover: #232323;
+  --ytm-surface-active: #212121;
+  --ytm-raised: #212121;
+  --ytm-menu-bg: #212121;
+  --ytm-menu-hover: #323232;
 
-  /* Text — one bright, two calm grays */
-  --ytm-text: #f2f2f5;
-  --ytm-text-2: #b8b8c0;
-  --ytm-text-3: #8a8a93;
+  /* Text — YTM grays */
+  --ytm-text: #fff;
+  --ytm-text-2: #aaa;
+  --ytm-text-3: #888;
 
   /* Accent — Braun orange, the ONE color in the UI */
   --ytm-accent: #e8500a;
@@ -25,17 +28,20 @@
   --ytm-accent-dim: rgba(232, 80, 10, 0.14);
 
   /* Misc */
-  --ytm-divider: #26262e;
+  --ytm-divider: #1f1f1f;
   --ytm-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
-  --ytm-radius: 10px;
+  --ytm-radius: 8px;
 
-  /* Layout metrics (desktop) */
-  --ytm-sidebar-w: 232px;
-  --ytm-player-h: 76px;
+  /* Layout metrics (YTM): guide 240px / rail 72px, topbar 64px,
+     player 72px, side panel 380px. */
+  --ytm-sidebar-w: 240px;
+  --ytm-guide-w: 72px;
+  --ytm-player-h: 72px;
+  --ytm-drawer-w: 380px;
   --ytm-tabbar-h: 56px; /* mobile bottom tabs */
   --ytm-miniplayer-h: 64px; /* mobile */
 
-  font-family: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-family: "Roboto", "Inter", "Segoe UI", system-ui, sans-serif;
   font-feature-settings: "tnum" 1; /* tabular numerals: seek bar never jitters */
 }
 
@@ -64,7 +70,7 @@
    persisted hamburger state is "expanded". */
 .ytm-app.guide-collapsed,
 .ytm-app.tablet-narrow {
-  grid-template-columns: var(--ytm-guide-w, 72px) 1fr;
+  grid-template-columns: var(--ytm-guide-w) 1fr;
 }
 .ytm-app.guide-collapsed .ytm-logo span,
 .ytm-app.guide-collapsed .ytm-nav-item span,
@@ -78,11 +84,25 @@
 .ytm-app.tablet-narrow .ytm-nav-item {
   justify-content: center;
   padding: 0;
+  gap: 0;
 }
-.ytm-app.guide-collapsed .ytm-logo,
-.ytm-app.tablet-narrow .ytm-logo {
+.ytm-app.guide-collapsed .ytm-guide-head,
+.ytm-app.tablet-narrow .ytm-guide-head {
+  flex-direction: column;
+  padding: 8px 0 12px;
+}
+.ytm-app.guide-collapsed .ytm-guide-new,
+.ytm-app.tablet-narrow .ytm-guide-new {
   justify-content: center;
-  padding: 12px 0 8px;
+  margin: 4px 12px;
+  padding: 0;
+  border-radius: 50%;
+  width: 40px;
+  align-self: center;
+}
+.ytm-app.guide-collapsed .ytm-guide-divider,
+.ytm-app.tablet-narrow .ytm-guide-divider {
+  margin: 8px 12px;
 }
 
 .ytm-content {
@@ -93,7 +113,7 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Sidebar (desktop)                                                   */
+/* Guide / sidebar (desktop, YTM persistent guide)                     */
 /* ------------------------------------------------------------------ */
 
 .ytm-sidebar {
@@ -102,35 +122,67 @@
   border-right: 1px solid var(--ytm-divider);
   display: flex;
   flex-direction: column;
-  padding: 12px 0;
-  overflow-y: auto;
+  padding: 0;
+  overflow: hidden;
+}
+
+.ytm-guide-nav {
+  flex-shrink: 0;
+}
+
+.ytm-guide-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px 12px;
 }
 
 .ytm-logo {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 24px 16px;
-  font-size: 17px;
+  gap: 8px;
+  font-size: 16px;
   font-weight: 500;
-  letter-spacing: -0.3px;
+  letter-spacing: -0.2px;
+  color: var(--ytm-text);
 }
 
 .ytm-logo svg {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.ytm-guide-sections {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 16px;
+}
+
+.ytm-guide-section {
+  display: flex;
+  flex-direction: column;
+}
+
+.ytm-guide-divider {
+  height: 1px;
+  background: var(--ytm-divider);
+  margin: 12px 0;
 }
 
 .ytm-nav-item {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: 16px;
   padding: 0 24px;
-  height: 44px;
+  height: 40px;
   color: var(--ytm-text-2);
   font-size: 14px;
   cursor: pointer;
   border-radius: 0;
+  background: none;
+  border: none;
+  font-family: inherit;
   transition: background 0.1s;
 }
 
@@ -141,13 +193,13 @@
 
 .ytm-nav-item.active {
   color: var(--ytm-text);
-  background: var(--ytm-surface);
+  background: var(--ytm-surface-hover);
   font-weight: 500;
 }
 
 .ytm-nav-item svg {
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   fill: currentColor;
   flex-shrink: 0;
 }
@@ -159,6 +211,103 @@
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--ytm-text-3);
+}
+
+/* "Новый" tonal button (YTM guide) */
+.ytm-guide-new {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 4px 12px;
+  height: 40px;
+  padding: 0 12px;
+  background: var(--ytm-surface-active);
+  color: var(--ytm-text);
+  border: none;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.ytm-guide-new:hover {
+  background: #323232;
+}
+
+.ytm-guide-new svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+/* Guide playlist rows: subtitle style like YTM's guide list */
+.ytm-guide-playlists {
+  display: flex;
+  flex-direction: column;
+}
+
+.ytm-guide-playlist .ytm-guide-playlist-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--ytm-text-3);
+}
+
+.ytm-guide-playlist .ytm-guide-playlist-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* Playing-state equalizer bars (guide + track rows): 3 animated bars */
+.ytm-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+
+.ytm-eq i {
+  width: 3px;
+  background: currentColor;
+  border-radius: 1px;
+  animation: ytm-eq-bounce 0.8s ease-in-out infinite;
+}
+
+.ytm-eq i:nth-child(1) {
+  height: 6px;
+  animation-delay: -0.2s;
+}
+
+.ytm-eq i:nth-child(2) {
+  height: 12px;
+  animation-delay: -0.45s;
+}
+
+.ytm-eq i:nth-child(3) {
+  height: 8px;
+  animation-delay: -0.65s;
+}
+
+@keyframes ytm-eq-bounce {
+  0%,
+  100% {
+    transform: scaleY(0.4);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ytm-eq i {
+    animation: none;
+    transform: none;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,17 +456,76 @@
 /* Player bar (bottom, desktop)                                        */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Player bar (bottom, YTM three-zone: left meta / center transport /
+   right controls; thin full-width progress strip on the bar's top). */
+/* ------------------------------------------------------------------ */
+
 .ytm-player {
   grid-area: player;
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(280px, 2fr) minmax(180px, 1fr);
-  align-items: center;
-  padding: 0 16px;
+  display: flex;
+  flex-direction: column;
   background: var(--ytm-bg);
   border-top: 1px solid var(--ytm-divider);
 }
 
-/* Left: now playing preview */
+/* Progress strip: sits on the TOP EDGE of the bar (YTM layout). The
+   times flank it; the range is the scrubber. */
+.ytm-player-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.ytm-time {
+  font-size: 11px;
+  color: var(--ytm-text-3);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  line-height: 1;
+}
+
+.ytm-time:last-child {
+  text-align: left;
+}
+
+.ytm-player-progress input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 4px;
+  background: var(--ytm-surface-hover);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.ytm-player-progress input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ytm-accent);
+  border: none;
+  cursor: pointer;
+}
+
+/* The 72px body: three YTM zones (280px / 1fr / 280px). */
+.ytm-player-body {
+  display: grid;
+  grid-template-columns: 280px minmax(280px, 2fr) 280px;
+  align-items: center;
+  height: 56px;
+  padding: 0 16px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Left: now playing preview (40px art in YTM) */
 .ytm-player-now {
   display: flex;
   align-items: center;
@@ -327,8 +535,8 @@
 }
 
 .ytm-player-art {
-  width: 48px;
-  height: 48px;
+  width: 40px;
+  height: 40px;
   border-radius: 4px;
   background: var(--ytm-raised);
   overflow: hidden;
@@ -343,6 +551,7 @@
 
 .ytm-player-meta {
   min-width: 0;
+  flex: 1;
 }
 
 .ytm-player-title {
@@ -361,19 +570,17 @@
   text-overflow: ellipsis;
 }
 
-/* Center: transport + progress */
+/* Center: transport (YTM: prev / play / next only) */
 .ytm-player-center {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding: 0 24px;
+  justify-content: center;
+  min-width: 0;
 }
 
 .ytm-transport {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: 12px;
 }
 
 .ytm-btn-icon {
@@ -387,6 +594,7 @@
   justify-content: center;
   color: var(--ytm-text-2);
   cursor: pointer;
+  font-family: inherit;
   transition: color 0.1s;
 }
 
@@ -454,41 +662,13 @@
   height: 32px;
 }
 
-.ytm-progress {
+/* Right: queue / stop / volume / shuffle / repeat (YTM order) */
+.ytm-player-right {
   display: flex;
   align-items: center;
-  gap: 10px;
-  width: 100%;
-  max-width: 640px;
-}
-
-.ytm-time {
-  font-size: 11px;
-  color: var(--ytm-text-3);
-  font-variant-numeric: tabular-nums;
-  min-width: 36px;
-}
-
-.ytm-progress input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  flex: 1;
-  height: 4px;
-  background: var(--ytm-surface-active);
-  border-radius: 2px;
-  outline: none;
-  cursor: pointer;
-}
-
-.ytm-progress input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: var(--ytm-accent);
-  border: none;
-  cursor: pointer;
+  justify-content: flex-end;
+  gap: 2px;
+  min-width: 0;
 }
 
 /* Right: extra controls */
@@ -571,13 +751,14 @@
 .ytm-search {
   display: flex;
   align-items: center;
-  gap: 12px;
-  background: var(--ytm-surface);
-  border-radius: 8px;
-  padding: 0 16px;
+  gap: 8px;
+  background: var(--ytm-surface); /* YTM's #121212 search field */
+  border-radius: var(--ytm-radius);
+  padding: 0 8px 0 16px;
   height: 48px;
   max-width: 560px;
   margin-bottom: 24px;
+  color: var(--ytm-text-3);
 }
 
 .ytm-search input {
@@ -855,6 +1036,45 @@
   right: 16px;
 }
 
+/* Main panel wrapper: artwork + Трек/Видео toggle (YTM player page) */
+.np-main {
+  position: relative;
+}
+
+/* Трек/Видео toggle (YTM av-toggle pill). Видео honestly disabled:
+   there is no video decoder on the web bridge yet — a clickable
+   "Видео" would promise what the engine cannot deliver (ADR 0002). */
+.np-av-toggle {
+  display: inline-flex;
+  background: var(--ytm-surface);
+  border-radius: 999px;
+  padding: 3px;
+  margin-bottom: 16px;
+}
+
+.np-av-btn {
+  border: none;
+  background: none;
+  color: var(--ytm-text-2);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 5px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.np-av-btn.active {
+  background: var(--ytm-surface-hover);
+  color: var(--ytm-text);
+}
+
+.np-av-btn[disabled] {
+  color: var(--ytm-text-3);
+  cursor: default;
+  opacity: 0.6;
+}
+
 .np-art {
   width: 100%;
   aspect-ratio: 1;
@@ -1003,19 +1223,34 @@
 
 .ytm-topbar {
   grid-area: topbar;
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  gap: 16px;
   padding: 0 16px;
   background: var(--ytm-bg);
   border-bottom: 1px solid var(--ytm-divider);
 }
 
+.ytm-topbar-left,
+.ytm-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ytm-topbar-right {
+  justify-content: flex-end;
+}
+
+.ytm-topbar-center {
+  display: flex;
+  justify-content: center;
+}
+
 .ytm-topbar .ytm-search {
-  flex: 1;
-  max-width: 560px;
-  margin: 0 auto;
-  height: 44px;
+  width: min(560px, 100%);
+  height: 40px;
+  margin: 0;
 }
 
 .ytm-quality {
@@ -1057,8 +1292,9 @@
   top: 0;
   right: 0;
   bottom: var(--ytm-player-h);
-  width: var(--ytm-drawer-w, 340px);
-  background: var(--ytm-surface);
+  width: var(--ytm-drawer-w);
+  background: var(--ytm-bg);
+  border-left: 1px solid var(--ytm-divider);
   box-shadow: var(--ytm-shadow);
   transform: translateX(100%);
   transition: transform 0.22s ease;
@@ -1216,6 +1452,7 @@
   .ytm-drawer {
     bottom: calc(var(--ytm-tabbar-h) + var(--ytm-miniplayer-h));
     width: 100%;
+    --ytm-drawer-w: 380px;
   }
 }
 
@@ -1229,9 +1466,9 @@
   min-width: 220px;
   max-height: 320px;
   overflow-y: auto;
-  background: var(--ytm-surface-active);
+  background: var(--ytm-menu-bg); /* YTM #212121 */
   border: 1px solid var(--ytm-divider);
-  border-radius: 8px;
+  border-radius: var(--ytm-radius);
   box-shadow: var(--ytm-shadow);
   padding: 6px 0;
   display: flex;
@@ -1250,7 +1487,7 @@
 }
 
 .ytm-menu button:hover {
-  background: var(--ytm-surface-hover);
+  background: var(--ytm-menu-hover); /* YTM #323232 */
   color: var(--ytm-text);
 }
 

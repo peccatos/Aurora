@@ -132,13 +132,19 @@ function render(root: HTMLElement) {
     <div class="np-page" id="np-page">
       <div class="np-bg" id="np-bg" aria-hidden="true"></div>
       <div class="np-close">
-        <button class="btn" id="np-close-btn" type="button" title="Back">✕ Close</button>
+        <button class="btn" id="np-close-btn" type="button" title="Назад">✕ Закрыть</button>
       </div>
-      <div class="np-art" id="np-art"><span class="art-glyph">♪</span></div>
+      <div class="np-main">
+        <div class="np-av-toggle" id="np-av-toggle" aria-label="Режим воспроизведения">
+          <button class="np-av-btn active" data-av="song" type="button">Трек</button>
+          <button class="np-av-btn" data-av="video" type="button" disabled title="Видео недоступно">Видео</button>
+        </div>
+        <div class="np-art" id="np-art"><span class="art-glyph">♪</span></div>
+      </div>
       <div class="np-side">
-        <p class="overline">Now playing</p>
-        <h1 class="np-title" id="np-title">Nothing playing</h1>
-        <p class="np-artist" id="np-artist">Open a file or pick from the library</p>
+        <p class="overline">Сейчас играет</p>
+        <h1 class="np-title" id="np-title">Ничего не играет</h1>
+        <p class="np-artist" id="np-artist">Откройте файл или выберите из библиотеки</p>
 
         <div class="wave-seek" id="wave-seek">
           <canvas id="wave-canvas" width="640" height="56"></canvas>
@@ -150,7 +156,7 @@ function render(root: HTMLElement) {
           <div class="loop-controls">
             <button class="btn" id="loop-set-a" type="button">A</button>
             <button class="btn" id="loop-set-b" type="button">B</button>
-            <button class="btn" id="loop-clear" type="button">Loop off</button>
+            <button class="btn" id="loop-clear" type="button">Без повтора</button>
           </div>
           <span id="wave-dur">0:00</span>
         </div>
@@ -158,16 +164,24 @@ function render(root: HTMLElement) {
         <div class="spectrum" id="spectrum"></div>
 
         <nav class="np-tabs" id="np-tabs">
-          <button class="np-tab active" data-tab="lyrics" type="button">Lyrics</button>
-          <button class="np-tab" data-tab="queue" type="button">Up next</button>
+          <button class="np-tab active" data-tab="queue" type="button">Далее</button>
+          <button class="np-tab" data-tab="lyrics" type="button">Текст</button>
+          <button class="np-tab" data-tab="comments" type="button">Комментарии</button>
+          <button class="np-tab" data-tab="related" type="button">Похожие</button>
           <button class="np-tab" data-tab="signal" type="button">Signal path</button>
         </nav>
 
-        <section class="np-tab-body" id="tab-lyrics">
-          <div class="np-lyrics" id="np-lyrics"></div>
-        </section>
         <section class="np-tab-body" id="tab-queue" hidden>
           <ul class="np-queue" id="np-queue"></ul>
+        </section>
+        <section class="np-tab-body" id="tab-lyrics" hidden>
+          <div class="np-lyrics" id="np-lyrics"></div>
+        </section>
+        <section class="np-tab-body" id="tab-comments" hidden>
+          <p class="np-lyrics-hint">Комментарии пока недоступны — локальный плеер без аккаунтов.</p>
+        </section>
+        <section class="np-tab-body" id="tab-related" hidden>
+          <p class="np-lyrics-hint">Похожие треки пока недоступны — рекомендации появятся вместе с онлайн-источниками.</p>
         </section>
         <section class="np-tab-body" id="tab-signal" hidden>
           <dl class="signal-grid" id="signal-grid"></dl>
@@ -182,7 +196,7 @@ function render(root: HTMLElement) {
     const btn = (ev.target as HTMLElement).closest<HTMLElement>(".np-tab");
     if (!btn?.dataset.tab) return;
     root.querySelectorAll<HTMLElement>(".np-tab").forEach((t) => t.classList.toggle("active", t === btn));
-    for (const name of ["lyrics", "queue", "signal"]) {
+    for (const name of ["queue", "lyrics", "comments", "related", "signal"]) {
       const body = root.querySelector<HTMLElement>(`#tab-${name}`);
       if (body) body.hidden = name !== btn.dataset.tab;
     }

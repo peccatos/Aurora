@@ -1,8 +1,9 @@
-/** Aurora Web shell — YTM-faithful layout (design direction winner).
+/** Aurora Web shell — YTM 1:1 layout (dark, ru-RU).
  *
- * Anatomy (YTM): left guide rail + collapsible sidebar, top bar with
- * search pill, routed content, bottom player bar (72px) with volume +
- * quality badge, right queue drawer (340px), mobile tabs + miniplayer.
+ * Anatomy mirrors music.youtube.com exactly: persistent left guide
+ * (240px, collapsible to 72px icon rail), 64px topbar with centered
+ * search pill, routed content, 72px full-width bottom player bar with
+ * a thin 4px progress strip on its top edge, 380px queue side panel.
  * The one deliberate deviation: Braun-orange accent instead of YTM red
  * (owner's veto on a literal Google look — one-file swap if reverted).
  */
@@ -27,6 +28,7 @@ import { unlockAudio, flushOutput } from "./audio-bridge";
 import { icon, type IconName } from "./styles/ytm-icons";
 import "./styles/ytm.css";
 import { homePage } from "./pages/home";
+import { listPlaylists, onPlaylistsChanged } from "./playlist-service";
 
 export function isWebShell(): boolean {
   return platform === "web";
@@ -39,16 +41,15 @@ interface NavEntry {
 }
 
 const NAV: NavEntry[] = [
-  { route: "home", label: "Home", icon: "home" },
-  { route: "library", label: "Explore", icon: "explore" },
-  { route: "history", label: "History", icon: "home" },
-  { route: "queue", label: "Queue", icon: "queue" },
+  { route: "home", label: "Главная", icon: "home" },
+  { route: "library", label: "Навигатор", icon: "explore" },
+  { route: "history", label: "Библиотека", icon: "library" },
 ];
 
 const LIBRARY_NAV: NavEntry[] = [
-  { route: "playlists", label: "Playlists", icon: "queue" },
-  { route: "eq", label: "Equalizer", icon: "more" },
-  { route: "settings", label: "Settings", icon: "more" },
+  { route: "playlists", label: "Плейлисты", icon: "queue" },
+  { route: "eq", label: "Эквалайзер", icon: "more" },
+  { route: "settings", label: "Настройки", icon: "more" },
 ];
 
 // Decks are NATIVE-ONLY for now: the wasm bridge drains only the main
@@ -56,9 +57,9 @@ const LIBRARY_NAV: NavEntry[] = [
 // deck_play would report "playing" with permanent silence (a dishonest
 // status per ADR 0002). Hidden until the ring mixer lands.
 const MOBILE_TABS: NavEntry[] = [
-  { route: "home", label: "Home", icon: "home" },
-  { route: "library", label: "Explore", icon: "explore" },
-  { route: "queue", label: "Queue", icon: "queue" },
+  { route: "home", label: "Главная", icon: "home" },
+  { route: "library", label: "Навигатор", icon: "explore" },
+  { route: "queue", label: "Очередь", icon: "queue" },
 ];
 
 /** Render the shell into #app. Returns the content root + nav elements. */
@@ -70,34 +71,45 @@ export function renderWebShell(root: HTMLElement): {
   root.innerHTML = `
     <div class="ytm-app">
       <nav class="ytm-sidebar" id="ytm-sidebar">
-        <div class="ytm-logo">
-          <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
-            <!-- Aurora mark: an off-center pulse (waveform seed), Braun-orange -->
-            <circle cx="12" cy="12" r="11" fill="#e8500a" opacity="0.92"/>
-            <path d="M4 12h2.2l1.4-4.4L10.5 17l2.2-9 1.6 5.6 1.1-1.6H20" fill="none" stroke="#101014" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span>Aurora</span>
+        <div class="ytm-guide-nav">
+          <div class="ytm-guide-head">
+            <button class="ytm-btn-icon" id="ytm-guide-toggle" type="button" title="Скрыть меню">${icon("more")}</button>
+            <div class="ytm-logo">
+              <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+                <!-- Aurora mark: an off-center pulse (waveform seed), Braun-orange -->
+                <circle cx="12" cy="12" r="11" fill="#e8500a" opacity="0.92"/>
+                <path d="M4 12h2.2l1.4-4.4L10.5 17l2.2-9 1.6 5.6 1.1-1.6H20" fill="none" stroke="#030303" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Aurora</span>
+            </div>
+          </div>
         </div>
-        <p class="ytm-nav-section">Main</p>
-        ${NAV.map(
-          (n) =>
-            `<button class="ytm-nav-item" data-route="${n.route}" type="button">${icon(n.icon)}<span>${n.label}</span></button>`,
-        ).join("\n        ")}
-        <p class="ytm-nav-section">Library</p>
-        ${LIBRARY_NAV.map(
-          (n) =>
-            `<button class="ytm-nav-item" data-route="${n.route}" type="button">${icon(n.icon)}<span>${n.label}</span></button>`,
-        ).join("\n        ")}
+        <div class="ytm-guide-sections" id="ytm-guide-sections">
+          <div class="ytm-guide-section" id="ytm-guide-main"></div>
+          <div class="ytm-guide-divider"></div>
+          <div class="ytm-guide-section" id="ytm-guide-playlists-wrap">
+            <button class="ytm-guide-new" id="ytm-guide-new" type="button">${icon("plus")}<span>Новый</span></button>
+          </div>
+          <div class="ytm-guide-playlists" id="ytm-guide-playlists"></div>
+          <div class="ytm-guide-divider"></div>
+          <div class="ytm-guide-section" id="ytm-guide-library"></div>
+        </div>
       </nav>
 
       <header class="ytm-topbar" id="ytm-topbar">
-        <button class="ytm-btn-icon" id="ytm-guide-toggle" type="button" title="Toggle menu">${icon("more")}</button>
-        <div class="ytm-search" id="ytm-topbar-search">
-          ${icon("search", 20)}
-          <input id="ytm-search-input" type="search" placeholder="Search songs, artists" autocomplete="off" />
-          <button class="ytm-btn-icon" id="ytm-search-clear" type="button" title="Clear" hidden>${icon("close", 18)}</button>
+        <div class="ytm-topbar-left">
+          <button class="ytm-btn-icon" id="ytm-guide-toggle-2" type="button" title="Меню" hidden>${icon("more")}</button>
         </div>
-        <button id="ytm-avatar" type="button" title="Menu">A</button>
+        <div class="ytm-topbar-center">
+          <div class="ytm-search" id="ytm-topbar-search">
+            ${icon("search", 20)}
+            <input id="ytm-search-input" type="search" placeholder="Поиск треков, альбомов, исполнителей, подкастов" autocomplete="off" />
+            <button class="ytm-btn-icon" id="ytm-search-clear" type="button" title="Очистить" hidden>${icon("close", 18)}</button>
+          </div>
+        </div>
+        <div class="ytm-topbar-right">
+          <button id="ytm-avatar" type="button" title="Меню">A</button>
+        </div>
       </header>
 
       <main class="ytm-content" id="ytm-content"></main>
@@ -106,7 +118,7 @@ export function renderWebShell(root: HTMLElement): {
         <div class="ytm-player-art" id="ytm-mini-art"></div>
         <div class="ytm-player-meta">
           <div class="ytm-player-title" id="ytm-mini-title">Aurora Web</div>
-          <div class="ytm-player-artist" id="ytm-mini-artist">Drop music to begin</div>
+          <div class="ytm-player-artist" id="ytm-mini-artist">Перетащите музыку, чтобы начать</div>
         </div>
         <button class="ytm-btn-icon ytm-btn-play" id="ytm-mini-play" type="button">${icon("play")}</button>
       </div>
@@ -118,57 +130,69 @@ export function renderWebShell(root: HTMLElement): {
         ).join("\n        ")}
       </nav>
 
-      <aside class="ytm-drawer" id="ytm-drawer" aria-label="Queue">
+      <aside class="ytm-drawer" id="ytm-drawer" aria-label="Очередь">
         <header class="ytm-drawer-head">
-          <span class="ytm-drawer-title">Queue</span>
+          <span class="ytm-drawer-title">Очередь</span>
           <span class="ytm-drawer-head-actions">
-            <button id="ytm-drawer-clear" type="button" title="Clear the queue">Clear</button>
-            <button class="ytm-btn-icon" id="ytm-drawer-close" type="button" title="Close">${icon("close", 20)}</button>
+            <button id="ytm-drawer-clear" type="button" title="Очистить очередь">Очистить</button>
+            <button class="ytm-btn-icon" id="ytm-drawer-close" type="button" title="Закрыть">${icon("close", 20)}</button>
           </span>
         </header>
         <div class="ytm-drawer-body" id="ytm-drawer-body"></div>
       </aside>
 
       <footer class="ytm-player">
-        <div class="ytm-player-now" id="ytm-now">
-          <div class="ytm-player-art" id="ytm-art"></div>
-          <div class="ytm-player-meta">
-            <div class="ytm-player-title" id="ytm-title">Aurora Web</div>
-            <div class="ytm-player-artist" id="ytm-artist">Drop music to begin</div>
-          </div>
-          <div class="ytm-player-like">
-            <button class="ytm-btn-icon" id="ytm-like" type="button" title="Like">${icon("like")}</button>
-            <button class="ytm-btn-icon" id="ytm-dislike" type="button" title="Dislike">${icon("dislike")}</button>
-          </div>
+        <div class="ytm-player-progress" id="ytm-player-progress">
+          <span class="ytm-time" id="ytm-cur">0:00</span>
+          <input id="ytm-seek" type="range" min="0" max="1000" step="1" value="0" />
+          <span class="ytm-time" id="ytm-dur">0:00</span>
         </div>
-        <div class="ytm-player-center">
-          <div class="ytm-transport">
-            <button class="ytm-btn-icon" id="ytm-shuffle" type="button" title="Shuffle">${icon("shuffle")}</button>
-            <button class="ytm-btn-icon" id="ytm-prev" type="button" title="Previous">${icon("prev")}</button>
-            <button class="ytm-btn-icon ytm-btn-play" id="ytm-play" type="button" title="Play / Pause">${icon("play")}</button>
-            <button class="ytm-btn-icon" id="ytm-next" type="button" title="Next">${icon("next")}</button>
-            <button class="ytm-btn-icon" id="ytm-repeat" type="button" title="Repeat off">${icon("repeat")}</button>
-            <button class="ytm-btn-icon" id="ytm-stop" type="button" title="Stop">${icon("close")}</button>
+        <div class="ytm-player-body">
+          <div class="ytm-player-now" id="ytm-now">
+            <div class="ytm-player-art" id="ytm-art"></div>
+            <div class="ytm-player-meta">
+              <div class="ytm-player-title" id="ytm-title">Aurora Web</div>
+              <div class="ytm-player-artist" id="ytm-artist">Перетащите музыку, чтобы начать</div>
+            </div>
+            <div class="ytm-player-like">
+              <button class="ytm-btn-icon" id="ytm-like" type="button" title="Нравится">${icon("like")}</button>
+              <button class="ytm-btn-icon" id="ytm-dislike" type="button" title="Не нравится">${icon("dislike")}</button>
+            </div>
           </div>
-          <div class="ytm-progress">
-            <span class="ytm-time" id="ytm-cur">0:00</span>
-            <input id="ytm-seek" type="range" min="0" max="1000" step="1" value="0" />
-            <span class="ytm-time" id="ytm-dur">0:00</span>
+          <div class="ytm-player-center">
+            <div class="ytm-transport">
+              <button class="ytm-btn-icon" id="ytm-prev" type="button" title="Назад">${icon("prev")}</button>
+              <button class="ytm-btn-icon ytm-btn-play" id="ytm-play" type="button" title="Приостановить">${icon("play")}</button>
+              <button class="ytm-btn-icon" id="ytm-next" type="button" title="Далее">${icon("next")}</button>
+            </div>
           </div>
-        </div>
-        <div class="ytm-player-right">
-          <button class="ytm-btn-icon" id="ytm-drawer-toggle" type="button" title="Queue">${icon("queue")}</button>
-          <span class="ytm-quality" id="ytm-quality" hidden></span>
-          <div class="ytm-vol" id="ytm-vol">
-            <button class="ytm-btn-icon" id="ytm-vol-btn" type="button" title="Volume">${icon("volume")}</button>
-            <input id="ytm-vol-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
+          <div class="ytm-player-right">
+            <span class="ytm-quality" id="ytm-quality" hidden></span>
+            <span class="ytm-player-artist" id="ytm-state">IDLE</span>
+            <button class="ytm-btn-icon" id="ytm-drawer-toggle" type="button" title="Очередь">${icon("queue")}</button>
+            <button class="ytm-btn-icon" id="ytm-stop" type="button" title="Стоп">${icon("close")}</button>
+            <div class="ytm-vol" id="ytm-vol">
+              <input id="ytm-vol-range" type="range" min="0" max="100" step="1" value="100" aria-label="Громкость" />
+              <button class="ytm-btn-icon" id="ytm-vol-btn" type="button" title="Громкость">${icon("volume")}</button>
+            </div>
+            <button class="ytm-btn-icon" id="ytm-shuffle" type="button" title="Перемешать">${icon("shuffle")}</button>
+            <button class="ytm-btn-icon" id="ytm-repeat" type="button" title="Повтор отключен">${icon("repeat")}</button>
           </div>
-          <span class="ytm-player-artist" id="ytm-state">IDLE</span>
         </div>
       </footer>
     </div>
     <p class="toast" id="toast" role="status"></p>
   `;
+
+  // Static guide sections (nav rows).
+  const mainSec = document.getElementById("ytm-guide-main");
+  const libSec = document.getElementById("ytm-guide-library");
+  if (mainSec) {
+    for (const n of NAV) mainSec.appendChild(navRow(n));
+  }
+  if (libSec) {
+    for (const n of LIBRARY_NAV) libSec.appendChild(navRow(n));
+  }
 
   // Guide collapse (YTM hamburger): persisted.
   const guideToggle = document.getElementById("ytm-guide-toggle");
@@ -176,18 +200,27 @@ export function renderWebShell(root: HTMLElement): {
     const el = document.querySelector<HTMLElement>(".ytm-app");
     if (!el) return;
     const collapsed = el.classList.toggle("guide-collapsed");
+    const alt = document.getElementById("ytm-guide-toggle-2");
+    if (alt) alt.hidden = !collapsed;
     try {
       localStorage.setItem("aw:guide-collapsed", collapsed ? "1" : "0");
     } catch {
       /* private mode */
     }
   });
+  document.getElementById("ytm-guide-toggle-2")?.addEventListener("click", () => {
+    document.getElementById("ytm-guide-toggle")?.click();
+  });
+  let startCollapsed = false;
   try {
-    if (localStorage.getItem("aw:guide-collapsed") === "1") {
-      document.querySelector<HTMLElement>(".ytm-app")?.classList.add("guide-collapsed");
-    }
+    startCollapsed = localStorage.getItem("aw:guide-collapsed") === "1";
   } catch {
     /* ignore */
+  }
+  if (startCollapsed) {
+    document.querySelector<HTMLElement>(".ytm-app")?.classList.add("guide-collapsed");
+    const alt = document.getElementById("ytm-guide-toggle-2");
+    if (alt) alt.hidden = false;
   }
 
   // Tablet (spec 5.3): the collapsed-rail layout applies whenever the
@@ -196,6 +229,22 @@ export function renderWebShell(root: HTMLElement): {
   if (matchMedia("(max-width:1024px)").matches) {
     document.querySelector<HTMLElement>(".ytm-app")?.classList.add("tablet-narrow");
   }
+
+  // Live playlists in the guide (YTM: user playlists under "Новый").
+  void renderGuidePlaylists();
+  onPlaylistsChanged(() => void renderGuidePlaylists());
+  document.getElementById("ytm-guide-new")?.addEventListener("click", () => {
+    // Same flow as the playlists page's "Новый": prompt + create, then
+    // navigate to the fresh playlist.
+    const name = window.prompt("Название плейлиста");
+    if (name === null) return;
+    void (async () => {
+      const { createPlaylist } = await import("./playlist-service");
+      const pl = await createPlaylist(name);
+      setToast(`Создан «${pl.name}»`);
+      window.location.hash = `#/playlist?id=${encodeURIComponent(pl.id)}`;
+    })();
+  });
 
   // Avatar (spec 5.4): kv profile-name initial, shared menu pattern.
   const avatar = document.getElementById("ytm-avatar");
@@ -265,6 +314,43 @@ export function renderWebShell(root: HTMLElement): {
   };
 }
 
+function navRow(n: NavEntry): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "ytm-nav-item";
+  b.dataset.route = n.route;
+  b.innerHTML = icon(n.icon) + `<span>${n.label}</span>`;
+  return b;
+}
+
+/** Guide playlists: live rows from playlist-service (YTM's guide list). */
+async function renderGuidePlaylists(): Promise<void> {
+  const box = document.getElementById("ytm-guide-playlists");
+  if (!box) return;
+  box.innerHTML = "";
+  try {
+    const lists = await listPlaylists();
+    for (const p of lists) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "ytm-nav-item ytm-guide-playlist";
+      row.dataset.playlist = p.id;
+      const ic = document.createElement("span");
+      ic.className = "ytm-guide-playlist-icon";
+      ic.innerHTML = icon("queue");
+      const label = document.createElement("span");
+      label.textContent = p.name;
+      row.append(ic, label);
+      row.addEventListener("click", () => {
+        window.location.hash = `#/playlist?id=${encodeURIComponent(p.id)}`;
+      });
+      box.appendChild(row);
+    }
+  } catch {
+    /* playlists store unavailable — the section just stays empty */
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Player bar behavior (bound after the shell renders)
 // ---------------------------------------------------------------------------
@@ -296,7 +382,7 @@ export function bindWebPlayerBar(): void {
       }
       await loadStatus();
     } catch (e) {
-      setToast(`Play failed: ${String(e)}`);
+      setToast(`Не удалось воспроизвести: ${String(e)}`);
     }
   };
 
@@ -480,7 +566,7 @@ export function renderWebBar(): void {
   if (title) title.textContent = t;
   if (artist) artist.textContent = a;
   if (miniTitle) miniTitle.textContent = t;
-  if (miniArtist) miniArtist.textContent = a || "Drop music to begin";
+  if (miniArtist) miniArtist.textContent = a || "Перетащите музыку, чтобы начать";
   if (stateEl) stateEl.textContent = s?.state?.toUpperCase() ?? "IDLE";
 
   // Play/pause icon.
@@ -489,6 +575,8 @@ export function renderWebBar(): void {
     const btn = document.getElementById(id);
     if (btn) btn.innerHTML = playing ? icon("pause") : icon("play");
   }
+  const playBtn = document.getElementById("ytm-play");
+  if (playBtn) playBtn.title = playing ? "Приостановить" : "Воспроизвести";
 
   // Seek bar: enabled whenever a duration is known.
   const seek = document.getElementById("ytm-seek") as HTMLInputElement | null;
@@ -504,7 +592,7 @@ export function renderTransportModes(): void {
   if (repeatBtn) {
     repeatBtn.classList.toggle("active", app.repeat !== "off");
     repeatBtn.title =
-      app.repeat === "all" ? "Repeat all" : app.repeat === "one" ? "Repeat one" : "Repeat off";
+      app.repeat === "all" ? "Повторять все треки" : app.repeat === "one" ? "Повторять один трек" : "Повтор отключен";
     // "1" indicator (repeat-one): a tnum numeral badge inside the button.
     let badge = repeatBtn.querySelector<HTMLElement>(".ytm-repeat-one");
     if (app.repeat === "one") {
@@ -521,7 +609,7 @@ export function renderTransportModes(): void {
   const shuffleBtn = document.getElementById("ytm-shuffle");
   if (shuffleBtn) {
     shuffleBtn.classList.toggle("active", app.shuffle);
-    shuffleBtn.title = app.shuffle ? "Shuffle on" : "Shuffle off";
+    shuffleBtn.title = app.shuffle ? "Перемешать: вкл" : "Перемешать";
   }
 }
 
@@ -547,7 +635,7 @@ export function renderDrawer(): void {
   body.innerHTML = "";
   const head = document.createElement("p");
   head.className = "ytm-drawer-section";
-  head.textContent = app.queueCurrent != null ? "Now playing" : "Queue";
+  head.textContent = app.queueCurrent != null ? "Сейчас играет" : "Очередь";
   body.appendChild(head);
 
   app.queueTracks.forEach((t, idx) => {
@@ -563,7 +651,7 @@ export function renderDrawer(): void {
     // The row button captures clicks, so the ✕ stops propagation.
     const remove = document.createElement("span");
     remove.className = "ytm-drawer-row-remove";
-    remove.title = "Remove from queue";
+    remove.title = "Удалить из очереди";
     remove.textContent = "✕";
     remove.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -576,7 +664,7 @@ export function renderDrawer(): void {
   if (!app.queueTracks.length) {
     const empty = document.createElement("p");
     empty.className = "ytm-drawer-empty";
-    empty.textContent = "Queue is empty";
+    empty.textContent = "Очередь пуста";
     body.appendChild(empty);
   }
 }
@@ -623,8 +711,8 @@ function removeQueueRow(idx: number): void {
   })();
 }
 
-/** Avatar menu (spec 5.4): the shared .ytm-menu pattern — Settings /
- *  Equalizer / History navigation plus an async Storage line from
+/** Avatar menu (spec 5.4): the shared .ytm-menu pattern — Настройки /
+ *  Эквалайзер / История navigation plus an async Storage line from
  *  navigator.storage.estimate(). No sign-out or account switch: there
  *  is nothing to switch to (ADR 0002 honesty). */
 function showAvatarMenu(anchor: HTMLElement): void {
@@ -642,27 +730,27 @@ function showAvatarMenu(anchor: HTMLElement): void {
     });
     return b;
   };
-  menu.appendChild(item("Settings", () => (window.location.hash = "#/settings")));
-  menu.appendChild(item("Equalizer", () => (window.location.hash = "#/eq")));
-  menu.appendChild(item("History", () => (window.location.hash = "#/history")));
+  menu.appendChild(item("Настройки", () => (window.location.hash = "#/settings")));
+  menu.appendChild(item("Эквалайзер", () => (window.location.hash = "#/eq")));
+  menu.appendChild(item("История", () => (window.location.hash = "#/history")));
 
   // Storage: the browser's own estimate, rendered when it answers.
   const storage = document.createElement("p");
   storage.className = "ytm-menu-head";
-  storage.textContent = "Storage: …";
+  storage.textContent = "Хранилище: …";
   menu.appendChild(storage);
   if (navigator.storage?.estimate) {
     navigator.storage
       .estimate()
       .then((est) => {
         const mb = Math.round((est.usage ?? 0) / 1048576);
-        storage.textContent = `Storage: ${mb} MB`;
+        storage.textContent = `Хранилище: ${mb} МБ`;
       })
       .catch(() => {
-        storage.textContent = "Storage: unavailable";
+        storage.textContent = "Хранилище: недоступно";
       });
   } else {
-    storage.textContent = "Storage: unavailable";
+    storage.textContent = "Хранилище: недоступно";
   }
 
   document.body.appendChild(menu);
