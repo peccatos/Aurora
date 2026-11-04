@@ -64,6 +64,14 @@
   --ytm-topbar-h: 64px;
 }
 
+/* Mobile-only shell pieces (miniplayer + bottom tabs) stay OUT of the
+   desktop grid: without this, the grid auto-places them into extra rows
+   under the player bar ("Aurora Web / Перетащите музыку…" leak). */
+.ytm-miniplayer,
+.ytm-tabs {
+  display: none;
+}
+
 /* Guide collapse (YTM hamburger) and tablet (<=1024px): sidebar ->
    icon rail. One combined rule set — the JS adds .tablet-narrow on
    narrow viewports so the compact layout applies even when the user's
@@ -940,7 +948,7 @@
   /* Miniplayer above tabs */
   .ytm-miniplayer {
     grid-area: mini;
-    display: flex;
+    display: flex !important;
     align-items: center;
     gap: 12px;
     padding: 0 12px;
@@ -955,7 +963,7 @@
   /* Bottom tabs */
   .ytm-tabs {
     grid-area: tabs;
-    display: grid;
+    display: grid !important;
     grid-template-columns: repeat(3, 1fr);
     border-top: 1px solid var(--ytm-divider);
     background: var(--ytm-bg);

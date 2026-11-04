@@ -42,14 +42,14 @@ interface NavEntry {
 
 const NAV: NavEntry[] = [
   { route: "home", label: "Главная", icon: "home" },
-  { route: "library", label: "Навигатор", icon: "explore" },
+  { route: "search", label: "Поиск", icon: "search" },
   { route: "history", label: "Библиотека", icon: "library" },
 ];
 
 const LIBRARY_NAV: NavEntry[] = [
   { route: "playlists", label: "Плейлисты", icon: "queue" },
-  { route: "eq", label: "Эквалайзер", icon: "more" },
-  { route: "settings", label: "Настройки", icon: "more" },
+  { route: "eq", label: "Эквалайзер", icon: "eq" },
+  { route: "settings", label: "Настройки", icon: "settings" },
 ];
 
 // Decks are NATIVE-ONLY for now: the wasm bridge drains only the main
@@ -58,7 +58,7 @@ const LIBRARY_NAV: NavEntry[] = [
 // status per ADR 0002). Hidden until the ring mixer lands.
 const MOBILE_TABS: NavEntry[] = [
   { route: "home", label: "Главная", icon: "home" },
-  { route: "library", label: "Навигатор", icon: "explore" },
+  { route: "search", label: "Поиск", icon: "search" },
   { route: "queue", label: "Очередь", icon: "queue" },
 ];
 

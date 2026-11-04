@@ -23,10 +23,10 @@ import { getWebTracks, playWebTracks, playUrlTrack } from "./home";
 type Filter = "all" | "songs" | "playlists" | "online";
 
 const FILTERS: { id: Filter; label: string }[] = [
-  { id: "all", label: "All" },
-  { id: "songs", label: "Songs" },
-  { id: "playlists", label: "Playlists" },
-  { id: "online", label: "Online" },
+  { id: "all", label: "Все" },
+  { id: "songs", label: "Треки" },
+  { id: "playlists", label: "Плейлисты" },
+  { id: "online", label: "Онлайн" },
 ];
 
 const RECENT_KEY = "aw:recent-searches";
@@ -70,7 +70,7 @@ async function render(root: HTMLElement) {
   root.innerHTML = `
     <div class="ytm-search">
       ${icon("search", 22)}
-      <input id="search-q" type="search" placeholder="Search songs, artists, playlists" autocomplete="off" />
+      <input id="search-q" type="search" placeholder="Поиск треков, исполнителей, плейлистов" autocomplete="off" />
     </div>
     <div class="ytm-chips" id="search-chips"></div>
     <div id="search-results"></div>
@@ -154,7 +154,7 @@ async function render(root: HTMLElement) {
     head.className = "ytm-shelf-head";
     const title = document.createElement("span");
     title.className = "ytm-shelf-title";
-    title.textContent = "Songs";
+    title.textContent = "Треки";
     head.appendChild(title);
     const list = document.createElement("div");
     list.className = "ytm-tracklist";
@@ -184,7 +184,7 @@ async function render(root: HTMLElement) {
       t1.textContent = t.name;
       const t2 = document.createElement("div");
       t2.className = "ytm-track-meta";
-      t2.textContent = t.artist ?? "Unknown artist";
+      t2.textContent = t.artist ?? "Неизвестный исполнитель";
       main.append(t1, t2);
       const dur = document.createElement("span");
       dur.className = "ytm-track-dur";
@@ -208,7 +208,7 @@ async function render(root: HTMLElement) {
       head.className = "ytm-shelf-head";
       const title = document.createElement("span");
       title.className = "ytm-shelf-title";
-      title.textContent = "Playlists";
+      title.textContent = "Плейлисты";
       head.appendChild(title);
       const row = document.createElement("div");
       row.className = "ytm-shelf-row";
@@ -240,7 +240,7 @@ async function render(root: HTMLElement) {
         if (!list?.length) {
           const empty = document.createElement("p");
           empty.className = "hint";
-          empty.textContent = "Search your library and the online catalogs — or drop music on the Home page first.";
+          empty.textContent = "Ищите по своей библиотеке и онлайн-каталогам — или сначала загрузите музыку на главной.";
           results.appendChild(empty);
           return;
         }
@@ -250,7 +250,7 @@ async function render(root: HTMLElement) {
         head.className = "ytm-shelf-head";
         const title = document.createElement("span");
         title.className = "ytm-shelf-title";
-        title.textContent = "Recent searches";
+        title.textContent = "Недавние запросы";
         head.appendChild(title);
         const row = document.createElement("div");
         row.className = "ytm-chips";
@@ -287,10 +287,10 @@ async function render(root: HTMLElement) {
     head.className = "ytm-shelf-head";
     const title = document.createElement("span");
     title.className = "ytm-shelf-title";
-    title.textContent = "Found online";
+    title.textContent = "Найдено онлайн";
     const more = document.createElement("span");
     more.className = "ytm-shelf-more";
-    more.textContent = "30-second previews";
+    more.textContent = "превью 30 секунд";
     head.append(title, more);
     const row = document.createElement("div");
     row.className = "ytm-shelf-row";
@@ -345,7 +345,7 @@ async function render(root: HTMLElement) {
         else if (filter === "online") {
           const empty = document.createElement("p");
           empty.className = "hint";
-          empty.textContent = "No online results.";
+          empty.textContent = "В онлайне ничего не найдено.";
           results.appendChild(empty);
         }
       })
@@ -379,8 +379,8 @@ async function render(root: HTMLElement) {
       empty.className = "hint";
       empty.textContent =
         filter === "playlists"
-          ? "No matching playlists."
-          : "Nothing matches in your library — check the online results below.";
+          ? "Подходящих плейлистов нет."
+          : "В библиотеке ничего не найдено — проверьте онлайн-результаты ниже.";
       results.appendChild(empty);
     }
   }
@@ -403,7 +403,7 @@ async function render(root: HTMLElement) {
         head.className = "ytm-shelf-head";
         const title = document.createElement("span");
         title.className = "ytm-shelf-title";
-        title.textContent = "Free — full tracks";
+        title.textContent = "Бесплатно — полные треки";
         const more = document.createElement("span");
         more.className = "ytm-shelf-more";
         more.textContent = "Creative Commons · archive.org";
@@ -490,7 +490,7 @@ async function render(root: HTMLElement) {
     head.className = "ytm-shelf-head";
     const title = document.createElement("span");
     title.className = "ytm-shelf-title";
-    title.textContent = "Your server";
+    title.textContent = "Ваш сервер";
     head.appendChild(title);
     const row = document.createElement("div");
     row.className = "ytm-tracklist";
