@@ -1,12 +1,26 @@
 /** YTM Home page: shelves of cards (your music, quick mix).
  *  Web-shell-only route; the desktop shell keeps its own player page. */
 
-import { invoke, platform, registerWebFile } from "../invoke";
+import { invoke, platform, registerWebFile, registerWebBytes } from "../invoke";
 import { app, playQueueIndex, setQueue, setToast } from "../state";
 import { unlockAudio } from "../audio-bridge";
 import { searchTracks, addPreviewToQueue, type SearchHit } from "../search-service";
 import { icon } from "../styles/ytm-icons";
 import type { Page } from "../router";
+import {
+  getAllTracks,
+  putTrack,
+  deleteTrack,
+  kvGet,
+  kvPut,
+  type StoredTrack,
+} from "../library-db";
+
+/** Fetch one stored track by id (byte-loading helper). */
+async function getStoredTrack(id: string): Promise<StoredTrack | null> {
+  const all = await getAllTracks();
+  return all.find((t) => t.id === id) ?? null;
+}
 
 interface WebTrack {
   id: string;
@@ -14,20 +28,44 @@ interface WebTrack {
   artist: string | null;
   album: string | null;
   durationMs: number | null;
-  /** In-memory file handle (page lifetime). */
-  file: File;
+  /** In-memory file handle (page lifetime) — null for tracks restored
+   *  from IndexedDB (their bytes live in the store). */
+  file: File | null;
+  /** File extension (no dot) — needed when bytes come from the store. */
+  extension: string;
   /** The web:// path registered with the kernel (after first play). */
   kernelPath: string | null;
 }
 
 const webTracks = new Map<string, WebTrack>();
 
-export function registerWebTrack(t: Omit<WebTrack, "kernelPath">) {
-  webTracks.set(t.id, { ...t, kernelPath: null });
+export function registerWebTrack(t: Omit<WebTrack, "kernelPath" | "extension"> & { extension?: string }) {
+  webTracks.set(t.id, {
+    ...t,
+    extension: t.extension ?? (t.file ? (t.file.name.split(".").pop() ?? "").toLowerCase() : ""),
+    kernelPath: null,
+  });
 }
 
 export function webTrackCount(): number {
   return webTracks.size;
+}
+
+/** Lazy byte loading for restored tracks: only fetched from IndexedDB
+ *  when the track is actually played (a big library costs nothing
+ *  until used). */
+const storedBytesCache = new Map<string, ArrayBuffer | null>();
+
+async function loadStoredBytes(id: string): Promise<ArrayBuffer | null> {
+  if (storedBytesCache.has(id)) return storedBytesCache.get(id) ?? null;
+  try {
+    const t = await getStoredTrack(id);
+    storedBytesCache.set(id, t?.bytes ?? null);
+    return t?.bytes ?? null;
+  } catch {
+    storedBytesCache.set(id, null);
+    return null;
+  }
 }
 
 function fmtDur(ms: number | null): string {
@@ -36,14 +74,17 @@ function fmtDur(ms: number | null): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-/** Play a set of web tracks through the kernel queue (registering each
- *  file with the wasm kernel first — the registry clones on play). */
+/** Play a set of web tracks through the kernel queue. Files register by
+ *  File handle; IndexedDB-restored tracks register their stored bytes
+ *  under their persistent id (queue paths survive reloads). */
 async function playWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   if (!tracks.length) return;
   unlockAudio(); // the click that got here is the user gesture
   const queue = [];
   for (const t of tracks) {
-    t.kernelPath = await registerWebFile(t.file);
+    t.kernelPath = t.file
+      ? await registerWebFile(t.file)
+      : await registerWebBytes(t.id, new Uint8Array((await loadStoredBytes(t.id)) ?? []), t.extension);
     queue.push({
       path: t.kernelPath,
       title: t.name,
@@ -231,10 +272,47 @@ async function render(root: HTMLElement) {
       const name = dashIdx > 0 ? stem.slice(dashIdx + 3) : stem;
       const artist = dashIdx > 0 ? stem.slice(0, dashIdx) : null;
       registerWebTrack({ id, name, artist, album: null, durationMs: null, file });
+      // Persist (async, best-effort): the library must survive reloads.
+      try {
+        await putTrack({
+          id,
+          name,
+          artist,
+          album: null,
+          durationMs: null,
+          extension: (file.name.split(".").pop() ?? "").toLowerCase(),
+          bytes: await file.arrayBuffer(),
+          addedAt: Date.now(),
+        });
+      } catch (e) {
+        console.warn("[aurora] track not persisted (storage full?)", e);
+      }
       added += 1;
     }
     setToast(`${added} track${added === 1 ? "" : "s"} added`);
     draw(search?.value.toLowerCase() ?? "");
+  }
+
+  // Restore persisted tracks on first render of the session (lazy:
+  // bytes stay in IndexedDB until a track is played).
+  try {
+    const restored = await getAllTracks();
+    if (restored.length && webTracks.size === 0) {
+      for (const t of restored) {
+        registerWebTrack({
+          id: t.id,
+          name: t.name,
+          artist: t.artist,
+          album: t.album,
+          durationMs: t.durationMs,
+          file: null,
+          extension: t.extension,
+        });
+      }
+      draw(search?.value.toLowerCase() ?? "");
+    }
+  } catch (e) {
+    console.warn("[aurora] library restore failed", e);
   }
 
   // Drag-n-drop anywhere on the page (web shell). Bound ONCE per element:

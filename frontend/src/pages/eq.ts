@@ -1,9 +1,10 @@
 /** EQ page: 10-band parametric EQ, preamp/volume, reverb, speed. */
 
-import { invoke } from "../invoke";
+import { invoke, platform } from "../invoke";
 import type { Page } from "../router";
 import { app, setToast } from "../state";
 import type { DspConfig, EqBand, ReverbParams } from "../types";
+import { kvGet, kvPut } from "../library-db";
 
 const BAND_FREQS = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
@@ -41,6 +42,11 @@ async function saveDsp() {
   if (!app.dsp) return;
   try {
     await invoke("set_dsp", { config: app.dsp });
+    // Persist (web shell): the EQ must survive page reloads. Best-effort —
+    // a storage failure never breaks playback.
+    if (platform === "web") {
+      void kvPut("dsp", app.dsp).catch(() => undefined);
+    }
   } catch (e) {
     setToast(`Save failed: ${String(e)}`);
   }
@@ -246,12 +252,29 @@ function update(root: HTMLElement) {
   });
 }
 
-/** Load the backend's DSP config once at app start. */
+/** Load the backend's DSP config once at app start. Web: a persisted
+ *  config (IndexedDB) is pushed INTO the kernel, so reloads restore the
+ *  user's EQ. */
 export async function loadDsp() {
   try {
     app.dsp = await invoke<DspConfig>("get_dsp");
   } catch {
     app.dsp = defaultDsp();
+  }
+  if (platform === "web") {
+    try {
+      const saved = await kvGet<DspConfig>("dsp");
+      if (saved) {
+        app.dsp = saved;
+        try {
+          await invoke("set_dsp", { config: saved });
+        } catch {
+          /* kernel busy — defaults remain */
+        }
+      }
+    } catch {
+      /* storage unavailable — defaults remain */
+    }
   }
 }
 

@@ -87,22 +87,27 @@ export function unlockAudio(): void {
 
 /** Pause: kill the scheduled audio NOW (the kernel ring is already
  *  cleared engine-side). The LOOP stays alive — it parks on the dry
- *  ring and picks up exactly where the engine left off on resume. */
+ *  ring and picks up exactly where the engine left off on resume.
+ *  The unheard scheduled tail is reported to the engine (ADR 0002:
+ *  the position must match what was AUDIBLE, not what was counted). */
 export function pauseOutput(): void {
-  dropScheduledAudio();
+  dropScheduledAudio("pause");
 }
 
 /** Seek / track change / EQ drain: everything scheduled is stale; the
- *  loop re-reads the (re-filled) ring on its next tick. */
+ *  loop re-reads the (re-filled) ring on its next tick. Seek/track
+ *  change rebase the position anyway (engine-side), so no correction
+ *  is reported — only pause does. */
 export function flushOutput(): void {
-  dropScheduledAudio();
+  dropScheduledAudio("flush");
 }
 
-/** Full stop: teardown of the loop AND the scheduled audio. */
+/** Full stop: teardown of the loop AND the scheduled audio. No position
+ *  correction — stopping resets the stream (position returns to 0). */
 export function stopOutput(): void {
   generation++;
   running = false;
-  dropScheduledAudio();
+  dropScheduledAudio("stop");
 }
 
 export function outputRunning(): boolean {
@@ -110,8 +115,29 @@ export function outputRunning(): boolean {
 }
 
 /** Stop and drop scheduled sources. Does NOT touch the loop or the
- *  generation token. */
-function dropScheduledAudio(): void {
+ *  generation token. On "pause" the unheard tail (scheduled beyond the
+ *  audio clock) is reported to the engine so `playback_position` stays
+ *  honest: those frames were counted as played but never sounded. */
+function dropScheduledAudio(reason: "pause" | "flush" | "stop"): void {
+  if (ctx && reason === "pause") {
+    const now = ctx.currentTime;
+    // Per-node start times are not exposed post-`start()`; the cursor
+    // stands in for them: everything from `now` to `nextTime` is
+    // scheduled-but-unheard audio. Report it so the engine's position
+    // stays honest (ADR 0002) instead of racing ahead of the audible.
+    if (nextTime > now) {
+      const unheard = nextTime - now;
+      webKernel().then((k) => {
+        if (k) {
+          try {
+            k.position_correction_s(-unheard);
+          } catch {
+            /* engine gone — stop will reset anyway */
+          }
+        }
+      });
+    }
+  }
   while (scheduled.length > 0) {
     const node = scheduled.pop();
     try {
@@ -194,7 +220,7 @@ function scheduleNext(token: number): void {
 export function disposeOutput(): void {
   generation++;
   running = false;
-  dropScheduledAudio();
+  dropScheduledAudio("stop");
   void ctx?.close();
   ctx = null;
 }

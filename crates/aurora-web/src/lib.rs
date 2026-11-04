@@ -43,6 +43,12 @@ fn to_js<T: serde::Serialize>(value: T) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub struct WebKernel {
     kernel: PlayerKernel,
+    /// The last pulled sample buffer, kept alive so the returned
+    /// `Float32Array` view (borrowing wasm memory) stays valid until
+    /// the next pull replaces it. The JS side copies into an
+    /// AudioBuffer immediately; the borrow window is one synchronous
+    /// call.
+    pull_scratch: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -51,6 +57,7 @@ impl WebKernel {
     pub fn new() -> Self {
         Self {
             kernel: PlayerKernel::new(),
+            pull_scratch: Vec::new(),
         }
     }
 
@@ -89,6 +96,14 @@ impl WebKernel {
 
     pub fn seek(&self, position_s: f64) -> Result<JsValue, JsValue> {
         to_js(self.kernel.seek(position_s).map_err(js_err)?)
+    }
+
+    /// Bridge honesty report (ADR 0002): seconds of scheduled-but-unheard
+    /// audio the browser dropped (pause/track change killed scheduled
+    /// nodes). Negative values roll the position back to the audible
+    /// truth; the seek rebase covers jumps.
+    pub fn position_correction_s(&self, seconds: f64) -> Result<(), JsValue> {
+        self.kernel.position_correction_s(seconds).map_err(js_err)
     }
 
     // -----------------------------------------------------------------
@@ -310,19 +325,30 @@ impl WebKernel {
     /// interleaved. Returns an empty array when nothing is playing or
     /// the ring ran dry (the worklet fills silence then).
     ///
-    /// The engine pushes wire-format bytes (its negotiated f32 target);
-    /// this converts to a JS Float32Array.
-    pub fn web_pull(&self, max_bytes: usize) -> js_sys::Float32Array {
-        let samples = self
-            .kernel
-            .engine
-            .lock()
-            .ok()
-            .and_then(|mut engine| engine.pull_web(max_bytes))
-            .unwrap_or_default();
-        let arr = js_sys::Float32Array::new_with_length(samples.len() as u32);
-        arr.copy_from(&samples);
-        arr
+    /// The engine pushes wire-format bytes (its negotiated f32 target).
+    /// Allocation discipline: the samples live in wasm memory; the view
+    /// (`Float32Array::view`) borrows that memory with ZERO copying and
+    /// zero JS-side allocation — the pull loop runs ~20x/s and the old
+    /// copy-into-fresh-array form was measurable GC pressure. The
+    /// buffer is only borrowed for the duration of the synchronous
+    /// call; JS copies into the AudioBuffer immediately.
+    pub fn web_pull(&mut self, max_bytes: usize) -> js_sys::Float32Array {
+        // Reuse the scratch buffer: the engine fills it, the returned
+        // view borrows it, and the NEXT pull replaces it. One stable
+        // allocation instead of a fresh Vec + JS copy per call.
+        let mut engine = match self.kernel.engine.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.pull_scratch.clear();
+                return unsafe { js_sys::Float32Array::view(&self.pull_scratch) };
+            }
+        };
+        if let Some(samples) = engine.pull_web(max_bytes) {
+            self.pull_scratch = samples;
+        } else {
+            self.pull_scratch.clear();
+        }
+        unsafe { js_sys::Float32Array::view(&self.pull_scratch) }
     }
 }
 

@@ -47,6 +47,7 @@ type WebKernel = {
   resume(): unknown;
   stop(): unknown;
   seek(position_s: number): unknown;
+  position_correction_s(seconds: number): void;
   set_queue(tracks: unknown): unknown;
   get_queue(): unknown;
   play_queue_index(index: number): unknown;
@@ -109,6 +110,8 @@ async function webInvoke<T>(cmd: string, args: InvokeArgs): Promise<T> {
       return k.stop() as unknown as Promise<T>;
     case "seek":
       return k.seek(args.positionS as number) as unknown as Promise<T>;
+    case "position_correction_s":
+      return k.position_correction_s(args.seconds as number) as unknown as T;
     case "set_queue":
       return k.set_queue(args.tracks) as unknown as Promise<T>;
     case "get_queue":
@@ -235,5 +238,19 @@ export async function registerWebFile(file: File): Promise<string> {
   const ext = (file.name.split(".").pop() ?? "").toLowerCase();
   const bytes = new Uint8Array(await file.arrayBuffer());
   k.register_file(id, bytes, ext);
+  return `web://${id}`;
+}
+
+/** Register raw bytes under a STABLE id (restored-from-IndexedDB tracks:
+ *  the id persists across reloads, so queue paths stay valid).
+ *  Returns the "web://<id>" path. */
+export async function registerWebBytes(
+  id: string,
+  bytes: Uint8Array,
+  extension: string,
+): Promise<string> {
+  if (platform !== "web") throw new Error("registerWebBytes: web build only");
+  const k = await loadKernel();
+  k.register_file(id, bytes, extension);
   return `web://${id}`;
 }

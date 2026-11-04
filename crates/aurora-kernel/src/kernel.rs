@@ -121,6 +121,17 @@ impl PlayerKernel {
         Ok(engine.position_s())
     }
 
+    /// Wasm bridge honesty (ADR 0002): report seconds of scheduled-but-
+    /// unheard audio the browser dropped (pause/track change). The
+    /// engine subtracts them so the reported position matches what was
+    /// audible. Web-only in practice; native no-op (the stream clock
+    /// never runs ahead of the device).
+    pub fn position_correction_s(&self, seconds: f64) -> Result<(), KernelError> {
+        let mut engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
+        engine.position_correction_s(seconds);
+        Ok(())
+    }
+
     pub fn pause_playback(&self) -> Result<PlaybackStatus, KernelError> {
         let mut engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
         engine.pause()?;

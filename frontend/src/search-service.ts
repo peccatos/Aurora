@@ -15,7 +15,7 @@ import { platform, registerWebFile, invoke } from "./invoke";
 import { setQueue, playQueueIndex, setToast } from "./state";
 
 export interface SearchHit {
-  source: "itunes" | "musicbrainz";
+  source: "itunes" | "deezer" | "musicbrainz";
   title: string;
   artist: string;
   album: string | null;
@@ -110,18 +110,50 @@ async function fetchWithTimeout(url: string, ms: number): Promise<Response> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Deezer public API (no key): 30s mp3 previews + cover art. Primary
+// fallback for networks where MusicBrainz is blocked (it is geo-blocked
+// from several regions — verified: this exact deployment's network).
+// ---------------------------------------------------------------------------
+
+interface DeezerTrack {
+  title: string;
+  artist: { name: string };
+  album: { title?: string; cover_medium?: string; cover_big?: string };
+  duration: number; // seconds
+  preview: string; // 30s mp3 URL
+}
+
+async function searchDeezer(query: string, limit = 20): Promise<SearchHit[]> {
+  const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+  const res = await fetchWithTimeout(url, 5000);
+  if (!res.ok) throw new Error(`Deezer: HTTP ${res.status}`);
+  const data = (await res.json()) as { data?: DeezerTrack[] };
+  return (data.data ?? []).map((t) => ({
+    source: "deezer" as const,
+    title: t.title,
+    artist: t.artist?.name ?? "Unknown",
+    album: t.album?.title ?? null,
+    durationMs: t.duration ? t.duration * 1000 : null,
+    artworkUrl: t.album?.cover_medium ?? t.album?.cover_big ?? null,
+    previewUrl: t.preview || null,
+  }));
+}
+
 export async function searchTracks(query: string): Promise<SearchHit[]> {
   if (!query.trim()) return [];
-  const [itunes, mb] = await Promise.allSettled([
+  const [itunes, mb, deezer] = await Promise.allSettled([
     searchItunes(query),
     searchMusicbrainz(query),
+    searchDeezer(query),
   ]);
   const hits: SearchHit[] = [];
   if (itunes.status === "fulfilled") hits.push(...itunes.value);
+  if (deezer.status === "fulfilled") hits.push(...deezer.value);
   if (mb.status === "fulfilled") hits.push(...mb.value);
 
-  // Dedup: same title+artist (case-insensitive), iTunes first (has
-  // previews/artwork).
+  // Dedup: same title+artist (case-insensitive), preview-bearing
+  // sources first (iTunes, then Deezer; MB is metadata-only).
   const seen = new Set<string>();
   return hits.filter((h) => {
     const key = `${h.title.toLowerCase()}|${h.artist.toLowerCase()}`;

@@ -224,34 +224,7 @@ impl WebDecodeWorker {
     }
 }
 
-/// Encode normalized f32 samples into the target's wire bytes (same
-/// encoding as the engine's `f32s_to_wire`).
-fn wire_bytes(samples: &[f32], target: PcmFormat) -> Vec<u8> {
-    let bytes = usize::from(target.bits_per_sample).div_ceil(8);
-    let mut out = Vec::with_capacity(samples.len() * bytes);
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        match target.sample_format {
-            aurora_core::SampleFormat::SignedInt => {
-                let full = (1u64 << (target.bits_per_sample - 1)) - 1;
-                let v = (f64::from(clamped) * full as f64).round() as i64;
-                let v = v.clamp(-(full as i64 + 1), full as i64) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..bytes]);
-            }
-            aurora_core::SampleFormat::UnsignedInt => {
-                let half = 1u64 << (target.bits_per_sample - 1);
-                let v = (f64::from(clamped) * half as f64).round() as i64 + half as i64;
-                let v = v.clamp(0, ((1u64 << target.bits_per_sample) - 1) as i64) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..bytes]);
-            }
-            aurora_core::SampleFormat::Float => {
-                if target.bits_per_sample == 64 {
-                    out.extend_from_slice(&f64::from(clamped).to_le_bytes());
-                } else {
-                    out.extend_from_slice(&clamped.to_le_bytes());
-                }
-            }
-        }
-    }
-    out
-}
+/// Encode normalized f32 samples into the target's wire bytes — the
+/// engine's ONE shared definition (was a duplicated copy here before;
+/// copies drift).
+use crate::engine::f32s_to_wire as wire_bytes;

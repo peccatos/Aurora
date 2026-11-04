@@ -1,37 +1,42 @@
-/* YouTube Music design system — Aurora Web shell (план §7).
-   Один-в-один: тёмная тема YTM, красный акцент #FF0033, Roboto.
-   Десктоп: сайдбар + ленты карточек + плеербар.
-   Мобильный (<=768px): нижние табы + мини-плеер + fullscreen player. */
+/* Aurora Web design system — OWN style (YTM copy was cancelled by the
+   owner: "плохо"). Principles: dark graphite, ONE warm accent
+   (Braun-orange #E8500A), restrained radii, calm hover states, generous
+   whitespace, tabular numbers for time. No red, no Roboto, no Google
+   lookalikes.
+   Desktop: sidebar + shelves + player bar.
+   Mobile (<=768px): bottom tabs + miniplayer. */
 
 :root {
-  /* Surfaces */
-  --ytm-bg: #030303;
-  --ytm-surface: #212121;
-  --ytm-surface-hover: #272727;
-  --ytm-surface-active: #353535;
-  --ytm-raised: #2d2d2d;
+  /* Surfaces — deep graphite ladder, never pure black */
+  --ytm-bg: #101014;
+  --ytm-surface: #1a1a20;
+  --ytm-surface-hover: #23232b;
+  --ytm-surface-active: #2c2c36;
+  --ytm-raised: #26262e;
 
-  /* Text */
-  --ytm-text: #ffffff;
-  --ytm-text-2: #aaaaaa;
-  --ytm-text-3: #909090;
+  /* Text — one bright, two calm grays */
+  --ytm-text: #f2f2f5;
+  --ytm-text-2: #b8b8c0;
+  --ytm-text-3: #8a8a93;
 
-  /* Accent — YTM red */
-  --ytm-accent: #ff0033;
-  --ytm-accent-hover: #cc0029;
+  /* Accent — Braun orange, the ONE color in the UI */
+  --ytm-accent: #e8500a;
+  --ytm-accent-hover: #ff6a26;
+  --ytm-accent-dim: rgba(232, 80, 10, 0.14);
 
   /* Misc */
-  --ytm-divider: #303030;
-  --ytm-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
-  --ytm-radius: 8px;
+  --ytm-divider: #26262e;
+  --ytm-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  --ytm-radius: 10px;
 
   /* Layout metrics (desktop) */
-  --ytm-sidebar-w: 240px;
-  --ytm-player-h: 72px;
+  --ytm-sidebar-w: 232px;
+  --ytm-player-h: 76px;
   --ytm-tabbar-h: 56px; /* mobile bottom tabs */
   --ytm-miniplayer-h: 64px; /* mobile */
 
-  font-family: Roboto, "Segoe UI", Arial, sans-serif;
+  font-family: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-feature-settings: "tnum" 1; /* tabular numerals: seek bar never jitters */
 }
 
 /* ------------------------------------------------------------------ */

@@ -50,9 +50,10 @@ export function renderWebShell(root: HTMLElement): {
     <div class="ytm-app">
       <nav class="ytm-sidebar" id="ytm-sidebar">
         <div class="ytm-logo">
-          <svg viewBox="0 0 24 24" width="26" height="26">
-            <circle cx="12" cy="12" r="11" fill="#ff0033" opacity="0.9"/>
-            <path d="M9 7l10 5-10 5V7z" fill="#fff"/>
+          <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+            <!-- Aurora mark: an off-center pulse (waveform seed), Braun-orange -->
+            <circle cx="12" cy="12" r="11" fill="#e8500a" opacity="0.92"/>
+            <path d="M4 12h2.2l1.4-4.4L10.5 17l2.2-9 1.6 5.6 1.1-1.6H20" fill="none" stroke="#101014" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
           <span>Aurora</span>
         </div>
@@ -93,6 +94,7 @@ export function renderWebShell(root: HTMLElement): {
             <button class="ytm-btn-icon" id="ytm-prev" type="button" title="Previous">${icon("prev")}</button>
             <button class="ytm-btn-icon ytm-btn-play" id="ytm-play" type="button" title="Play / Pause">${icon("play")}</button>
             <button class="ytm-btn-icon" id="ytm-next" type="button" title="Next">${icon("next")}</button>
+            <button class="ytm-btn-icon" id="ytm-stop" type="button" title="Stop">${icon("close")}</button>
           </div>
           <div class="ytm-progress">
             <span class="ytm-time" id="ytm-cur">0:00</span>
@@ -157,6 +159,14 @@ export function bindWebPlayerBar(): void {
   });
   next?.addEventListener("click", () => void nextTrack());
   prev?.addEventListener("click", () => void prevTrack());
+  document.getElementById("ytm-stop")?.addEventListener("click", async () => {
+    try {
+      app.status = await invoke("stop_playback");
+      await loadStatus();
+    } catch (e) {
+      setToast(String(e));
+    }
+  });
   now?.addEventListener("click", () => {
     // Fullscreen now-playing: swap the content for the player page.
     window.location.hash = "#/player";
@@ -203,17 +213,9 @@ export function renderWebBar(): void {
     if (btn) btn.innerHTML = playing ? icon("pause") : icon("play");
   }
 
-  // Seek bar.
+  // Seek bar: enabled whenever a duration is known.
   const seek = document.getElementById("ytm-seek") as HTMLInputElement | null;
-  const cur = document.getElementById("ytm-cur");
-  const dur = document.getElementById("ytm-dur");
-  if (seek && app.durationS > 0) {
-    const pos = app.status ? s?.state === "playing" ? undefined : undefined : undefined;
-    void pos;
-    seek.disabled = false;
-  }
-  void cur;
-  void dur;
+  if (seek) seek.disabled = !(app.durationS > 0);
 }
 
 /** Update the YTM progress bar (from the position poll). */

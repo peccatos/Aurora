@@ -175,6 +175,9 @@ pub struct PlaybackEngine {
     source_format: Option<PcmFormat>,
     /// Track duration from the container (ms), for the seek bar.
     source_duration_ms: Option<u64>,
+    /// Wasm honesty correction (see `position_s`): seconds of counted-
+    /// as-played audio the browser actually dropped. Reset per stream.
+    position_correction: Mutex<f64>,
     /// ADR 0002 integrity classification of the current path: honest,
     /// computed from the transformation chain, never assumed.
     integrity: aurora_core::OutputIntegrity,
@@ -225,6 +228,7 @@ impl PlaybackEngine {
             device_key: None,
             source_format: None,
             source_duration_ms: None,
+            position_correction: Mutex::new(0.0),
             integrity: aurora_core::OutputIntegrity::Unverified,
         }
     }
@@ -971,6 +975,9 @@ impl PlaybackEngine {
             self.worker = Some(worker);
         }
         self.source_duration_ms = source_duration_ms;
+        if let Ok(mut c) = self.position_correction.lock() {
+            *c = 0.0; // fresh stream: no unheard-audio correction carries over
+        }
         self.negotiated = Some(negotiated.pcm);
         // Report the full honest chain: forced conversions (negotiation)
         // plus the user-configured DSP stages (ADR 0002).
@@ -1409,18 +1416,39 @@ impl PlaybackEngine {
     /// played and the output rate — rebased after a seek so the UI bar
     /// reflects the jump immediately instead of continuing the pre-seek
     /// count.
+    ///
+    /// Wasm honesty correction: `frames_played` counts bytes HANDED to
+    /// the JS bridge, which schedules them ~200ms ahead on the browser
+    /// clock. When the bridge drops scheduled-but-unheard audio (pause,
+    /// track change) it reports the unheard span via
+    /// [`position_correction_s`](Self::position_correction_s); the
+    /// correction is applied here so the reported position matches what
+    /// was actually AUDIBLE, not what was scheduled. ADR 0002: the
+    /// player reports what really happened.
     pub fn position_s(&self) -> f64 {
         let rate = self.negotiated.map(|f| f.sample_rate).unwrap_or(0);
         if rate == 0 {
             return 0.0;
         }
+        let correction = self.position_correction.lock().map(|c| *c).unwrap_or(0.0);
         let played = self.metrics.frames_played();
         let rebase = self.shared.seek_rebase.lock().ok().and_then(|rb| *rb);
-        match rebase {
+        let raw = match rebase {
             Some((base, position)) => {
                 position + played.saturating_sub(base) as f64 / f64::from(rate)
             }
             None => played as f64 / f64::from(rate),
+        };
+        (raw + correction).max(0.0)
+    }
+
+    /// Report unheard scheduled audio (wasm bridge, ADR 0002 honesty):
+    /// `seconds` of audio the engine counted as played but the browser
+    /// dropped (pause/track change killed scheduled nodes). Negative
+    /// values roll the position back to what was audible.
+    pub fn position_correction_s(&mut self, seconds: f64) {
+        if let Ok(mut c) = self.position_correction.lock() {
+            *c += seconds;
         }
     }
 
@@ -1532,11 +1560,9 @@ impl PlaybackEngine {
             return Some(Vec::new());
         }
         let popped_frames = popped / frame_bytes;
-        let out: Vec<f32> = bytes[..popped_frames * frame_bytes]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        #[expect(clippy::chunks_exact)] // constant 4 = f32 lane; clarity wins
+        let wire = &bytes[..popped_frames * frame_bytes];
+        let (chunks, _) = wire.as_chunks::<4>();
+        let out: Vec<f32> = chunks.iter().map(|b| f32::from_le_bytes(*b)).collect();
         self.metrics.add_frames(popped_frames as u64);
         Some(out)
     }
@@ -1668,7 +1694,10 @@ fn source_seek(
 /// The inverse of the decoder's read path: full-scale maps back to the
 /// integer grid, floats copy through directly.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
-fn f32s_to_wire(samples: &[f32], target: PcmFormat) -> Vec<u8> {
+/// Encode normalized f32 samples into the target format's wire bytes.
+/// Shared by the native worker and the wasm cooperative worker —
+/// ONE definition, never a copy (a copy would drift).
+pub(crate) fn f32s_to_wire(samples: &[f32], target: PcmFormat) -> Vec<u8> {
     let bytes = usize::from(target.bits_per_sample).div_ceil(8);
     let mut out = Vec::with_capacity(samples.len() * bytes);
     for &s in samples {
