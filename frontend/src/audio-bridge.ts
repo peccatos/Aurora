@@ -1,129 +1,120 @@
-/** Web Audio output bridge.
+/** Web Audio output bridge — AudioWorklet edition (W9).
  *
- * The wasm kernel decodes + processes audio into its ring; the browser
- * owns the device (ADR 0006). This module drains the ring through
- * `web_pull` and feeds a Web Audio graph.
+ * ONE continuous AudioWorklet stream instead of per-chunk
+ * AudioBufferSourceNodes: node seams joined with sub-sample jitter
+ * were the "noise/fizz" on sustained audio. Latency drops from
+ * ~200ms (schedule-ahead) to ~1.5 render quanta + fill margin
+ * (~50ms). No SharedArrayBuffer needed (message-transfer push), so
+ * plain hosting (GitHub Pages) still works.
  *
- * Implementation: ONE scheduled pull loop + AudioBufferSourceNodes
- * (zero hosting requirements; an AudioWorklet upgrade needs
- * SharedArrayBuffer/COOP-COEP and is a drop-in later). Latency is
- * honest: ~200ms scheduling slack.
+ * The main thread keeps a small pull loop: top the worklet's ring up
+ * to a fill margin from the kernel's ring; on pause/seek/track change
+ * FLUSH the worklet buffer (those bytes were scheduled-not-heard).
+ * The kernel-side position correction (ADR 0002) covers the pause
+ * case as before.
  *
- * Loop lifecycle (the bugs this design prevents):
- *  - Exactly one loop, ever: `running` is claimed SYNCHRONOUSLY at the
- *    top of startOutput, BEFORE any await — two overlapping calls
- *    (autoplay-blocked resume + the 500ms status poll both calling
- *    startOutput) previously both passed the `!running` check and
- *    started two loops over one ring: doubled, 2x-speed audio.
- *  - Pause/seek/track change kill only the SCHEDULED NODES, not the
- *    loop: the ring is empty then (cleared engine-side), the loop's
- *    dry branch just parks the cursor, and playback continues when the
- *    ring refills. Killing the loop there left `running=true` with no
- *    consumer — silence or stale overlap.
- *  - Full teardown (stop) uses the generation token so a superseded
- *    loop iteration can never reschedule itself.
+ * Fallback: if AudioWorklet is unavailable, the legacy
+ * AudioBufferSourceNode path runs (kept, marked; seams remain —
+ * old browsers only).
  */
 
 import { platform, webKernel } from "./invoke";
 
 let ctx: AudioContext | null = null;
-/** Claimed synchronously in startOutput; released only in stopOutput. */
 let running = false;
 let sampleRate = 0;
 let channels = 2;
 
-/** Sources currently scheduled on the Web Audio clock. Stopped and
- *  dropped on transport interruptions (pause/seek/track change). */
+/** Worklet node + its port state. */
+let node: AudioWorkletNode | null = null;
+/** Fill margin in frames: keep this much queued in the worklet. */
+const MARGIN_MS = 120;
+/** Legacy fallback scheduled nodes. */
 const scheduled: AudioBufferSourceNode[] = [];
+/** True when the worklet path is active. */
+let usingWorklet = false;
 
-/** Generation token: bumped on full teardown; a loop iteration from a
- *  superseded generation never reschedules. */
 let generation = 0;
 
-/** Start (or parameter-refresh) the output bridge for the current
- *  stream. Call from a user gesture when possible — browsers gate
- *  AudioContext.resume() on interaction. */
 export async function startOutput(rate: number, ch: number): Promise<void> {
   if (platform !== "web") return;
   if (!ctx) {
     ctx = new AudioContext();
   }
-  // Device rate to the engine ONCE: with it, the engine resamples to
-  // the DEVICE rate as one continuous stream (reported honestly);
-  // without it the browser resamples each buffer independently —
-  // phase-discontinuous at chunk boundaries, the "dirty/jumping"
-  // sound on 44.1k files played at a 48k device.
   const k0 = await webKernel();
-  if (k0 && !deviceRateTold) {
-    deviceRateTold = true;
+  if (k0 && !deviceTold) {
+    deviceTold = true;
     try {
       k0.set_output_rate(ctx.sampleRate);
       k0.set_output_channels(2);
     } catch {
-      /* older binary without the API — browser resampling remains */
+      /* older binary — browser resampling remains */
     }
   }
   if (running && rate !== sampleRate) {
-    // RATE change is impossible now (the engine always outputs the
-    // device rate) — but if a stale binary passes source rate through,
-    // a rate change still means a full restart (old buffers at a new
-    // rate = pitch shift). Channel changes do NOT restart: the engine
-    // remixes to the device channel count, the bridge format never
-    // changes (W7 gapless).
-    stopOutput();
+    stopOutput(); // rate change = stale worklet format
   }
   sampleRate = rate;
   channels = ch;
-  if (running) {
-    // Same format, loop already alive: nothing to do.
-    return;
-  }
-  // Claim BEFORE the first await: concurrent callers must not both
-  // pass the guard while resume() is pending.
+  if (running) return;
   running = true;
   if (ctx.state === "suspended") {
     try {
       await ctx.resume();
     } catch {
-      // Retried on the next user click (see unlockAudio). The loop
-      // still runs; while suspended the clock stands still, so it just
-      // parks — nothing is scheduled or lost.
+      /* retried on the next user click */
+    }
+  }
+  // Try the worklet path once per context.
+  if (!node) {
+    try {
+      const url = new URL("./worklet-processor.js", import.meta.url).href;
+      await ctx.audioWorklet.addModule(url);
+      node = new AudioWorkletNode(ctx, "aurora-processor", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [Math.min(2, channels)],
+        processorOptions: { channels: Math.min(2, channels) },
+      });
+      node.port.onmessage = (e) => {
+        const msg = e.data;
+        if (msg.type === "state") {
+          workletAvailable = msg.available;
+          workletUnderruns = msg.underruns;
+        }
+      };
+      node.connect(ctx.destination);
+      usingWorklet = true;
+    } catch {
+      // No AudioWorklet (ancient browser): legacy path.
+      node = null;
+      usingWorklet = false;
     }
   }
   scheduleNext(generation);
 }
 
-/** One-shot flag: the device rate was reported to the engine. */
-let deviceRateTold = false;
+let deviceTold = false;
+let workletAvailable = 0;
+let workletUnderruns = 0;
 
-/** Called from any user gesture: unlock/resume the audio context so
- *  later programmatic starts (status poll) are not blocked by the
- *  browser's autoplay policy. */
 export function unlockAudio(): void {
   if (platform !== "web") return;
   if (!ctx) ctx = new AudioContext();
   if (ctx.state === "suspended") void ctx.resume();
 }
 
-/** Pause: kill the scheduled audio NOW (the kernel ring is already
- *  cleared engine-side). The LOOP stays alive — it parks on the dry
- *  ring and picks up exactly where the engine left off on resume.
- *  The unheard scheduled tail is reported to the engine (ADR 0002:
- *  the position must match what was AUDIBLE, not what was counted). */
+/** Pause: flush the worklet buffer (scheduled-not-heard bytes must
+ *  not play after resume); the kernel reports the position honestly. */
 export function pauseOutput(): void {
   dropScheduledAudio("pause");
 }
 
-/** Seek / track change / EQ drain: everything scheduled is stale; the
- *  loop re-reads the (re-filled) ring on its next tick. Seek/track
- *  change rebase the position anyway (engine-side), so no correction
- *  is reported — only pause does. */
+/** Seek / track change: same flush; engine rebases position. */
 export function flushOutput(): void {
   dropScheduledAudio("flush");
 }
 
-/** Full stop: teardown of the loop AND the scheduled audio. No position
- *  correction — stopping resets the stream (position returns to 0). */
 export function stopOutput(): void {
   generation++;
   running = false;
@@ -134,104 +125,106 @@ export function outputRunning(): boolean {
   return running;
 }
 
-/** Stop and drop scheduled sources. Does NOT touch the loop or the
- *  generation token. On "pause" the unheard tail (scheduled beyond the
- *  audio clock) is reported to the engine so `playback_position` stays
- *  honest: those frames were counted as played but never sounded. */
 function dropScheduledAudio(reason: "pause" | "flush" | "stop"): void {
   if (ctx && reason === "pause") {
     const now = ctx.currentTime;
-    // Per-node start times are not exposed post-`start()`; the cursor
-    // stands in for them: everything from `now` to `nextTime` is
-    // scheduled-but-unheard audio. Report it so the engine's position
-    // stays honest (ADR 0002) instead of racing ahead of the audible.
-    if (nextTime > now) {
-      const unheard = nextTime - now;
+    if (nextTime > now && usingWorklet) {
+      // Worklet path: the unheard span is the worklet's fill margin.
+      const unheard = Math.min(nextTime - now, MARGIN_MS / 1000);
       webKernel().then((k) => {
         if (k) {
           try {
             k.position_correction_s(-unheard);
           } catch {
-            /* engine gone — stop will reset anyway */
+            /* engine gone — stop will reset */
           }
         }
       });
     }
   }
+  if (node) {
+    node.port.postMessage({ type: "flush" });
+  }
   while (scheduled.length > 0) {
-    const node = scheduled.pop();
+    const src = scheduled.pop();
     try {
-      node?.stop();
-      node?.disconnect();
+      src?.stop();
+      src?.disconnect();
     } catch {
-      // Already ended — fine.
+      /* ended */
     }
   }
-  nextTime = 0; // rebase the cursor to the live audio clock
+  nextTime = 0;
 }
 
 // ---------------------------------------------------------------------------
-// Pull loop: each iteration queues ~200ms of audio ahead.
+// Fill loop: pull from the kernel ring, push into the worklet (or
+// schedule legacy nodes when the worklet is unavailable).
 // ---------------------------------------------------------------------------
 
-const AHEAD_MS = 200;
 let nextTime = 0;
 
 function scheduleNext(token: number): void {
-  if (token !== generation) return; // superseded by a full stop
+  if (token !== generation) return;
   const kernel = webKernel();
   void kernel.then((k) => {
     if (!k || !ctx || token !== generation) return;
     if (!running) return;
-    const now = ctx.currentTime;
-    // Cursor rebase: never schedule in the past (overlapping starts =
-    // audible doubling), never more than the schedule window ahead.
-    if (nextTime < now + 0.05) nextTime = now + 0.05;
-    if (nextTime > now + AHEAD_MS / 1000) nextTime = now + AHEAD_MS / 1000;
-    // THE horizon is on the AUDIO CLOCK, not the cursor: keep AHEAD_MS
-    // of audio queued ahead of `now`. (Scheduling until
-    // nextTime + AHEAD_MS instead let the cursor advance 200ms every
-    // 50ms tick — pulling 4x faster than realtime: the position raced
-    // to ~4x wall time, "skipping seconds" with every tick.)
-    const horizon = now + AHEAD_MS / 1000;
-    while (nextTime < horizon) {
-      const chunkFrames = 4096;
-      const maxBytes = chunkFrames * channels * 4;
-      const samples = k.web_pull(maxBytes);
-      const frames = Math.floor(samples.length / channels);
-      if (frames === 0) {
-        // Ring dry: paused / decoding / between tracks. Park the cursor
-        // just ahead of the clock — do NOT advance past the horizon
-        // (that would fast-forward the timeline).
-        nextTime = Math.max(nextTime, now + 0.05);
-        break;
+    if (usingWorklet && node) {
+      const marginFrames = Math.round((MARGIN_MS / 1000) * sampleRate);
+      // Top up in ~50ms pulls: bounded so one pull can't freeze the UI.
+      while (workletAvailable < marginFrames) {
+        const chunkFrames = 4096;
+        const samples = k.web_pull(chunkFrames * channels * 4);
+        const frames = Math.floor(samples.length / channels);
+        if (frames === 0) break;
+        // Transfer the buffer copy (the view borrows wasm memory).
+        const copy = new Float32Array(frames * channels);
+        copy.set(samples.subarray(0, frames * channels));
+        node.port.postMessage({ type: "push", samples: copy }, [copy.buffer]);
+        workletAvailable += frames;
       }
-      const buf = ctx.createBuffer(channels, frames, sampleRate);
-      for (let ch = 0; ch < channels; ch++) {
-        const target = buf.getChannelData(ch);
-        for (let i = 0; i < frames; i++) {
-          target[i] = samples[i * channels + ch];
+      node.port.postMessage({ type: "query" });
+    } else if (ctx) {
+      // Legacy: AudioBufferSourceNode scheduling (seams = known noise).
+      const now = ctx.currentTime;
+      if (nextTime < now + 0.05) nextTime = now + 0.05;
+      if (nextTime > now + 0.3) nextTime = now + 0.3;
+      const horizon = now + 0.2;
+      while (nextTime < horizon) {
+        const chunkFrames = 4096;
+        const samples = k.web_pull(chunkFrames * channels * 4);
+        const frames = Math.floor(samples.length / channels);
+        if (frames === 0) {
+          nextTime = Math.max(nextTime, now + 0.05);
+          break;
         }
-      }
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
-      src.start(nextTime);
-      scheduled.push(src);
-      nextTime += frames / sampleRate;
-      if (scheduled.length > 256) {
-        // Bound the list; the browser GCs ended nodes on its own.
-        scheduled.splice(0, scheduled.length - 256).forEach((n) => {
-          try {
-            n.disconnect();
-          } catch {
-            /* ended */
+        const buf = ctx.createBuffer(channels, frames, sampleRate);
+        for (let ch = 0; ch < channels; ch++) {
+          const target = buf.getChannelData(ch);
+          for (let i = 0; i < frames; i++) {
+            target[i] = samples[i * channels + ch];
           }
-        });
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(nextTime);
+        scheduled.push(src);
+        nextTime += frames / sampleRate;
+        if (scheduled.length > 256) {
+          scheduled.splice(0, scheduled.length - 256).forEach((n) => {
+            try {
+              n.disconnect();
+            } catch {
+              /* ended */
+            }
+          });
+        }
       }
     }
     if (running && token === generation) {
-      setTimeout(() => scheduleNext(token), 50);
+      setTimeout(() => scheduleNext(token), 25);
     }
   });
 }
@@ -241,6 +234,12 @@ export function disposeOutput(): void {
   generation++;
   running = false;
   dropScheduledAudio("stop");
+  try {
+    node?.disconnect();
+  } catch {
+    /* gone */
+  }
+  node = null;
   void ctx?.close();
   ctx = null;
 }
