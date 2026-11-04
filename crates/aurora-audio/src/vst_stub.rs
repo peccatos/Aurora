@@ -30,8 +30,13 @@ impl VstPluginList {
 /// A "loaded" chain: passthrough only. Loading a non-empty list in a
 /// no-host build fails honestly — the caller logs and plays without
 /// plugins, exactly like a native load failure.
+/// The chain type is part of the engine's integration surface even when
+/// nothing constructs it on wasm (the engine's VST code paths are native
+/// cfg'd away) — kept so the wire shapes stay aligned.
+#[allow(dead_code)]
 pub struct VstPluginChain;
 
+#[allow(dead_code)]
 impl VstPluginChain {
     pub fn load(list: &VstPluginList, _format: &aurora_core::PcmFormat) -> Result<Self, String> {
         if list.slots.is_empty() {

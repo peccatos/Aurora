@@ -14,6 +14,8 @@ pub mod engine;
 pub mod error;
 pub mod metrics;
 pub mod spectrum;
+#[cfg(target_family = "wasm")]
+pub(crate) mod web_worker;
 
 #[cfg(feature = "win-wasapi")]
 pub mod exclusive;

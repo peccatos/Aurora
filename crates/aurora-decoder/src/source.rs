@@ -119,10 +119,28 @@ impl AudioSource {
         // Decode the first packet to learn the actual decoder output format.
         // Codec parameters lie for compressed formats: MP3/Vorbis/FLAC
         // decode to f32 even when the container declares integer PCM.
+        //
+        // Probe errors are BOUNDED, never silently terminal: an Err from
+        // the demuxer (recoverable container glitch) skips forward like
+        // a corrupt packet instead of ending the probe — the old
+        // `.ok().flatten()` form made one read error abort probing and
+        // fall back to the (lying for MP3) codec parameters.
         let (pcm_format, first_chunk) = {
             let mut first_chunk = None;
             let mut actual_format = None;
-            while let Some(packet) = format.next_packet().ok().flatten() {
+            let mut probe_errors = 0;
+            loop {
+                let packet = match format.next_packet() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break, // end of stream without a usable packet
+                    Err(_) => {
+                        probe_errors += 1;
+                        if probe_errors > 16 {
+                            break; // too broken to probe: parameter fallback
+                        }
+                        continue;
+                    }
+                };
                 if packet.track_id != track_id {
                     continue;
                 }
@@ -436,11 +454,4 @@ fn pcm_format_from_params(
         sample_format,
         channel_layout: aurora_core::ChannelLayout::Interleaved,
     })
-}
-
-fn audio_format_from_extension(path: &Path) -> AudioFormat {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(AudioFormat::from_extension)
-        .unwrap_or(AudioFormat::Unknown)
 }

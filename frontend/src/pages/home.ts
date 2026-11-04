@@ -3,6 +3,8 @@
 
 import { invoke, platform, registerWebFile } from "../invoke";
 import { app, playQueueIndex, setQueue, setToast } from "../state";
+import { unlockAudio } from "../audio-bridge";
+import { searchTracks, addPreviewToQueue, type SearchHit } from "../search-service";
 import { icon } from "../styles/ytm-icons";
 import type { Page } from "../router";
 
@@ -35,9 +37,10 @@ function fmtDur(ms: number | null): string {
 }
 
 /** Play a set of web tracks through the kernel queue (registering each
- *  file with the wasm kernel first — the registry consumes entries). */
+ *  file with the wasm kernel first — the registry clones on play). */
 async function playWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   if (!tracks.length) return;
+  unlockAudio(); // the click that got here is the user gesture
   const queue = [];
   for (const t of tracks) {
     t.kernelPath = await registerWebFile(t.file);
@@ -149,7 +152,72 @@ async function render(root: HTMLElement) {
     });
   }
 
-  search?.addEventListener("input", () => draw(search.value.toLowerCase()));
+  search?.addEventListener("input", () => {
+    draw(search.value.toLowerCase());
+    void runExternalSearch(search.value);
+  });
+
+  /** External catalog search (iTunes + MusicBrainz): live results under
+   *  the local list; each hit plays its 30s preview or is metadata-only. */
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchSeq = 0;
+  async function runExternalSearch(query: string): Promise<void> {
+    if (searchTimer) clearTimeout(searchTimer);
+    if (query.trim().length < 3) {
+      hideExternal();
+      return;
+    }
+    searchTimer = setTimeout(async () => {
+      const seq = ++searchSeq;
+      try {
+        const hits = await searchTracks(query);
+        if (seq !== searchSeq) return; // stale response
+        drawExternal(hits);
+      } catch {
+        hideExternal(); // offline / API blocked: local results only
+      }
+    }, 400);
+  }
+
+  function hideExternal(): void {
+    shelves.querySelector("#ytm-external")?.remove();
+  }
+
+  function drawExternal(hits: SearchHit[]): void {
+    if (!hits.length) {
+      hideExternal();
+      return;
+    }
+    let ext = shelves.querySelector<HTMLElement>("#ytm-external");
+    if (!ext) {
+      ext = document.createElement("div");
+      ext.className = "ytm-shelf";
+      ext.id = "ytm-external";
+      ext.innerHTML = `<div class="ytm-shelf-head"><span class="ytm-shelf-title">Found online</span><span class="ytm-shelf-more">30-second previews</span></div><div class="ytm-shelf-row" id="ytm-ext-row"></div>`;
+      shelves.prepend(ext);
+    }
+    const row = ext.querySelector<HTMLElement>("#ytm-ext-row")!;
+    row.innerHTML = "";
+    for (const hit of hits.slice(0, 12)) {
+      const card = document.createElement("div");
+      card.className = "ytm-card";
+      card.innerHTML = `
+        <div class="ytm-card-art" style="${hit.artworkUrl ? `background-image:url('${hit.artworkUrl}');background-size:cover` : ""}">
+          ${hit.artworkUrl ? "" : icon("search", 48)}
+          ${hit.previewUrl ? `<button class="ytm-card-play" type="button" title="Play 30s preview">${icon("play")}</button>` : ""}
+        </div>
+        <div class="ytm-card-title">${hit.title}</div>
+        <div class="ytm-card-sub">${hit.artist}</div>
+      `;
+      card.querySelector<HTMLButtonElement>(".ytm-card-play")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        unlockAudio();
+        void addPreviewToQueue(hit);
+      });
+      card.title = hit.previewUrl ? "Play 30-second preview" : "Metadata only (no preview)";
+      row.appendChild(card);
+    }
+  }
 
   draw("");
 
@@ -169,12 +237,17 @@ async function render(root: HTMLElement) {
     draw(search?.value.toLowerCase() ?? "");
   }
 
-  // Drag-n-drop anywhere on the page (web shell).
-  root.addEventListener("dragover", (e) => e.preventDefault());
-  root.addEventListener("drop", (e) => {
-    e.preventDefault();
-    void ingest(e.dataTransfer?.files ?? null);
-  });
+  // Drag-n-drop anywhere on the page (web shell). Bound ONCE per element:
+  // render() runs on every state change and re-adding listeners here
+  // duplicated every drop (N renders -> N ingests -> N duplicate tracks).
+  if (!root.dataset.dropBound) {
+    root.dataset.dropBound = "1";
+    root.addEventListener("dragover", (e) => e.preventDefault());
+    root.addEventListener("drop", (e) => {
+      e.preventDefault();
+      void ingest(e.dataTransfer?.files ?? null);
+    });
+  }
 }
 
 function update(root: HTMLElement) {

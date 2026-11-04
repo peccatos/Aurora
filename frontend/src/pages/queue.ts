@@ -64,8 +64,8 @@ function update(root: HTMLElement) {
     const stem = t.path.split(/[\\/]/).pop() ?? t.path;
     name.textContent = t.artist ? `${t.artist} — ${t.title ?? stem}` : (t.title ?? stem);
     name.addEventListener("click", () => {
-      void playQueueIndex(idx).then((q) => {
-        setToast(`${q.display[q.current ?? 0] ?? ""} (${(q.current ?? 0) + 1}/${q.tracks.length})`);
+      void playQueueIndex(idx).then(() => {
+        setToast(`${idx + 1}/${app.queueTracks.length}`);
       });
     });
 

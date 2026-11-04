@@ -16,9 +16,13 @@ use aurora_audio::{EngineState, PlaybackEngine};
 
 use crate::decks::Deck;
 use crate::dtos::{
-    BitPerfectVerdict, DeckDto, ExclusivePlayResult, ExclusiveProbe, ImportReport, LibraryStatus,
-    PlayRequest, PlaybackStatus, QueueDto, TrackDto, VstSlotDto,
+    BitPerfectVerdict, DeckDto, ExclusivePlayResult, ExclusiveProbe, PlayRequest, PlaybackStatus,
+    QueueDto, VstSlotDto,
 };
+// Storage-backed DTOs: the wasm kernel has no SQLite, these services
+// are native-only — import them only where the code is compiled.
+#[cfg(not(target_family = "wasm"))]
+use crate::dtos::{ImportReport, LibraryStatus, TrackDto};
 use crate::error::KernelError;
 use crate::events::EventSubscribers;
 use crate::queue::{QueueTrack, TrackQueue};
@@ -136,7 +140,7 @@ impl PlayerKernel {
     }
 
     pub fn seek(&self, position_s: f64) -> Result<PlaybackStatus, KernelError> {
-        let engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
+        let mut engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
         engine.seek(position_s);
         Ok(self.status_of(&engine))
     }
@@ -761,7 +765,7 @@ impl PlayerKernel {
 
     pub fn deck_seek(&self, deck: usize, position_s: f64) -> Result<(), KernelError> {
         let idx = deck.min(1);
-        let decks = self.decks.lock().map_err(|_| KernelError::Poisoned)?;
+        let mut decks = self.decks.lock().map_err(|_| KernelError::Poisoned)?;
         decks[idx].engine.seek(position_s.max(0.0));
         Ok(())
     }

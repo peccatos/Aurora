@@ -12,8 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use aurora_core::PcmFormat;
-use aurora_decoder::{AudioSource, DecodeError};
-use ringbuf::{HeapRb, traits::Consumer, traits::Producer, traits::Split};
+use aurora_decoder::AudioSource;
+#[cfg(not(target_family = "wasm"))]
+use aurora_decoder::DecodeError;
+#[cfg(not(target_family = "wasm"))]
+use ringbuf::traits::Producer;
+use ringbuf::{HeapRb, traits::Consumer, traits::Split};
 
 #[cfg(target_family = "wasm")]
 use crate::vst_stub as vst_host;
@@ -55,30 +59,30 @@ pub enum EngineState {
     Paused,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     /// True while the worker should keep producing.
-    running: Arc<AtomicBool>,
+    pub(crate) running: Arc<AtomicBool>,
     /// True when a natural end-of-source was reached.
-    finished: Arc<AtomicBool>,
+    pub(crate) finished: Arc<AtomicBool>,
     /// Live DSP configuration: the worker recompiles the pipeline when the
     /// version changes, without interrupting the stream.
-    dsp: Arc<Mutex<LiveDsp>>,
+    pub(crate) dsp: Arc<Mutex<LiveDsp>>,
     /// Pending seek position in seconds; the worker performs the seek and
     /// clears the slot.
-    seek: Arc<Mutex<Option<f64>>>,
+    pub(crate) seek: Arc<Mutex<Option<f64>>>,
     /// True while the stream is paused: the worker stops filling the ring
     /// (which would otherwise block in back-pressure forever) and keeps
     /// servicing live-DSP/seek requests instead.
-    paused: Arc<AtomicBool>,
+    pub(crate) paused: Arc<AtomicBool>,
     /// True after a live DSP recompile: the worker drains stale buffered
     /// audio (produced by the OLD config) so the new preset is heard
     /// immediately instead of after the ring's worth of audio.
-    drain: Arc<AtomicBool>,
+    pub(crate) drain: Arc<AtomicBool>,
     /// Seek rebase: (output frames played when the seek happened, the
     /// position in seconds the stream jumped to). `position_s()` reads
     /// this so the UI bar matches reality after a seek instead of
     /// continuing the pre-seek count.
-    seek_rebase: Arc<Mutex<Option<(u64, f64)>>>,
+    pub(crate) seek_rebase: Arc<Mutex<Option<(u64, f64)>>>,
     /// Stream failure signal (Phase 8): set by the CPAL error callback
     /// when the device is lost mid-flight. The app layer polls this via
     /// `take_stream_error`, stops the dead stream and can re-play on
@@ -97,7 +101,7 @@ struct Shared {
     worker_panicked: Arc<AtomicBool>,
     /// Auto-advance signal: set by the callback side when the stream ends
     /// naturally (checked by the app layer for next-track behavior).
-    track_ended: Arc<AtomicBool>,
+    pub(crate) track_ended: Arc<AtomicBool>,
     /// VST3 plugin chain config (ADR 0004): (path, class_id) slots. The
     /// worker rebuilds the chain when the version changes; plugins run
     /// out-of-process, inline on this worker thread — never the callback.
@@ -155,6 +159,13 @@ pub struct PlaybackEngine {
     #[cfg(feature = "win-wasapi")]
     exclusive_stream: Option<crate::exclusive_stream::ExclusiveStream>,
     worker: Option<JoinHandle<()>>,
+    /// Wasm: the cooperative decode worker. There is no `std::thread`
+    /// on wasm32-unknown-unknown — `spawn` fails with
+    /// `ErrorKind::Unsupported` (surfaced as "internal engine failure:
+    /// operation not supported on this platform"). Instead the JS pull
+    /// loop pumps the worker through `web_pull` (see `web_worker`).
+    #[cfg(target_family = "wasm")]
+    web_worker: Option<crate::web_worker::WebDecodeWorker>,
     /// The negotiated output PCM format (for diagnostics).
     negotiated: Option<PcmFormat>,
     /// Transformations active on the current path (empty = direct match).
@@ -207,6 +218,8 @@ impl PlaybackEngine {
             exclusive_stream: None,
             exclusive_reference: None,
             worker: None,
+            #[cfg(target_family = "wasm")]
+            web_worker: None,
             negotiated: None,
             transformations: Vec::new(),
             device_key: None,
@@ -295,7 +308,10 @@ impl PlaybackEngine {
         // output mode, not an error: clicking "Bit-perfect" while a
         // shared-mode stream is playing must switch modes gracefully.
         self.stop_internal();
+        #[cfg(not(target_family = "wasm"))]
         let mut source = AudioSource::open(&path)?;
+        #[cfg(target_family = "wasm")]
+        let source = AudioSource::open(&path)?;
         let source_format = source.pcm_format();
         // Restart semantics: switching to exclusive while shared-mode
         // playback is running must restart the stream, not error out.
@@ -326,22 +342,35 @@ impl PlaybackEngine {
 
         // Worker: decode and push into the ring until done or stopped.
         // The worker owns the producer; dropping it (in stop) closes writes.
+        #[cfg(not(target_family = "wasm"))]
         let worker_running = Arc::clone(&self.shared.running);
+        #[cfg(not(target_family = "wasm"))]
         let worker_finished = Arc::clone(&self.shared.finished);
+        #[cfg_attr(target_family = "wasm", allow(unused_variables))]
         let live_dsp = Arc::clone(&self.shared.dsp);
+        #[cfg(not(target_family = "wasm"))]
         let live_seek = Arc::clone(&self.shared.seek);
+        #[cfg(not(target_family = "wasm"))]
         let live_paused = Arc::clone(&self.shared.paused);
+        #[cfg(not(target_family = "wasm"))]
         let live_drain = Arc::clone(&self.shared.drain);
+        #[cfg(not(target_family = "wasm"))]
         let track_ended_flag = Arc::clone(&self.shared.track_ended);
+        #[cfg(not(target_family = "wasm"))]
         let self_worker_panicked = Arc::clone(&self.shared.worker_panicked);
+        #[cfg(not(target_family = "wasm"))]
         let live_seek_rebase = Arc::clone(&self.shared.seek_rebase);
+        #[cfg(not(target_family = "wasm"))]
         let worker_frames_played = Arc::clone(&self.metrics);
         let live_vst = Arc::clone(&self.shared.vst);
+        #[cfg(not(target_family = "wasm"))]
         let worker_restart_flag = Arc::clone(&self.shared.needs_dsp_restart);
+        #[cfg(not(target_family = "wasm"))]
         let worker_loop_region = Arc::clone(&self.shared.loop_region);
 
         // The wire format the fallback path converts into (the negotiated
         // device format; equal to the source format on the native path).
+        #[cfg_attr(target_family = "wasm", allow(unused_variables))]
         let target_format = negotiated.pcm;
 
         // The DSP path pipeline: compiled once for this stream. When the
@@ -380,6 +409,7 @@ impl PlaybackEngine {
         } else {
             vec![aurora_core::AudioTransformation::ExternalPlugin]
         };
+        #[cfg(not(target_family = "wasm"))]
         let vst_chain = if vst_list.is_empty() {
             None
         } else {
@@ -400,8 +430,27 @@ impl PlaybackEngine {
         };
 
         // Seeded dither for the float->int boundary (stable across runs).
+        #[cfg_attr(target_family = "wasm", allow(unused_mut))]
         let mut ditherer = aurora_dsp::TpdfDither::new(0xA10CA);
 
+        // ---- Worker construction -------------------------------------
+        // Native: an OS thread runs the decode loop.
+        // Wasm: no std::thread exists (spawn -> ErrorKind::Unsupported,
+        // the "operation not supported on this platform" play failure).
+        // The loop state moves into `WebDecodeWorker`, pumped
+        // cooperatively from `web_pull` (the JS side owns the clock).
+        #[cfg(target_family = "wasm")]
+        let web_worker = crate::web_worker::WebDecodeWorker::new(
+            source,
+            dsp_pipeline,
+            ditherer,
+            Arc::clone(&self.shared),
+            Arc::clone(&self.metrics),
+            prod,
+            negotiated.pcm,
+        );
+
+        #[cfg(not(target_family = "wasm"))]
         let worker = std::thread::Builder::new()
             .name("aurora-decode-worker".into())
             .spawn(move || {
@@ -908,10 +957,19 @@ impl PlaybackEngine {
         {
             let _ = (cb_metrics, cb_state_finished, cb_stream_error);
             self.web_cons = Some(cons);
+            self.web_worker = Some(web_worker);
+            // Jump-start: pre-decode a ring's worth so the first pull
+            // does not play silence while the first chunk decodes.
+            if let Some(w) = self.web_worker.as_mut() {
+                w.pump(RING_TARGET_BYTES, 32);
+            }
         }
 
         self.metrics.reset();
-        self.worker = Some(worker);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.worker = Some(worker);
+        }
         self.source_duration_ms = source_duration_ms;
         self.negotiated = Some(negotiated.pcm);
         // Report the full honest chain: forced conversions (negotiation)
@@ -1101,6 +1159,12 @@ impl PlaybackEngine {
     /// starve live-DSP updates and seek.
     pub fn pause(&mut self) -> Result<(), EngineError> {
         self.shared.paused.store(true, Ordering::Release);
+        // Wasm: the JS bridge stops the browser-scheduled nodes itself
+        // (pauseOutput) — the ring's un-consumed bytes must SURVIVE the
+        // pause: they have not been played yet. The worker stops
+        // decoding (paused flag); on resume the bridge resumes pulling
+        // exactly from the ring, no seconds skipped. (Native path: the
+        // CPAL stream clock simply stops.)
         #[cfg(not(target_family = "wasm"))]
         if let Some(stream) = &self.stream {
             stream
@@ -1131,7 +1195,14 @@ impl PlaybackEngine {
 
     /// Seek to a position in seconds (worker performs it on the next loop
     /// iteration; sub-frame precision is the demuxer's).
-    pub fn seek(&self, position_s: f64) {
+    pub fn seek(&mut self, position_s: f64) {
+        // Wasm: in-flight scheduled audio is stale the instant the seek
+        // lands — clear it so the next pull returns the sought position
+        // (the worker re-decodes from there on its next pump).
+        #[cfg(target_family = "wasm")]
+        if let Some(cons) = self.web_cons.as_mut() {
+            discard_ring(cons);
+        }
         if let Ok(mut slot) = self.shared.seek.lock() {
             *slot = Some(position_s.clamp(0.0, f64::MAX));
         }
@@ -1396,6 +1467,7 @@ impl PlaybackEngine {
         #[cfg(target_family = "wasm")]
         {
             self.web_cons = None;
+            self.web_worker = None;
         }
         self.shared.finished.store(false, Ordering::Release);
         self.shared.track_ended.store(false, Ordering::Release);
@@ -1429,6 +1501,21 @@ impl PlaybackEngine {
     /// silence; the metrics count the deficit via its own counter).
     pub fn pull_web(&mut self, max_bytes: usize) -> Option<Vec<f32>> {
         use ringbuf::traits::Consumer;
+        // Drain (live DSP change): drop the stale old-config audio before
+        // decoding new — the preset must be heard within one chunk, not
+        // after the ring's worth (see the native worker's drain branch).
+        if self.shared.drain.load(Ordering::Acquire) && !self.shared.paused.load(Ordering::Acquire)
+        {
+            if let Some(cons) = self.web_cons.as_mut() {
+                discard_ring(cons);
+            }
+            self.shared.drain.store(false, Ordering::Release);
+        }
+        // Cooperative decode advance: no thread on wasm — the pull itself
+        // drives the worker until the ring is fed (bounded per call).
+        if let Some(w) = self.web_worker.as_mut() {
+            w.pump(RING_TARGET_BYTES, 8);
+        }
         let cons = self.web_cons.as_mut()?;
         let frame_bytes = self
             .negotiated
@@ -1445,14 +1532,41 @@ impl PlaybackEngine {
             return Some(Vec::new());
         }
         let popped_frames = popped / frame_bytes;
-        let samples = popped_frames * frame_bytes / 4; // f32 wire
         let out: Vec<f32> = bytes[..popped_frames * frame_bytes]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
+        #[expect(clippy::chunks_exact)] // constant 4 = f32 lane; clarity wins
         self.metrics.add_frames(popped_frames as u64);
-        let _ = samples;
         Some(out)
+    }
+}
+
+/// Native (non-wasm) counterpart of the web pull: the method exists so
+/// code compiles identically on both targets (and rust-analyzer, which
+/// analyzes the native target, resolves it) — but there is no browser
+/// ring to drain natively; callers see an honest None.
+#[cfg(not(target_family = "wasm"))]
+impl PlaybackEngine {
+    /// Wasm-only in practice: always None on native (the CPAL stream is
+    /// the consumer there, not a JS pull loop).
+    pub fn pull_web(&mut self, _max_bytes: usize) -> Option<Vec<f32>> {
+        None
+    }
+}
+
+/// Wasm: empty the ring from the consumer side (in-flight audio is stale
+/// after a pause/seek/DSP change — the browser clock owns playback, and
+/// those bytes were scheduled, not heard).
+#[cfg(target_family = "wasm")]
+fn discard_ring(cons: &mut ringbuf::wrap::caching::CachingCons<Arc<HeapRb<u8>>>) {
+    use ringbuf::traits::Consumer;
+    let mut sink = [0u8; 4096];
+    loop {
+        let popped = cons.pop_slice(&mut sink);
+        if popped < sink.len() {
+            break;
+        }
     }
 }
 
@@ -1467,7 +1581,6 @@ fn build_stream(
     finished: Arc<AtomicBool>,
     stream_error: Arc<AtomicBool>,
 ) -> Result<Stream, EngineError> {
-    let pcm = pcm;
     let device_format = native.device_sample_format;
 
     // Phase 8 device-loss path: the error callback flags the failure; the
@@ -1503,6 +1616,7 @@ fn build_stream(
 
 /// The real-time callback: pop bytes from the ring, count frames, fill
 /// underruns with silence. No allocation, no locks, no logging.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn callback(
     cons: &mut ringbuf::wrap::caching::CachingCons<Arc<HeapRb<u8>>>,
     out: &mut [u8],
@@ -1534,12 +1648,14 @@ fn callback(
 
 /// Occupied bytes in the producer's ring (cached view; slight
 /// underestimation is fine for drain logic).
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn prod_len(prod: &ringbuf::wrap::caching::CachingProd<Arc<HeapRb<u8>>>) -> usize {
     use ringbuf::traits::Observer;
     prod.occupied_len()
 }
 
 /// Seek the source to a time position (accurate mode).
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn source_seek(
     source: &mut AudioSource,
     to: symphonia::core::formats::SeekTo,
@@ -1551,6 +1667,7 @@ fn source_seek(
 ///
 /// The inverse of the decoder's read path: full-scale maps back to the
 /// integer grid, floats copy through directly.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn f32s_to_wire(samples: &[f32], target: PcmFormat) -> Vec<u8> {
     let bytes = usize::from(target.bits_per_sample).div_ceil(8);
     let mut out = Vec::with_capacity(samples.len() * bytes);

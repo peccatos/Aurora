@@ -9,17 +9,12 @@
 //! reported as N/A here — the browser audio path cannot be measured —
 //! never claimed.
 
-use aurora_kernel::{
-    DeckDto, ExclusiveProbe, KernelError, LibraryStatus, PlayRequest, PlaybackStatus, PlayerKernel,
-    QueueDto, QueueTrack,
-};
+use aurora_kernel::{DeckDto, KernelError, LibraryStatus, PlayRequest, PlayerKernel, QueueTrack};
 use wasm_bindgen::prelude::*;
-
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// In-memory file registry: the JS shell registers File bytes by id
 /// ("web://<id>" queue paths resolve here). The browser has no disk.
+/// (Native: register is a no-op in web_files — see that module.)
 fn register_web_file(id: &str, bytes: Vec<u8>, extension: &str) {
     aurora_decoder::web_files::register(id, bytes, extension);
 }

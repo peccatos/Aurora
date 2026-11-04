@@ -2,7 +2,13 @@
  *  Single source of truth every page module subscribes to. */
 
 import { invoke, platform } from "./invoke";
-import { startOutput, stopOutput, outputRunning } from "./audio-bridge";
+import {
+  startOutput,
+  stopOutput,
+  outputRunning,
+  pauseOutput,
+  flushOutput,
+} from "./audio-bridge";
 import type {
   DeviceDto,
   DspConfig,
@@ -70,15 +76,31 @@ export function setToast(text: string) {
 // Transport (audio.ts would re-export these; kept here for cohesion)
 // ---------------------------------------------------------------------------
 
+/** Path of the track the output bridge last saw playing (web track-change
+ *  detection — scheduled stale audio must die on a track switch). */
+let lastTrackPath: string | null = null;
+
 export async function loadStatus(): Promise<PlaybackStatus> {
   const s = await invoke<PlaybackStatus>("playback_status");
+  const prevState = app.status?.state ?? "idle";
   app.status = s;
   if (s.duration_s && s.duration_s > 0) app.durationS = s.duration_s;
   if (s.state === "idle") app.exclusiveActive = false;
   // Web build: drive the browser output while the engine plays.
   if (platform === "web") {
+    // Track change while playing: the previous track's scheduled audio
+    // must die before the new track's bytes mix with it (doubling).
+    const cur = app.queueTracks[app.queueCurrent ?? 0]?.path ?? null;
+    if (s.state === "playing" && cur !== lastTrackPath) {
+      if (cur) lastTrackPath = cur;
+      flushOutput();
+    }
     if (s.state === "playing" && s.sample_rate) {
       if (!outputRunning()) void startOutput(s.sample_rate, s.channels ?? 2);
+    } else if (s.state === "paused") {
+      // Transition into pause: kill browser-scheduled audio immediately
+      // (the kernel ring is cleared engine-side).
+      if (prevState === "playing") pauseOutput();
     } else if (s.state === "idle" && outputRunning()) {
       stopOutput();
     }
@@ -87,13 +109,18 @@ export async function loadStatus(): Promise<PlaybackStatus> {
   return s;
 }
 
-export async function playQueueIndex(idx: number): Promise<QueueDto> {
-  const q = await invoke<QueueDto>("play_queue_index", { index: idx });
-  app.queueCurrent = q.current;
-  const cur = q.tracks[q.current ?? 0];
+export async function playQueueIndex(idx: number): Promise<number | null> {
+  // The kernel returns a PlaybackStatus (NOT a QueueDto) here — the old
+  // code read q.tracks[q.current] from it and crashed with
+  // "Cannot read properties of undefined (reading '0')", which silently
+  // killed the whole post-play chain (status refresh, title update).
+  await invoke("play_queue_index", { index: idx });
+  app.queueCurrent = idx;
+  const cur = app.queueTracks[idx];
   if (cur) app.selectedPath = cur.path;
   await loadStatus();
-  return q;
+  notify();
+  return app.queueCurrent;
 }
 
 export async function setQueue(tracks: QueueTrack[]): Promise<QueueDto> {

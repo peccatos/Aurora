@@ -8,7 +8,8 @@
  */
 
 import { platform, invoke } from "./invoke";
-import { app, loadStatus, nextTrack, prevTrack, setQueue, setToast } from "./state";
+import { app, loadStatus, nextTrack, playQueueIndex, prevTrack, setQueue, setToast } from "./state";
+import { unlockAudio, flushOutput } from "./audio-bridge";
 import { icon, type IconName } from "./styles/ytm-icons";
 import "./styles/ytm.css";
 import { homePage } from "./pages/home";
@@ -134,13 +135,14 @@ export function bindWebPlayerBar(): void {
   const now = document.getElementById("ytm-now");
 
   const toggle = async () => {
+    unlockAudio(); // user gesture: unblock the browser's autoplay policy
     try {
       if (app.status?.state === "playing") {
         app.status = await invoke("pause_playback");
       } else if (app.status?.state === "paused") {
         app.status = await invoke("resume_playback");
       } else if (app.queueTracks.length) {
-        await invoke("play_queue_index", { index: app.queueCurrent ?? 0 });
+        await playQueueIndex(app.queueCurrent ?? 0);
       }
       await loadStatus();
     } catch (e) {
@@ -165,6 +167,7 @@ export function bindWebPlayerBar(): void {
   seek?.addEventListener("change", async () => {
     const pos = (Number.parseFloat(seek.value) / 1000) * app.durationS;
     try {
+      flushOutput(); // drop browser-scheduled stale audio first
       await invoke("seek", { positionS: pos });
     } catch (e) {
       setToast(String(e));

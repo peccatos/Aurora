@@ -12,7 +12,11 @@ pub mod pcm;
 pub mod source;
 pub mod tempo;
 
-#[cfg(target_family = "wasm")]
+/// In-memory "web://<id>" file registry: the real thing on wasm (the
+/// browser has no filesystem), an honest no-op natively (native paths
+/// are real files; "web://" paths never occur). Both targets see the
+/// SAME module so code compiles identically and IDEs (which analyze the
+/// native target) resolve it.
 pub mod web_files;
 
 pub use error::{DecodeError, SourceError};
