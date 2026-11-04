@@ -38,12 +38,16 @@ function first(v: string | string[] | undefined): string | null {
   return v ?? null;
 }
 
-/** Search CC-licensed audio items. `query` matches title/creator. */
+/** Search CC-licensed audio items. `query` matches title/creator.
+ *  The format filter demands DERIVED MP3s — items whose uploader only
+ *  shipped a ZIP have no playable files (a real discovery flaw found
+ *  in live testing: hit counts were full of unplayable entries). */
 export async function searchFreeTracks(query: string, limit = 12): Promise<FreeTrackHit[]> {
   const q = [
     "mediatype:audio",
     "(collection:netlabels OR collection:audio_music OR collection:etree)",
     "licenseurl:(*creativecommons*)",
+    'format:("VBR MP3")',
     `(${query.split(/\s+/).filter(Boolean).map((w) => `"${w}"`).join(" AND ")})`,
   ].join(" AND ");
   const params = new URLSearchParams();

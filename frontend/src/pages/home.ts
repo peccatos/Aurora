@@ -370,6 +370,64 @@ export async function playWebTracksByIds(playlistId: string, startIndex = 0): Pr
   await playWebTracks(tracks, startIndex);
 }
 
+/** A remote, FULL track (legal sources: the owner's server, or CC
+ *  archive.org): fetch the bytes -> register with the kernel -> queue.
+ *  The SAME decode/DSP path as local files; attribution rides in the
+ *  artist field ("CC BY" / the server's license note).
+ *  Honest degradation: a failed fetch shows a toast, never silence. */
+export async function playUrlTrack(
+  url: string,
+  title: string,
+  artist: string | null,
+  durationMs: number | null = null,
+  queueWholeList: Array<{ url: string; title: string; artist: string | null; durationMs?: number | null; license?: string | null }> = [],
+  startIndex = 0,
+): Promise<void> {
+  unlockAudio();
+  const list = queueWholeList.length ? queueWholeList : [{ url, title, artist, durationMs }];
+  const queue = [];
+  for (const item of list) {
+    const ext = (item.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase();
+    try {
+      const res = await fetch(item.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const id = crypto.randomUUID();
+      const path = await registerWebBytes(id, bytes, ext);
+      queue.push({
+        path,
+        title: item.title,
+        artist: item.license ? `${item.artist ?? "Unknown"} · ${item.license}` : item.artist,
+        replaygain_track_db: null as number | null,
+        replaygain_album_db: null as number | null,
+        bpm: null as number | null,
+      });
+    } catch (e) {
+      setToast(`Could not load "${item.title.slice(0, 30)}": ${String(e).slice(0, 60)}`);
+    }
+  }
+  if (!queue.length) return;
+  // LUFS honesty for remote tracks too: the kernel measures on the
+  // registered bytes... the measurement API takes bytes directly:
+  try {
+    const first = queue[0];
+    // Measure only the STARTING track (bounded 60s) — like local ingest.
+    const firstItem = list[startIndex] ?? list[0];
+    const res = await fetch(firstItem.url);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const lufs = await analyzeLufs(bytes, (firstItem.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase());
+    if (lufs != null) {
+      (first as { replaygain_track_db: number | null }).replaygain_track_db = -14 - lufs;
+    }
+    void first;
+  } catch {
+    /* no measurement -> no normalization (honest) */
+  }
+  await setQueue(queue);
+  await playQueueIndex(startIndex);
+  void recordPlay({ id: url, title, artist });
+}
+
 async function render(root: HTMLElement) {
   root.innerHTML = `
     <div class="ytm-search">

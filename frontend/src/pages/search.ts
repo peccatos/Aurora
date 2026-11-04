@@ -9,12 +9,15 @@
 import type { Page } from "../router";
 import { navigate } from "../router";
 import { kvGet, kvPut } from "../library-db";
+import { setToast } from "../state";
 import { unlockAudio } from "../audio-bridge";
 import { searchTracks, addPreviewToQueue, type SearchHit } from "../search-service";
 import { listPlaylists } from "../playlist-service";
 import { icon } from "../styles/ytm-icons";
 import { trackArtworkUrl } from "../artwork-store";
-import { getWebTracks, playWebTracks } from "./home";
+import { searchFreeTracks, resolveFreeTrack, attribution, type FreeTrackHit } from "../free-music-service";
+import { getServerTracks, getServerUrl, type ServerTrack } from "../server-library-service";
+import { getWebTracks, playWebTracks, playUrlTrack } from "./home";
 
 /** Result filter chips (YTM filter row). */
 type Filter = "all" | "songs" | "playlists" | "online";
@@ -355,6 +358,7 @@ async function render(root: HTMLElement) {
     results.innerHTML = "";
     if (!q.trim()) {
       void drawRecent();
+      void drawServerShelf();
       return;
     }
     const songs = filter === "all" || filter === "songs" ? drawSongs(q) : null;
@@ -366,6 +370,8 @@ async function render(root: HTMLElement) {
     }
     if (filter === "all" || filter === "online") {
       drawOnline(q);
+      drawFree(q);
+      void drawServerTracks(q);
     }
     // Honest empty state (local half only when offline).
     if (filter !== "online" && !songs) {
@@ -377,6 +383,155 @@ async function render(root: HTMLElement) {
           : "Nothing matches in your library — check the online results below.";
       results.appendChild(empty);
     }
+  }
+
+  /** Free full-track shelf (archive.org, CC-licensed): whole songs,
+   *  attributed. Resolve-and-play on click — the file URL is fetched
+   *  lazily (item metadata) then fed to the kernel. */
+  function drawFree(q: string): void {
+    const query = q.trim();
+    if (query.length < 3) return;
+    const my = ++seq;
+    searchFreeTracks(query)
+      .then(async (hits) => {
+        if (my !== seq) return;
+        if (input.value.trim() !== query) return;
+        if (!hits.length) return;
+        const shelf = document.createElement("div");
+        shelf.className = "ytm-shelf";
+        const head = document.createElement("div");
+        head.className = "ytm-shelf-head";
+        const title = document.createElement("span");
+        title.className = "ytm-shelf-title";
+        title.textContent = "Free — full tracks";
+        const more = document.createElement("span");
+        more.className = "ytm-shelf-more";
+        more.textContent = "Creative Commons · archive.org";
+        head.append(title, more);
+        const row = document.createElement("div");
+        row.className = "ytm-tracklist";
+        shelf.append(head, row);
+        for (const hit of hits) {
+          const r = document.createElement("div");
+          r.className = "ytm-track-row";
+          const idx = document.createElement("span");
+          idx.className = "ytm-track-index";
+          idx.innerHTML = icon("play", 14);
+          const thumb = document.createElement("div");
+          thumb.className = "ytm-track-thumb";
+          thumb.innerHTML = icon("explore", 18);
+          const main = document.createElement("div");
+          main.className = "ytm-track-main";
+          const t1 = document.createElement("div");
+          t1.className = "ytm-track-title";
+          t1.textContent = hit.title;
+          const t2 = document.createElement("div");
+          t2.className = "ytm-track-meta";
+          t2.textContent = attribution(hit);
+          main.append(t1, t2);
+          r.append(idx, thumb, main);
+          r.title = "Play the full track (Creative Commons)";
+          r.addEventListener("click", () => {
+            unlockAudio();
+            setToast(`Loading "${hit.title.slice(0, 30)}"…`);
+            void resolveFreeTrack(hit)
+              .then(async (url) => {
+                if (!url) {
+                  setToast("Track unavailable");
+                  return;
+                }
+                try {
+                  await playUrlTrack(url, hit.title, hit.creator, hit.durationS ? hit.durationS * 1000 : null, [
+                    { url, title: hit.title, artist: hit.creator, license: hit.license },
+                  ], 0);
+                } catch (e) {
+                  console.error("[aurora] free-track play failed:", e);
+                  setToast(`Play failed: ${String(e).slice(0, 80)}`);
+                }
+              })
+              .catch((e) => {
+                console.error("[aurora] resolveFreeTrack failed:", e);
+                setToast(`Load failed: ${String(e).slice(0, 80)}`);
+              });
+          });
+          row.appendChild(r);
+        }
+        results.appendChild(shelf);
+      })
+      .catch(() => {
+        /* archive.org unreachable: honest silence */
+      });
+  }
+
+  /** The owner's server library: full tracks at the configured URL.
+   *  Empty query = the whole shelf; a query filters it. */
+  async function drawServerTracks(q: string): Promise<void> {
+    const query = q.trim().toLowerCase();
+    const tracks = await getServerTracks();
+    const hits = tracks.filter(
+      (t) => !query || t.title.toLowerCase().includes(query) || (t.artist ?? "").toLowerCase().includes(query),
+    );
+    if (!hits.length) return;
+    results.appendChild(buildServerShelf(hits));
+  }
+
+  async function drawServerShelf(): Promise<void> {
+    const base = await getServerUrl();
+    if (!base) return; // not configured: hidden (honest — nothing to show)
+    const tracks = await getServerTracks();
+    if (!tracks.length) return;
+    results.appendChild(buildServerShelf(tracks));
+  }
+
+  function buildServerShelf(tracks: ServerTrack[]): HTMLElement {
+    const shelf = document.createElement("div");
+    shelf.className = "ytm-shelf";
+    const head = document.createElement("div");
+    head.className = "ytm-shelf-head";
+    const title = document.createElement("span");
+    title.className = "ytm-shelf-title";
+    title.textContent = "Your server";
+    head.appendChild(title);
+    const row = document.createElement("div");
+    row.className = "ytm-tracklist";
+    shelf.append(head, row);
+    const list = tracks.map((t) => ({
+      url: t.url,
+      title: t.title,
+      artist: t.artist,
+      durationMs: t.durationMs ?? null,
+      license: t.license ?? null,
+    }));
+    tracks.forEach((t, i) => {
+      const r = document.createElement("div");
+      r.className = "ytm-track-row";
+      const idx = document.createElement("span");
+      idx.className = "ytm-track-index";
+      idx.innerHTML = icon("play", 14);
+      const thumb = document.createElement("div");
+      thumb.className = "ytm-track-thumb";
+      thumb.innerHTML = icon("home", 18);
+      const main = document.createElement("div");
+      main.className = "ytm-track-main";
+      const t1 = document.createElement("div");
+      t1.className = "ytm-track-title";
+      t1.textContent = t.title;
+      const t2 = document.createElement("div");
+      t2.className = "ytm-track-meta";
+      t2.textContent = t.license ? `${t.artist ?? "Unknown"} · ${t.license}` : (t.artist ?? "Unknown");
+      main.append(t1, t2);
+      const dur = document.createElement("span");
+      dur.className = "ytm-track-dur";
+      dur.textContent = fmtDur(t.durationMs ?? null);
+      r.append(idx, thumb, main, dur);
+      r.addEventListener("click", () => {
+        unlockAudio();
+        setToast(`Loading "${t.title.slice(0, 30)}"…`);
+        void playUrlTrack(t.url, t.title, t.artist, t.durationMs ?? null, list, i);
+      });
+      row.appendChild(r);
+    });
+    return shelf;
   }
 
   draw(initialQ);

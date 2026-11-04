@@ -27,6 +27,17 @@ function render(root: HTMLElement) {
 
       <div class="eq-card">
         <header class="card-head">
+          <p class="overline">Your music server</p>
+        </header>
+        <div class="settings-row">
+          <input id="server-url" type="url" placeholder="https://your-server.example/music" style="flex:1;min-width:260px" />
+          <button class="btn" id="server-save" type="button">Save</button>
+        </div>
+        <p class="hint">A static library.json on the server lists your tracks and videos (url, title, artist, durationMs, license). The server must allow CORS. Tracks appear in Search → "Your server".</p>
+      </div>
+
+      <div class="eq-card">
+        <header class="card-head">
           <p class="overline">Integrity</p>
         </header>
         <div class="settings-row">
@@ -41,6 +52,28 @@ function render(root: HTMLElement) {
   `;
 
   const deviceSel = root.querySelector<HTMLSelectElement>("#device-select");
+
+  // Server library URL: persisted (kv); empty = feature hidden.
+  const serverUrlInput = root.querySelector<HTMLInputElement>("#server-url");
+  void import("../server-library-service").then(async (svc) => {
+    if (serverUrlInput) serverUrlInput.value = await svc.getServerUrl();
+  });
+  root.querySelector<HTMLButtonElement>("#server-save")?.addEventListener("click", async () => {
+    const url = serverUrlInput?.value.trim() ?? "";
+    const { setServerUrl, getServerTracks } = await import("../server-library-service");
+    await setServerUrl(url);
+    if (!url) {
+      setToast("Server library cleared");
+      return;
+    }
+    const tracks = await getServerTracks();
+    setToast(
+      tracks.length
+        ? `Server library: ${tracks.length} track${tracks.length === 1 ? "" : "s"}`
+        : "Saved — no tracks found (check library.json and CORS)",
+    );
+  });
+
   void (async () => {
     try {
       const devices = await invoke<DeviceDto[]>("list_output_devices");
