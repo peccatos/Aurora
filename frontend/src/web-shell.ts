@@ -28,15 +28,18 @@ const NAV: NavEntry[] = [
   { route: "home", label: "Home", icon: "home" },
   { route: "library", label: "Explore", icon: "explore" },
   { route: "queue", label: "Queue", icon: "queue" },
-  { route: "decks", label: "Decks", icon: "more" },
   { route: "eq", label: "EQ", icon: "more" },
   { route: "settings", label: "Settings", icon: "more" },
 ];
 
+// Decks are NATIVE-ONLY for now: the wasm bridge drains only the main
+// engine's ring — deck engines (Deck::engine) have no consumer on the
+// web, so deck_play would report "playing" with permanent silence
+// (a dishonest status per ADR 0002). Hidden until the ring mixer lands.
 const MOBILE_TABS: NavEntry[] = [
   { route: "home", label: "Home", icon: "home" },
   { route: "library", label: "Explore", icon: "explore" },
-  { route: "queue", label: "Library", icon: "library" },
+  { route: "queue", label: "Queue", icon: "queue" },
 ];
 
 /** Render the YTM shell into #app. Returns the content root + nav

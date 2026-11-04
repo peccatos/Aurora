@@ -45,6 +45,23 @@ let generation = 0;
  *  AudioContext.resume() on interaction. */
 export async function startOutput(rate: number, ch: number): Promise<void> {
   if (platform !== "web") return;
+  if (!ctx) {
+    ctx = new AudioContext();
+  }
+  // Device rate to the engine ONCE: with it, the engine resamples to
+  // the DEVICE rate as one continuous stream (reported honestly);
+  // without it the browser resamples each buffer independently —
+  // phase-discontinuous at chunk boundaries, the "dirty/jumping"
+  // sound on 44.1k files played at a 48k device.
+  const k0 = await webKernel();
+  if (k0 && !deviceRateTold) {
+    deviceRateTold = true;
+    try {
+      k0.set_output_rate(ctx.sampleRate);
+    } catch {
+      /* older binary without the API — browser resampling remains */
+    }
+  }
   if (running && (rate !== sampleRate || ch !== channels)) {
     // Format change (track with a different rate/channels): the old
     // loop's scheduled buffers carry OLD-format bytes — playing them
@@ -61,9 +78,6 @@ export async function startOutput(rate: number, ch: number): Promise<void> {
   // Claim BEFORE the first await: concurrent callers must not both
   // pass the guard while resume() is pending.
   running = true;
-  if (!ctx) {
-    ctx = new AudioContext();
-  }
   if (ctx.state === "suspended") {
     try {
       await ctx.resume();
@@ -75,6 +89,9 @@ export async function startOutput(rate: number, ch: number): Promise<void> {
   }
   scheduleNext(generation);
 }
+
+/** One-shot flag: the device rate was reported to the engine. */
+let deviceRateTold = false;
 
 /** Called from any user gesture: unlock/resume the audio context so
  *  later programmatic starts (status poll) are not blocked by the

@@ -1,8 +1,7 @@
 /** Settings page: output device, bit-perfect (exclusive + verify), files. */
 
-import { invoke } from "../invoke";
-const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
-  import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
+import { invoke, platform } from "../invoke";
+import { pickAudioFiles } from "../file-picker";
 import type { Page } from "../router";
 import { app, loadStatus, setQueue, setToast, trackToQueueTrack } from "../state";
 import type { BitPerfectVerdict, DeviceDto, ExclusivePlayResult, PlaybackStatus, QueueDto } from "../types";
@@ -86,19 +85,15 @@ function render(root: HTMLElement) {
   });
 
   root.querySelector<HTMLButtonElement>("#pick-file")?.addEventListener("click", async () => {
-    const picked = await open({
-      multiple: true,
-      filters: [
-        {
-          name: "Audio",
-          extensions: [
-            "flac", "wav", "wave", "mp3", "m4a", "alac", "aac",
-            "ogg", "oga", "opus", "aif", "aiff", "wv",
-          ],
-        },
-      ],
-    });
-    const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+    // Platform-aware: native dialog on desktop, <input type=file> on the
+    // web (the old plugin-dialog import crashed silently in browsers).
+    if (platform === "web") {
+      // Web: picking goes through the Home pipeline (register + persist
+      // + play). Send the user there; the button stays honest.
+      setToast("Adding music lives on the Home page — drop or pick files there");
+      return;
+    }
+    const { paths } = await pickAudioFiles();
     if (paths.length > 0) {
       app.selectedPath = paths[0];
       app.queueTracks = paths.map((path) => ({ path }));

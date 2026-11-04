@@ -40,7 +40,17 @@ function parseHash(): string {
 function render() {
   if (!root) return;
   const page = pages.get(activeId);
-  if (!page) return;
+  if (!page) {
+    // Unregistered route (e.g. native-only page opened on the web
+    // shell): fall back to the first registered page instead of a
+    // silently blank screen.
+    const fallback = pages.keys().next().value;
+    if (fallback && fallback !== activeId) {
+      activeId = fallback;
+      render();
+    }
+    return;
+  }
   document.querySelectorAll(".nav-item").forEach((n) => {
     const el = n as HTMLElement;
     el.classList.toggle("active", el.dataset.route === activeId);

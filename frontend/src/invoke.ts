@@ -48,6 +48,7 @@ type WebKernel = {
   stop(): unknown;
   seek(position_s: number): unknown;
   position_correction_s(seconds: number): void;
+  set_output_rate(rate: number): void;
   set_queue(tracks: unknown): unknown;
   get_queue(): unknown;
   play_queue_index(index: number): unknown;
@@ -86,7 +87,22 @@ async function loadKernel(): Promise<WebKernel> {
       // (wasm-pack output is copied into src/wasm/ during build.)
       const mod = await import("./wasm/aurora_web");
       await mod.default();
-      return new mod.WebKernel() as unknown as WebKernel;
+      const kernel = new mod.WebKernel() as unknown as WebKernel;
+      // Device rate BEFORE the first play: the engine's negotiator must
+      // know the AudioContext rate when play_queue_index runs, or 44.1k
+      // files pass through at 44.1k and the BROWSER resamples each
+      // buffer independently (phase-discontinuous "jumping" audio).
+      // Creating an AudioContext here is allowed (it starts suspended);
+      // playback unlocks it from the user gesture later.
+      try {
+        const probe = new AudioContext();
+        kernel.set_output_rate(probe.sampleRate);
+        void probe.close();
+      } catch {
+        // No audio yet (rare): the engine falls back to source-rate
+        // passthrough and the bridge keeps working.
+      }
+      return kernel;
     })();
   }
   return kernelPromise;
@@ -180,6 +196,10 @@ async function webInvoke<T>(cmd: string, args: InvokeArgs): Promise<T> {
       return "0.1.0-web" as T;
     case "app_name":
       return "Aurora Web" as T;
+    case "list_output_devices":
+      // The browser has exactly one output — the kernel's resolve_device
+      // returns the same "web:default" the device selector expects.
+      return [{ key: "web:default", name: "Browser output" }] as T;
     default:
       throw new Error(`invoke: unsupported command in web build: ${cmd}`);
   }

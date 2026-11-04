@@ -59,3 +59,30 @@ Consequences for users:
 
 Rust 1.90 (enforced in CI on the MSRV job). Dependencies are audited via
 `cargo audit` in CI (Sprint 0 setup).
+
+## Web (Aurora Web, wasm) — known limitations
+
+- **Background-tab stutter (architectural)**: the output bridge is a
+  `setTimeout(50ms)` pull loop; browsers clamp background-tab timers to
+  ~1s while only ~200ms of audio is scheduled ahead — hidden tabs get
+  dry windows (gaps). The AudioWorklet upgrade (needs
+  SharedArrayBuffer + COOP/COEP headers) is the designed fix and a
+  drop-in for the ring drain.
+- **Latency**: ~200ms scheduling slack by design (honest, displayed);
+  native builds have no such gap.
+- **Decks are native-only**: the wasm bridge drains only the main
+  engine's ring; deck engines have no consumer on the web, so the Decks
+  route is hidden (a "playing" deck with no sound would be a dishonest
+  status per ADR 0002). A ring mixer (main + 2 decks + crossfader) is
+  the planned unblock.
+- **No SQLite/library**: the wasm kernel has no storage crate; the JS
+  shell owns IndexedDB (tracks + DSP settings). Bit-perfect exclusive
+  and loopback verification honestly report N/A here — the browser
+  audio path cannot be measured from wasm.
+- **Position honesty**: the engine counts frames handed to the bridge,
+  which schedules ~200ms ahead of the audible clock; pause reports the
+  unheard tail (position correction, ADR 0002), and the auto-advance
+  threshold compensates for the schedule window.
+- **Deezer catalog**: api.deezer.com sends no CORS headers — its
+  results arrive only via CORS-friendly networks/proxies; iTunes Search
+  is the reliable browser-side source.

@@ -178,6 +178,22 @@ impl PlayerKernel {
 
     pub fn set_queue(&self, tracks: Vec<QueueTrack>) -> Result<QueueDto, KernelError> {
         let mut queue = self.queue.lock().map_err(|_| KernelError::Poisoned)?;
+        let keep = queue.current.filter(|&c| c < tracks.len());
+        queue.tracks = tracks;
+        // Preserve the current index when it still points INTO the new
+        // list: add/reorder flows mutate the queue mid-playback, and
+        // losing `current` there broke auto-advance (advance() from
+        // None returns None -> stop) and the UI's now-playing pointer.
+        // Replacing the whole queue with a fresh list (a NEW play flow)
+        // passes current=None and resets as before.
+        queue.current = keep;
+        Ok(self.queue_dto(&queue))
+    }
+
+    /// Replace the queue unconditionally: current resets to None (the
+    /// strict old set_queue semantics for flows that swap the queue).
+    pub fn reset_queue(&self, tracks: Vec<QueueTrack>) -> Result<QueueDto, KernelError> {
+        let mut queue = self.queue.lock().map_err(|_| KernelError::Poisoned)?;
         queue.tracks = tracks;
         queue.current = None;
         Ok(self.queue_dto(&queue))

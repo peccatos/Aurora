@@ -111,9 +111,11 @@ async function fetchWithTimeout(url: string, ms: number): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Deezer public API (no key): 30s mp3 previews + cover art. Primary
-// fallback for networks where MusicBrainz is blocked (it is geo-blocked
-// from several regions — verified: this exact deployment's network).
+// Deezer public API (no key): 30s mp3 previews + cover art.
+// NOTE: api.deezer.com sends NO CORS headers — direct browser requests
+// fail with a TypeError (allSettled swallows it). Results DO come
+// through on networks/proxies that add CORS, and the same code serves
+// any future server-side proxy. Not the primary source for that reason.
 // ---------------------------------------------------------------------------
 
 interface DeezerTrack {

@@ -68,6 +68,19 @@ async function loadStoredBytes(id: string): Promise<ArrayBuffer | null> {
   }
 }
 
+/** Third-party URL trust gate: only absolute https URLs pass. A
+ *  catalog response must never inject javascript: or data: URIs into
+ *  style attributes. */
+function safeHttpsUrl(u: string | null | undefined): u is string {
+  if (!u) return false;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function fmtDur(ms: number | null): string {
   if (!ms) return "";
   const s = Math.round(ms / 1000);
@@ -80,6 +93,10 @@ function fmtDur(ms: number | null): string {
 async function playWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   if (!tracks.length) return;
   unlockAudio(); // the click that got here is the user gesture
+  await doPlayWebTracks(tracks, index);
+}
+
+async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
   const queue = [];
   for (const t of tracks) {
     t.kernelPath = t.file
@@ -144,17 +161,29 @@ async function render(root: HTMLElement) {
     );
     const list = shelves.querySelector<HTMLElement>("#ytm-list")!;
     all.forEach((t, i) => {
+      // DOM API, not innerHTML: file names are user input — a name like
+      // '"><img src=x onerror=…>' must never execute (XSS).
       const row = document.createElement("div");
       row.className = "ytm-track-row";
-      row.innerHTML = `
-        <span class="ytm-track-index">${i + 1}</span>
-        <div class="ytm-track-thumb">${icon("library", 18)}</div>
-        <div class="ytm-track-main">
-          <div class="ytm-track-title">${t.name}</div>
-          <div class="ytm-track-meta">${t.artist ?? "Unknown artist"}${t.album ? " • " + t.album : ""}</div>
-        </div>
-        <span class="ytm-track-dur">${fmtDur(t.durationMs)}</span>
-      `;
+      const idx = document.createElement("span");
+      idx.className = "ytm-track-index";
+      idx.textContent = String(i + 1);
+      const thumb = document.createElement("div");
+      thumb.className = "ytm-track-thumb";
+      thumb.innerHTML = icon("library", 18); // trusted constant
+      const main = document.createElement("div");
+      main.className = "ytm-track-main";
+      const title = document.createElement("div");
+      title.className = "ytm-track-title";
+      title.textContent = t.name;
+      const meta = document.createElement("div");
+      meta.className = "ytm-track-meta";
+      meta.textContent = t.artist ?? "Unknown artist";
+      const dur = document.createElement("span");
+      dur.className = "ytm-track-dur";
+      dur.textContent = fmtDur(t.durationMs);
+      main.append(title, meta);
+      row.append(idx, thumb, main, dur);
       row.addEventListener("click", () => void playWebTracks(all, i));
       list.appendChild(row);
     });
@@ -170,15 +199,19 @@ async function render(root: HTMLElement) {
     const mix = shelves.querySelector<HTMLElement>("#ytm-mix")!;
     const shuffled = [...all].sort(() => Math.random() - 0.5).slice(0, 8);
     shuffled.forEach((t) => {
+      // DOM API: user file names must not pass through innerHTML (XSS).
       const card = document.createElement("div");
       card.className = "ytm-card";
-      card.innerHTML = `
-        <div class="ytm-card-art">${icon("library", 48)}
-          <button class="ytm-card-play" type="button" title="Play">${icon("play")}</button>
-        </div>
-        <div class="ytm-card-title">${t.name}</div>
-        <div class="ytm-card-sub">${t.artist ?? "Unknown artist"}</div>
-      `;
+      const art = document.createElement("div");
+      art.className = "ytm-card-art";
+      art.innerHTML = `${icon("library", 48)}<button class="ytm-card-play" type="button" title="Play">${icon("play")}</button>`;
+      const ct = document.createElement("div");
+      ct.className = "ytm-card-title";
+      ct.textContent = t.name;
+      const cs = document.createElement("div");
+      cs.className = "ytm-card-sub";
+      cs.textContent = t.artist ?? "Unknown artist";
+      card.append(art, ct, cs);
       const playShuffled = () => {
         const shuffledAll = [...all].sort(() => Math.random() - 0.5);
         const startIdx = Math.max(0, shuffledAll.findIndex((x) => x.id === t.id));
@@ -240,22 +273,40 @@ async function render(root: HTMLElement) {
     const row = ext.querySelector<HTMLElement>("#ytm-ext-row")!;
     row.innerHTML = "";
     for (const hit of hits.slice(0, 12)) {
+      // THIRD-PARTY data (catalog APIs): never innerHTML. Text goes
+      // through textContent; URLs are validated https-only.
       const card = document.createElement("div");
       card.className = "ytm-card";
-      card.innerHTML = `
-        <div class="ytm-card-art" style="${hit.artworkUrl ? `background-image:url('${hit.artworkUrl}');background-size:cover` : ""}">
-          ${hit.artworkUrl ? "" : icon("search", 48)}
-          ${hit.previewUrl ? `<button class="ytm-card-play" type="button" title="Play 30s preview">${icon("play")}</button>` : ""}
-        </div>
-        <div class="ytm-card-title">${hit.title}</div>
-        <div class="ytm-card-sub">${hit.artist}</div>
-      `;
-      card.querySelector<HTMLButtonElement>(".ytm-card-play")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        unlockAudio();
-        void addPreviewToQueue(hit);
-      });
+      const art = document.createElement("div");
+      art.className = "ytm-card-art";
+      if (safeHttpsUrl(hit.artworkUrl)) {
+        art.style.backgroundImage = `url("${hit.artworkUrl}")`;
+        art.style.backgroundSize = "cover";
+      } else {
+        art.textContent = "";
+        art.innerHTML = icon("search", 48);
+      }
+      if (hit.previewUrl) {
+        const playBtn = document.createElement("button");
+        playBtn.className = "ytm-card-play";
+        playBtn.type = "button";
+        playBtn.title = "Play 30s preview";
+        playBtn.innerHTML = icon("play");
+        playBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          unlockAudio();
+          void addPreviewToQueue(hit);
+        });
+        art.appendChild(playBtn);
+      }
+      const ct = document.createElement("div");
+      ct.className = "ytm-card-title";
+      ct.textContent = hit.title;
+      const cs = document.createElement("div");
+      cs.className = "ytm-card-sub";
+      cs.textContent = hit.artist;
       card.title = hit.previewUrl ? "Play 30-second preview" : "Metadata only (no preview)";
+      card.append(art, ct, cs);
       row.appendChild(card);
     }
   }
@@ -285,7 +336,10 @@ async function render(root: HTMLElement) {
           addedAt: Date.now(),
         });
       } catch (e) {
+        // Storage failure is LOUD: the user believes their library is
+        // saved; a silent console.warn betrays that trust after a reload.
         console.warn("[aurora] track not persisted (storage full?)", e);
+        setToast("Storage full — tracks will not survive a reload");
       }
       added += 1;
     }

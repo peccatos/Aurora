@@ -266,6 +266,23 @@ pub(crate) mod imp {
 #[cfg(target_family = "wasm")]
 pub(crate) mod imp {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The browser device sample rate, set by the JS shell once it has an
+    /// AudioContext (`ctx.sampleRate`). 0 = unknown yet; the engine then
+    /// keeps the source rate and the BROWSER resamples — which is
+    /// per-buffer and phase-discontinuous at chunk boundaries (the
+    /// "frequencies jumping" bug). With the rate known, the engine's DSP
+    /// resampler converts to the device rate as ONE continuous stream and
+    /// reports the `Resampling` transformation honestly (ADR 0002).
+    static DEVICE_RATE: AtomicU32 = AtomicU32::new(0);
+
+    /// Called by the wasm shell (WebKernel::set_output_rate) at startup.
+    pub fn set_device_rate(rate: u32) {
+        if rate > 0 {
+            DEVICE_RATE.store(rate, Ordering::Release);
+        }
+    }
 
     /// The single browser output (the default endpoint).
     pub fn output_devices() -> Result<Vec<OutputDevice>, EngineError> {
@@ -279,19 +296,30 @@ pub(crate) mod imp {
         })
     }
 
-    /// Honest "negotiation": the AudioWorklet consumes f32 interleaved at
-    /// the source rate; any conversion from the source representation is
-    /// reported (the browser's own resampling beyond the worklet is not
-    /// measurable from here — never claimed).
+    /// Honest "negotiation": the JS bridge consumes f32 interleaved at
+    /// the DEVICE rate when known (the engine resamples through its DSP
+    /// pipeline — one continuous stream, reported as `Resampling`).
+    /// Without a known rate the source rate passes through and the
+    /// browser resamples per-buffer (phase-discontinuous; kept as the
+    /// honest fallback and reported). Every conversion is listed.
     pub fn negotiate(source: PcmFormat) -> Result<NegotiatedConfig, EngineError> {
+        let device_rate = DEVICE_RATE.load(Ordering::Acquire);
+        let target_rate = if device_rate > 0 {
+            device_rate
+        } else {
+            source.sample_rate
+        };
         let pcm = PcmFormat {
-            sample_rate: source.sample_rate,
+            sample_rate: target_rate,
             channels: source.channels,
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
             channel_layout: ChannelLayout::Interleaved,
         };
         let mut transformations = Vec::new();
+        if pcm.sample_rate != source.sample_rate {
+            transformations.push(aurora_core::AudioTransformation::Resampling);
+        }
         if source.sample_format != SampleFormat::Float || source.bits_per_sample != 32 {
             transformations.push(aurora_core::AudioTransformation::SampleFormatConversion);
         }
@@ -305,3 +333,20 @@ pub(crate) mod imp {
 #[cfg(not(target_family = "wasm"))]
 pub use imp::find_by_key;
 pub use imp::{default_output_device, output_devices};
+
+/// Wasm: JS shell reports the AudioContext's device rate once at
+/// startup so the engine resamples as one continuous stream. Native:
+/// no-op (CPAL negotiates against the real device) — the function
+/// exists on BOTH targets so callers compile identically everywhere.
+pub fn set_output_rate(rate: u32) {
+    #[cfg(target_family = "wasm")]
+    {
+        imp::set_device_rate(rate);
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        // Native: the device rate is negotiated per-stream via CPAL;
+        // a browser-reported rate is meaningless here.
+        let _ = rate;
+    }
+}

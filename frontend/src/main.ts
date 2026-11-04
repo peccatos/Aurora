@@ -13,7 +13,7 @@ import "./styles/player.css";
 import "./styles/pages.css";
 
 import { navigate, refreshActive, registerPage, startRouter, activeRoute } from "./router";
-import { app, loadStatus, nextTrack, prevTrack, setQueue, setToast, subscribe } from "./state";
+import { app, loadStatus, nextTrack, playQueueIndex, prevTrack, setQueue, setToast, subscribe } from "./state";
 import { registerDrop } from "./drop";
 import { loadDsp } from "./pages/eq";
 import { playerPage, animatePlayer } from "./pages/player";
@@ -39,7 +39,10 @@ registerPage(libraryPage);
 registerPage(eqPage);
 registerPage(pluginsPage);
 registerPage(settingsPage);
-registerPage(decksPage);
+// Decks page is native-only on the web shell (deck engines have no
+// ring consumer there — deck_play would be silent "playing"). The
+// page itself stays registered for the desktop shell.
+if (!isWebShell()) registerPage(decksPage);
 if (isWebShell()) registerPage(homePage);
 
 const shell = document.querySelector<HTMLDivElement>("#app");
@@ -78,10 +81,19 @@ if (isWebShell()) {
     try {
       const pos = await invoke<number>("playback_position");
       renderWebProgress(pos);
-      if (app.durationS > 0 && pos >= app.durationS - 0.3) {
+      // End-of-track threshold: the engine's position counts bytes HANDED
+      // to the bridge, which schedules ~AHEAD_MS ahead of the audible
+      // clock — cutting at duration-0.3 would clip the audible tail.
+      // Wait for the scheduled audio to have sounded.
+      const AHEAD_S = 0.25; // bridge schedule window + scheduling slack
+      if (app.durationS > 0 && pos >= app.durationS - 0.3 + AHEAD_S) {
         const q = await nextTrack();
         if (!q && app.queueTracks.length === 1) {
-          await invoke("play_queue_index", { index: 0 });
+          // Single-track queue replay: use the WRAPPER (restores
+          // queueCurrent/selectedPath + refreshes status), not the raw
+          // invoke — the raw call left the UI showing defaults while
+          // the track actually replayed.
+          await playQueueIndex(0);
         }
       }
     } catch {

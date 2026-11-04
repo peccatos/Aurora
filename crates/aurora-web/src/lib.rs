@@ -106,6 +106,16 @@ impl WebKernel {
         self.kernel.position_correction_s(seconds).map_err(js_err)
     }
 
+    /// Tell the engine the browser's output sample rate (AudioContext.
+    /// sampleRate). With it, playback resamples to the DEVICE rate in the
+    /// engine's DSP pipeline (one continuous stream, reported honestly);
+    /// without it the browser resamples each buffer independently —
+    /// phase-discontinuous at chunk boundaries ("frequencies jumping").
+    /// Call once at app start, before the first play.
+    pub fn set_output_rate(&self, rate: u32) {
+        aurora_audio::device::set_output_rate(rate);
+    }
+
     // -----------------------------------------------------------------
     // Queue
     // -----------------------------------------------------------------
