@@ -58,20 +58,29 @@
   --ytm-topbar-h: 64px;
 }
 
-/* Guide collapse (YTM hamburger): sidebar -> icon rail */
-.ytm-app.guide-collapsed {
+/* Guide collapse (YTM hamburger) and tablet (<=1024px): sidebar ->
+   icon rail. One combined rule set — the JS adds .tablet-narrow on
+   narrow viewports so the compact layout applies even when the user's
+   persisted hamburger state is "expanded". */
+.ytm-app.guide-collapsed,
+.ytm-app.tablet-narrow {
   grid-template-columns: var(--ytm-guide-w, 72px) 1fr;
 }
 .ytm-app.guide-collapsed .ytm-logo span,
 .ytm-app.guide-collapsed .ytm-nav-item span,
-.ytm-app.guide-collapsed .ytm-nav-section {
+.ytm-app.guide-collapsed .ytm-nav-section,
+.ytm-app.tablet-narrow .ytm-logo span,
+.ytm-app.tablet-narrow .ytm-nav-item span,
+.ytm-app.tablet-narrow .ytm-nav-section {
   display: none;
 }
-.ytm-app.guide-collapsed .ytm-nav-item {
+.ytm-app.guide-collapsed .ytm-nav-item,
+.ytm-app.tablet-narrow .ytm-nav-item {
   justify-content: center;
   padding: 0;
 }
-.ytm-app.guide-collapsed .ytm-logo {
+.ytm-app.guide-collapsed .ytm-logo,
+.ytm-app.tablet-narrow .ytm-logo {
   justify-content: center;
   padding: 12px 0 8px;
 }
@@ -643,6 +652,21 @@
   background: var(--ytm-surface-hover);
 }
 
+/* History page: rows whose track left the session's library stay
+   readable but inert (no fake play affordance — ADR honesty). */
+.ytm-track-row.gone {
+  cursor: default;
+  color: var(--ytm-text-3);
+}
+
+.ytm-track-row.gone .ytm-track-title {
+  color: var(--ytm-text-2);
+}
+
+.ytm-track-row.gone:hover {
+  background: none;
+}
+
 .ytm-track-row.playing {
   color: var(--ytm-accent);
 }
@@ -1004,6 +1028,29 @@
   white-space: nowrap;
 }
 
+/* Avatar (spec 5.4): 28px accent circle, profile initial */
+#ytm-avatar {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: var(--ytm-accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+#ytm-avatar:hover {
+  background: var(--ytm-accent-hover);
+}
+
 /* Queue drawer */
 .ytm-drawer {
   position: fixed;
@@ -1079,6 +1126,66 @@
 .ytm-drawer-row .sub {
   font-size: 12px;
   color: var(--ytm-text-3);
+}
+
+/* Row ✕ (spec 5.1): appears on hover, never triggers the row's play */
+.ytm-drawer-row-remove {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  color: var(--ytm-text-3);
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.ytm-drawer-row {
+  position: relative;
+  padding-right: 40px; /* room for the ✕ */
+}
+
+.ytm-drawer-row:hover .ytm-drawer-row-remove,
+.ytm-drawer-row-remove:hover,
+.ytm-drawer-row-remove:focus-visible {
+  opacity: 1;
+}
+
+.ytm-drawer-row-remove:hover {
+  background: var(--ytm-surface-active);
+  color: var(--ytm-text);
+}
+
+.ytm-drawer-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#ytm-drawer-clear {
+  background: none;
+  border: none;
+  color: var(--ytm-text-3);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#ytm-drawer-clear:hover {
+  color: var(--ytm-text);
+  background: var(--ytm-surface-hover);
 }
 
 .ytm-drawer-empty {
@@ -1256,4 +1363,73 @@
   border-radius: 50%;
   background: var(--ytm-text-2);
   cursor: pointer;
+}
+
+/* ------------------------------------------------------------------ */
+/* Carousel arrows + snap (spec 4.3)                                   */
+/* ------------------------------------------------------------------ */
+
+.ytm-shelf {
+  position: relative;
+}
+
+.ytm-shelf-arrow {
+  position: absolute;
+  top: 40%;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--ytm-surface-active);
+  border: none;
+  color: var(--ytm-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 5;
+  box-shadow: var(--ytm-shadow);
+}
+
+.ytm-shelf:hover .ytm-shelf-arrow {
+  opacity: 1;
+}
+
+.ytm-shelf-arrow.left {
+  left: -8px;
+}
+
+.ytm-shelf-arrow.right {
+  right: -8px;
+}
+
+.ytm-snap {
+  scroll-snap-align: start;
+}
+
+/* ------------------------------------------------------------------ */
+/* History card progress (spec 4.3 "continue listening")               */
+/* ------------------------------------------------------------------ */
+
+.ytm-card {
+  position: relative;
+}
+
+.ytm-card-progress {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 6px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--ytm-surface-active);
+}
+
+.ytm-card-progress i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--ytm-accent);
+  width: var(--p, 0%);
 }

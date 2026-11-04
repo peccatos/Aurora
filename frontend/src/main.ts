@@ -25,6 +25,7 @@ import { settingsPage } from "./pages/settings";
 import { decksPage } from "./pages/decks";
 import { playlistsPage, playlistDetailPage } from "./pages/playlists";
 import { searchPage } from "./pages/search";
+import { historyPage } from "./pages/history";
 import {
   isWebShell,
   renderWebShell,
@@ -51,6 +52,7 @@ if (isWebShell()) {
   registerPage(playlistsPage);
   registerPage(playlistDetailPage);
   registerPage(searchPage);
+  registerPage(historyPage);
 }
 
 const shell = document.querySelector<HTMLDivElement>("#app");

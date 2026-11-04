@@ -19,6 +19,8 @@ import {
 import { trackArtworkUrl } from "../artwork-store";
 import { readTrackTags } from "../tag-reader";
 import { recordPlay, recentPlays } from "../history-service";
+import { listPlaylists, onPlaylistsChanged } from "../playlist-service";
+import { makeCarousel } from "../carousel";
 
 /** Fetch one stored track by id (byte-loading helper). */
 async function getStoredTrack(id: string): Promise<StoredTrack | null> {
@@ -84,6 +86,76 @@ async function loadStoredBytes(id: string): Promise<ArrayBuffer | null> {
   }
 }
 
+/** Spec 4.1/4.2: active Home filter chip (survives re-renders — the
+ *  page re-mounts on every state push, so local state must live at
+ *  module level, not inside render()). */
+let activeChip: "all" | "songs" | "playlists" | "recent" = "all";
+
+/** Which shelves each chip keeps visible. "all" = current behavior. */
+function chipKeeps(chip: typeof activeChip, shelf: "history" | "playlists" | "tracks"): boolean {
+  if (chip === "all") return true;
+  if (chip === "recent") return shelf === "history";
+  if (chip === "playlists") return shelf === "playlists";
+  return shelf === "tracks"; // songs
+}
+
+/** The search filter shared by draw() and update() — update() must
+ *  predict how many rows the CURRENT query yields, or it re-renders
+ *  the whole page on every 500ms status poll while a filter is active. */
+function filterTracks(query: string): WebTrack[] {
+  return [...webTracks.values()].filter(
+    (t) =>
+      !query ||
+      t.name.toLowerCase().includes(query) ||
+      (t.artist ?? "").toLowerCase().includes(query),
+  );
+}
+
+/** Render the "Your playlists" shelf row contents (spec 4.1): playlist
+ *  cards — name + track count, click navigates to the playlist page.
+ *  Called by draw() on mount and by the playlistsChanged listener on
+ *  any mutation from any route (create via ⋯ menu, rename, reorder…). */
+async function renderPlaylistsShelf(row: HTMLElement): Promise<void> {
+  const lists = await listPlaylists();
+  row.innerHTML = "";
+  for (const pl of lists) {
+    // DOM API: playlist names are user input (XSS law).
+    const card = document.createElement("div");
+    card.className = "ytm-card";
+    card.title = pl.name;
+    const art = document.createElement("div");
+    art.className = "ytm-card-art ytm-card-art--playlist";
+    art.innerHTML = `${icon("queue", 48)}<button class="ytm-card-play" type="button" title="Play">${icon("play")}</button>`;
+    const ct = document.createElement("div");
+    ct.className = "ytm-card-title";
+    ct.textContent = pl.name;
+    const cs = document.createElement("div");
+    cs.className = "ytm-card-sub";
+    cs.textContent = `${pl.trackIds.length} track${pl.trackIds.length === 1 ? "" : "s"}`;
+    card.append(art, ct, cs);
+    card.addEventListener("click", () => {
+      // The playlist page reads the id from the hash query at mount.
+      window.location.hash = `#/playlist?id=${encodeURIComponent(pl.id)}`;
+    });
+    card.querySelector<HTMLButtonElement>(".ytm-card-play")!.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void playWebTracksByIds(pl.id, 0);
+    });
+    row.appendChild(card);
+  }
+  makeCarousel(row);
+}
+
+/** Spec 4.1: keep the shelf DOM alive across playlist mutations so the
+ *  listener re-renders ONLY the row (not the whole page). Registered
+ *  ONCE at module level (module state survives re-renders); the
+ *  homepage module never unmounts in this shell's lifetime. */
+let shelfRowEl: HTMLElement | null = null;
+onPlaylistsChanged(() => {
+  const row = shelfRowEl;
+  if (row?.isConnected) void renderPlaylistsShelf(row);
+});
+
 /** Render the "Continue listening" shelf into the given root
  *  (draw() and update() share this — one card renderer, no drift). */
 async function renderHistory(root: HTMLElement): Promise<void> {
@@ -105,11 +177,28 @@ async function renderHistory(root: HTMLElement): Promise<void> {
     cs.className = "ytm-card-sub";
     cs.textContent = e.artist ?? "Unknown artist";
     card.append(art, ct, cs);
+    // Spec 4.3 "continue listening": resume-position bar under the
+    // artwork. Only when the entry carries a position AND the track's
+    // duration is known — no bar (rather than a fake 0%) otherwise.
+    const durationMs = track?.durationMs ?? null;
+    if (e.positionS != null && e.positionS > 0 && durationMs && durationMs > 0) {
+      const pct = Math.min(100, (e.positionS * 1000) / durationMs) * 100;
+      if (pct > 0 && pct < 100) {
+        const bar = document.createElement("div");
+        bar.className = "ytm-card-progress";
+        const fill = document.createElement("i");
+        fill.style.setProperty("--p", `${pct.toFixed(1)}%`);
+        bar.appendChild(fill);
+        card.appendChild(bar);
+      }
+    }
     card.addEventListener("click", () => {
       if (track) void playWebTracks([track], 0);
     });
     container.appendChild(card);
   }
+  // Carousel after populate (arrows need real card widths).
+  makeCarousel(container as HTMLElement);
 }
 
 /** Third-party URL trust gate: only absolute https URLs pass. A
@@ -287,23 +376,49 @@ async function render(root: HTMLElement) {
       ${icon("search", 22)}
       <input id="home-search-input" type="search" placeholder="Search" />
     </div>
+    <div class="ytm-chips" id="home-chips"></div>
     <div id="ytm-shelves"></div>
     <p class="hint" id="ytm-empty"></p>
   `;
 
   const shelves = root.querySelector<HTMLElement>("#ytm-shelves")!;
   const empty = root.querySelector<HTMLElement>("#ytm-empty")!;
+  const chips = root.querySelector<HTMLElement>("#home-chips")!;
   const search = root.querySelector<HTMLInputElement>("#home-search-input");
 
   function draw(query: string): void {
-    const all = [...webTracks.values()].filter(
-      (t) =>
-        !query ||
-        t.name.toLowerCase().includes(query) ||
-        (t.artist ?? "").toLowerCase().includes(query),
-    );
+    // Chips row (spec 4.1): All / Songs / Playlists / Recent — the
+    // active chip survives re-draws (module-level activeChip).
+    const CHIP_DEFS: Array<{ id: typeof activeChip; label: string }> = [
+      { id: "all", label: "All" },
+      { id: "songs", label: "Songs" },
+      { id: "playlists", label: "Playlists" },
+      { id: "recent", label: "Recent" },
+    ];
+    chips.innerHTML = "";
+    for (const def of CHIP_DEFS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ytm-chip" + (def.id === activeChip ? " active" : "");
+      b.textContent = def.label;
+      b.addEventListener("click", () => {
+        if (activeChip === def.id) return;
+        activeChip = def.id;
+        draw(search?.value.toLowerCase() ?? "");
+      });
+      chips.appendChild(b);
+    }
+
+    const keepHistory = chipKeeps(activeChip, "history");
+    const keepPlaylists = chipKeeps(activeChip, "playlists");
+    const keepTracks = chipKeeps(activeChip, "tracks");
+
+    const all = filterTracks(query);
     shelves.innerHTML = "";
-    if (!all.length) {
+    shelfRowEl = null;
+    // Empty library or nothing matching on a songs-only view: the old
+    // early-return (onboarding hint / "nothing matches"), unchanged.
+    if (!all.length && (!keepPlaylists || !keepHistory)) {
       empty.textContent = webTracks.size
         ? "Nothing matches the search."
         : "No music yet — drop audio files anywhere on this page, or pick some below.";
@@ -315,28 +430,77 @@ async function render(root: HTMLElement) {
       input?.addEventListener("change", () => void ingest(input.files));
       return;
     }
-    empty.textContent = "";
+    if (!all.length) {
+      // Filtered chip (Playlists/Recent) without songs: keep the shelf
+      // visible, honest message instead of the "add music" drop hint.
+      empty.textContent = webTracks.size ? "Nothing matches the search." : "";
+    } else {
+      empty.textContent = "";
+    }
 
     // Shelf 0: "Continue listening" (local play history, graft from the
     // design judges). Rendered async — the shelf appears when history
     // resolves; empty history leaves nothing (honest).
-    void renderHistory(shelves);
-    shelves.insertAdjacentHTML(
-      "afterbegin",
-      `<div class="ytm-shelf">
-         <div class="ytm-shelf-head"><span class="ytm-shelf-title">Continue listening</span></div>
-         <div class="ytm-shelf-row" id="ytm-history"></div>
-       </div>`,
-    );
+    if (keepHistory) {
+      void renderHistory(shelves);
+      shelves.insertAdjacentHTML(
+        "afterbegin",
+        `<div class="ytm-shelf">
+           <div class="ytm-shelf-head"><span class="ytm-shelf-title">Continue listening</span></div>
+           <div class="ytm-shelf-row" id="ytm-history"></div>
+         </div>`,
+      );
+    }
 
-    // Shelf 1: all tracks as YTM song rows.
+    // Shelf 0.5: "Your playlists" (spec 4.1) — between history and
+    // "Your music". Async render; the row element is kept at module
+    // level so the onPlaylistsChanged listener can refresh ONLY this
+    // shelf when playlists mutate from any route.
+    if (keepPlaylists) {
+      shelves.insertAdjacentHTML(
+        "beforeend",
+        `<div class="ytm-shelf" id="ytm-playlists-shelf">
+           <div class="ytm-shelf-head"><span class="ytm-shelf-title">Your playlists</span></div>
+           <div class="ytm-shelf-row" id="ytm-playlists"></div>
+         </div>`,
+      );
+      shelfRowEl = shelves.querySelector<HTMLElement>("#ytm-playlists");
+      if (shelfRowEl) void renderPlaylistsShelf(shelfRowEl);
+    }
+
+    if (keepTracks && all.length) {
+      drawTracklist(all);
+    }
+    if (keepTracks && all.length && activeChip === "all") {
+      drawQuickMix(all);
+    }
+  }
+
+  function drawTracklist(all: WebTrack[]): void {
+    // Shelf 1: all tracks as YTM song rows. Header (spec 4.6): track
+    // count + shuffle-all button (btn small, shuffle icon).
     shelves.insertAdjacentHTML(
       "beforeend",
       `<div class="ytm-shelf">
-         <div class="ytm-shelf-head"><span class="ytm-shelf-title">Your music</span></div>
+         <div class="ytm-shelf-head"><span class="ytm-shelf-title">Your music</span><span class="ytm-shelf-more" id="ytm-music-count" style="cursor:default;text-transform:none;letter-spacing:normal"></span></div>
          <div class="ytm-tracklist" id="ytm-list"></div>
        </div>`,
     );
+    const headCount = shelves.querySelector<HTMLElement>("#ytm-music-count")!;
+    headCount.textContent = `${all.length} track${all.length === 1 ? "" : "s"}`;
+    const shuffleAll = document.createElement("button");
+    shuffleAll.type = "button";
+    // Inline styles: this task owns home.ts only — CSS files are other
+    // agents' territory (ytm.css has no .btn small variant).
+    shuffleAll.style.cssText =
+      "display:inline-flex;align-items:center;gap:6px;margin-left:auto;padding:4px 10px;border:1px solid var(--ytm-divider);border-radius:999px;background:transparent;color:var(--ytm-text-2);font:inherit;font-size:13px;font-weight:500;cursor:pointer";
+    shuffleAll.title = "Shuffle all tracks";
+    shuffleAll.setAttribute("aria-label", "Shuffle all tracks");
+    shuffleAll.innerHTML = `${icon("shuffle", 16)}<span>Shuffle</span>`;
+    shuffleAll.addEventListener("click", () => {
+      void playWebTracks([...webTracks.values()].sort(() => Math.random() - 0.5), 0);
+    });
+    headCount.after(shuffleAll);
     const list = shelves.querySelector<HTMLElement>("#ytm-list")!;
     all.forEach((t, i) => {
       // DOM API, not innerHTML: file names are user input — a name like
@@ -386,7 +550,9 @@ async function render(root: HTMLElement) {
       row.addEventListener("click", () => void playWebTracks(all, i));
       list.appendChild(row);
     });
+  }
 
+  function drawQuickMix(all: WebTrack[]): void {
     // Shelf 2: quick mix (shuffled).
     shelves.insertAdjacentHTML(
       "beforeend",
@@ -423,6 +589,7 @@ async function render(root: HTMLElement) {
       card.addEventListener("click", playShuffled);
       mix.appendChild(card);
     });
+    makeCarousel(mix);
   }
 
   search?.addEventListener("input", () => {
@@ -508,6 +675,7 @@ async function render(root: HTMLElement) {
       card.append(art, ct, cs);
       row.appendChild(card);
     }
+    makeCarousel(row);
   }
 
   draw("");
@@ -609,22 +777,29 @@ async function render(root: HTMLElement) {
 }
 
 function update(root: HTMLElement) {
+  const input = root.querySelector<HTMLInputElement>("#home-search-input");
+  const query = input?.value.toLowerCase() ?? "";
   const list = root.querySelector("#ytm-list");
   const rows = list ? list.querySelectorAll(".ytm-track-row").length : 0;
-  if (rows !== webTracks.size) {
-    const input = root.querySelector<HTMLInputElement>("#home-search-input");
-    // Re-draw preserving the current query.
+  // Expected row count for the CURRENT chip + query (chips other than
+  // "songs"/"all" hide the tracklist — 0 rows is correct there).
+  const expected = chipKeeps(activeChip, "tracks") ? filterTracks(query).length : 0;
+  if (rows !== expected) {
+    // Re-draw preserving the current query and chip.
     void render(root).then(() => {
       const again = root.querySelector<HTMLInputElement>("#home-search-input");
       if (again && input?.value) again.value = input.value;
+      // render() re-reads activeChip (module-level) — chip stays put.
     });
     return;
   }
   // Same track count: still refresh the history shelf — a play just
   // recorded changes it without changing the row count.
-  const historyRow = root.querySelector("#ytm-history");
-  if (historyRow) {
-    void renderHistory(root);
+  if (chipKeeps(activeChip, "history")) {
+    const historyRow = root.querySelector("#ytm-history");
+    if (historyRow) {
+      void renderHistory(root);
+    }
   }
 }
 

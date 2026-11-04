@@ -41,6 +41,7 @@ interface NavEntry {
 const NAV: NavEntry[] = [
   { route: "home", label: "Home", icon: "home" },
   { route: "library", label: "Explore", icon: "explore" },
+  { route: "history", label: "History", icon: "home" },
   { route: "queue", label: "Queue", icon: "queue" },
 ];
 
@@ -96,6 +97,7 @@ export function renderWebShell(root: HTMLElement): {
           <input id="ytm-search-input" type="search" placeholder="Search songs, artists" autocomplete="off" />
           <button class="ytm-btn-icon" id="ytm-search-clear" type="button" title="Clear" hidden>${icon("close", 18)}</button>
         </div>
+        <button id="ytm-avatar" type="button" title="Menu">A</button>
       </header>
 
       <main class="ytm-content" id="ytm-content"></main>
@@ -119,7 +121,10 @@ export function renderWebShell(root: HTMLElement): {
       <aside class="ytm-drawer" id="ytm-drawer" aria-label="Queue">
         <header class="ytm-drawer-head">
           <span class="ytm-drawer-title">Queue</span>
-          <button class="ytm-btn-icon" id="ytm-drawer-close" type="button" title="Close">${icon("close", 20)}</button>
+          <span class="ytm-drawer-head-actions">
+            <button id="ytm-drawer-clear" type="button" title="Clear the queue">Clear</button>
+            <button class="ytm-btn-icon" id="ytm-drawer-close" type="button" title="Close">${icon("close", 20)}</button>
+          </span>
         </header>
         <div class="ytm-drawer-body" id="ytm-drawer-body"></div>
       </aside>
@@ -184,6 +189,38 @@ export function renderWebShell(root: HTMLElement): {
   } catch {
     /* ignore */
   }
+
+  // Tablet (spec 5.3): the collapsed-rail layout applies whenever the
+  // viewport is narrow, regardless of the hamburger state (the CSS
+  // shares the guide-collapsed rules through a combined selector).
+  if (matchMedia("(max-width:1024px)").matches) {
+    document.querySelector<HTMLElement>(".ytm-app")?.classList.add("tablet-narrow");
+  }
+
+  // Avatar (spec 5.4): kv profile-name initial, shared menu pattern.
+  const avatar = document.getElementById("ytm-avatar");
+  if (avatar) {
+    void (async () => {
+      try {
+        const { kvGet } = await import("./library-db");
+        const name = await kvGet<string>("aw:profile-name");
+        if (name) avatar.textContent = name.trim().slice(0, 1).toUpperCase();
+      } catch {
+        /* default "A" stands */
+      }
+    })();
+    avatar.addEventListener("click", () => showAvatarMenu(avatar));
+  }
+
+  // Queue drawer: Clear (whole queue) — bound here, the rows' ✕ live in
+  // renderDrawer().
+  document.getElementById("ytm-drawer-clear")?.addEventListener("click", () => {
+    void (async () => {
+      app.queueCurrent = null;
+      await setQueue([]);
+      notify();
+    })();
+  });
 
   // Topbar search: routes to home and drives its search input.
   const topSearch = document.getElementById("ytm-search-input") as HTMLInputElement | null;
@@ -503,7 +540,7 @@ export function renderWebQuality(): void {
   }
 }
 
-/** Queue drawer body: current + up next (click to jump). */
+/** Queue drawer body: current + up next (click to jump, ✕ to remove). */
 export function renderDrawer(): void {
   const body = document.getElementById("ytm-drawer-body");
   if (!body) return;
@@ -522,7 +559,17 @@ export function renderDrawer(): void {
     const sub = document.createElement("span");
     sub.className = "sub";
     sub.textContent = t.artist ?? "";
-    row.append(title, sub);
+    // ✕ remove (spec 5.1): splice + index fix + push to the kernel.
+    // The row button captures clicks, so the ✕ stops propagation.
+    const remove = document.createElement("span");
+    remove.className = "ytm-drawer-row-remove";
+    remove.title = "Remove from queue";
+    remove.textContent = "✕";
+    remove.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeQueueRow(idx);
+    });
+    row.append(title, sub, remove);
     row.addEventListener("click", () => void playQueueIndex(idx));
     body.appendChild(row);
   });
@@ -532,6 +579,107 @@ export function renderDrawer(): void {
     empty.textContent = "Queue is empty";
     body.appendChild(empty);
   }
+}
+
+/** Remove one queue row: splice, keep `current` pointing at the SAME
+ *  track (shift down when the removed row sat before it, clamp when the
+ *  current track itself was removed), push the list to the kernel. The
+ *  kernel's set_queue preserves a `current` that still lands inside the
+ *  new list, so mid-playback removals never break auto-advance. */
+function removeQueueRow(idx: number): void {
+  if (idx < 0 || idx >= app.queueTracks.length) return;
+  void (async () => {
+    const next = [...app.queueTracks];
+    next.splice(idx, 1);
+    const wasCurrent = idx === app.queueCurrent;
+    const wasBefore = idx < (app.queueCurrent ?? -1);
+    if (app.queueCurrent != null) {
+      if (wasCurrent) {
+        app.queueCurrent = next.length ? Math.min(idx, next.length - 1) : null;
+      } else if (wasBefore) {
+        app.queueCurrent -= 1;
+      }
+    }
+    await setQueue(next);
+    notify();
+    if (wasCurrent && app.status?.state === "playing") {
+      // The playing track was removed: hand the queue position to the
+      // track that took its place (leaving `current` pointing at a
+      // different track than the one sounding would lie in the bar).
+      // Only while actually playing — a paused/idle queue removal must
+      // never START playback.
+      if (next.length && app.queueCurrent != null) {
+        await playQueueIndex(app.queueCurrent);
+      } else {
+        try {
+          await invoke("stop_playback");
+        } catch {
+          /* already idle */
+        }
+        app.queueCurrent = null;
+        notify();
+      }
+    }
+  })();
+}
+
+/** Avatar menu (spec 5.4): the shared .ytm-menu pattern — Settings /
+ *  Equalizer / History navigation plus an async Storage line from
+ *  navigator.storage.estimate(). No sign-out or account switch: there
+ *  is nothing to switch to (ADR 0002 honesty). */
+function showAvatarMenu(anchor: HTMLElement): void {
+  document.querySelector(".ytm-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "ytm-menu";
+
+  const item = (label: string, onClick: () => void): HTMLButtonElement => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      onClick();
+      menu.remove();
+    });
+    return b;
+  };
+  menu.appendChild(item("Settings", () => (window.location.hash = "#/settings")));
+  menu.appendChild(item("Equalizer", () => (window.location.hash = "#/eq")));
+  menu.appendChild(item("History", () => (window.location.hash = "#/history")));
+
+  // Storage: the browser's own estimate, rendered when it answers.
+  const storage = document.createElement("p");
+  storage.className = "ytm-menu-head";
+  storage.textContent = "Storage: …";
+  menu.appendChild(storage);
+  if (navigator.storage?.estimate) {
+    navigator.storage
+      .estimate()
+      .then((est) => {
+        const mb = Math.round((est.usage ?? 0) / 1048576);
+        storage.textContent = `Storage: ${mb} MB`;
+      })
+      .catch(() => {
+        storage.textContent = "Storage: unavailable";
+      });
+  } else {
+    storage.textContent = "Storage: unavailable";
+  }
+
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.right = `${Math.max(8, window.innerWidth - rect.right)}px`;
+  menu.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 240)}px`;
+  menu.style.left = "auto";
+
+  const close = (e: Event) => {
+    if (!menu.contains(e.target as Node)) {
+      menu.remove();
+      document.removeEventListener("click", close, true);
+    }
+  };
+  // The avatar's own click is still propagating — defer arming by a tick
+  // so the menu does not close immediately.
+  setTimeout(() => document.addEventListener("click", close, true), 0);
 }
 
 /** Update the progress bar (position poll). */

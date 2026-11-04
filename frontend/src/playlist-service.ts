@@ -16,6 +16,21 @@ export interface Playlist {
 
 const KEY = "aw:playlists";
 
+/** Change listeners: the Home "Your playlists" shelf re-renders itself
+ *  when playlists change from ANY route (playlists page, ⋯ menu). */
+type PlaylistsListener = () => void;
+const listeners = new Set<PlaylistsListener>();
+
+/** Subscribe to playlist mutations. Returns an unsubscribe function. */
+export function onPlaylistsChanged(fn: PlaylistsListener): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+function notifyChanged(): void {
+  for (const fn of listeners) fn();
+}
+
 let cache: Playlist[] | null = null;
 
 async function load(): Promise<Playlist[]> {
@@ -30,6 +45,7 @@ async function load(): Promise<Playlist[]> {
 
 async function save(list: Playlist[]): Promise<void> {
   cache = list;
+  notifyChanged();
   try {
     await kvPut(KEY, list);
   } catch {

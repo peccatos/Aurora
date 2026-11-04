@@ -12,6 +12,10 @@ export interface HistoryEntry {
   title: string;
   artist: string | null;
   playedAt: number;
+  /** Resume position in seconds at the moment the play was logged
+   *  (spec 4.3 "continue listening" progress bar). Optional — an
+   *  entry without it renders no bar (honest, not zero). */
+  positionS?: number;
 }
 
 const KEY = "aw:play-history";
@@ -48,4 +52,16 @@ export async function recordPlay(entry: Omit<HistoryEntry, "playedAt">): Promise
 export async function recentPlays(count = 8): Promise<HistoryEntry[]> {
   const list = await load();
   return list.slice(0, count);
+}
+
+/** Wipe the whole history (History page "Clear all"). The cache and the
+ *  kv record drop to empty together — after this, load() must not
+ *  resurrect old entries from a stale cache. */
+export async function clearHistory(): Promise<void> {
+  cache = [];
+  try {
+    await kvPut(KEY, []);
+  } catch {
+    /* best-effort: the in-memory copy is already gone */
+  }
 }
