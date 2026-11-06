@@ -51,7 +51,7 @@ function render() {
     }
     return;
   }
-  document.querySelectorAll(".nav-item").forEach((n) => {
+  document.querySelectorAll(".nav-item, .ytm-nav-item, .ytm-tab").forEach((n) => {
     const el = n as HTMLElement;
     el.classList.toggle("active", el.dataset.route === activeId);
   });

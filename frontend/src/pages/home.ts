@@ -19,8 +19,10 @@ import {
 import { trackArtworkUrl } from "../artwork-store";
 import { readTrackTags } from "../tag-reader";
 import { recordPlay, recentPlays } from "../history-service";
+import { likedIds, type LikeValue } from "../likes-service";
 import { listPlaylists, onPlaylistsChanged } from "../playlist-service";
 import { makeCarousel } from "../carousel";
+import { importDuplicateKey, validateAudioFile, audioExtension } from "../audio-import";
 
 /** Fetch one stored track by id (byte-loading helper). */
 async function getStoredTrack(id: string): Promise<StoredTrack | null> {
@@ -33,6 +35,8 @@ interface WebTrack {
   name: string;
   artist: string | null;
   album: string | null;
+  genre: string | null;
+  year: number | null;
   durationMs: number | null;
   /** In-memory file handle (page lifetime) — null for tracks restored
    *  from IndexedDB (their bytes live in the store). */
@@ -42,18 +46,53 @@ interface WebTrack {
   /** R128 integrated loudness (LUFS) measured at ingest (W8): feeds the
    *  kernel's ReplayGain stage for track-normalized loudness. */
   lufs: number | null;
+  lyrics: string | null;
+  lyrics_language: string | null;
+  lyrics_translation: string | null;
+  lyrics_translation_language: string | null;
+  artwork_data_url: string | null;
+  source_url: string | null;
+  source_provider: string | null;
+  video_url: string | null;
+  metadata_source: string | null;
   /** The web:// path registered with the kernel (after first play). */
   kernelPath: string | null;
 }
 
 const webTracks = new Map<string, WebTrack>();
+let activeHomeRoot: HTMLElement | null = null;
+const importedFileKeys = new Set<string>();
+
+window.addEventListener("aurora:web-track-metadata-updated", () => {
+  if (activeHomeRoot?.isConnected) void render(activeHomeRoot);
+});
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
 
 export function registerWebTrack(
-  t: Omit<WebTrack, "kernelPath" | "extension" | "lufs"> & { extension?: string; lufs?: number | null },
+  t: Omit<WebTrack, "kernelPath" | "extension" | "lufs" | "lyrics" | "lyrics_language" | "lyrics_translation" | "lyrics_translation_language" | "artwork_data_url" | "source_url" | "source_provider" | "video_url" | "metadata_source" | "genre" | "year"> & { extension?: string; lufs?: number | null; genre?: string | null; year?: number | null; lyrics?: string | null; lyrics_language?: string | null; lyrics_translation?: string | null; lyrics_translation_language?: string | null; artwork_data_url?: string | null; source_url?: string | null; source_provider?: string | null; video_url?: string | null; metadata_source?: string | null },
 ) {
   webTracks.set(t.id, {
     ...t,
     lufs: t.lufs ?? null,
+    genre: t.genre ?? null,
+    year: t.year ?? null,
+    lyrics: t.lyrics ?? null,
+    lyrics_language: t.lyrics_language ?? null,
+    lyrics_translation: t.lyrics_translation ?? null,
+    lyrics_translation_language: t.lyrics_translation_language ?? null,
+    artwork_data_url: t.artwork_data_url ?? null,
+    source_url: t.source_url ?? null,
+    source_provider: t.source_provider ?? null,
+    video_url: t.video_url ?? null,
+    metadata_source: t.metadata_source ?? null,
     extension: t.extension ?? (t.file ? (t.file.name.split(".").pop() ?? "").toLowerCase() : ""),
     kernelPath: null,
   });
@@ -67,6 +106,11 @@ export function webTrackCount(): number {
  *  without touching the Map itself). */
 export function getWebTracks(): WebTrack[] {
   return [...webTracks.values()];
+}
+
+export function getWebTrackByPath(path: string): WebTrack | null {
+  if (!path.startsWith("web://")) return null;
+  return webTracks.get(path.slice("web://".length)) ?? null;
 }
 
 /** Lazy byte loading for restored tracks: only fetched from IndexedDB
@@ -155,6 +199,66 @@ onPlaylistsChanged(() => {
   const row = shelfRowEl;
   if (row?.isConnected) void renderPlaylistsShelf(row);
 });
+
+/** A deterministic, local-only recommendation shelf. Likes seed the radio;
+ * recent tracks are de-prioritized to avoid immediate repeats. */
+export function rankMyWave(
+  tracks: readonly StoredTrack[],
+  likes: Readonly<Record<string, LikeValue>>,
+  history: readonly { id: string; playedAt: number }[],
+  now = Date.now(),
+): Array<{ track: StoredTrack; reason: string; score: number }> {
+  const recent = new Map<string, number>();
+  for (const entry of history) {
+    if (!recent.has(entry.id)) recent.set(entry.id, Math.max(0, now - entry.playedAt));
+  }
+  return tracks.flatMap((track, index) => {
+    if (likes[track.id] === "dislike") return [];
+    const age = recent.get(track.id);
+    const liked = likes[track.id] === "like";
+    if (!liked && age == null) return [];
+    const fresh = age == null || age >= 24 * 60 * 60 * 1000;
+    const recency = age == null ? 0 : Math.max(0, 14 - age / (24 * 60 * 60 * 1000));
+    const score = (liked ? 100 : 0) + recency;
+    const reason = liked ? "Because you liked this track" : "From your listening history";
+    return [{ track, reason: fresh ? reason : `${reason} · played recently`, score, index }];
+  }).sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, 8).map(({ track, reason, score }) => ({ track, reason, score }));
+}
+
+async function renderMyWave(root: HTMLElement): Promise<void> {
+  const [tracks, liked, history] = await Promise.all([getAllTracks(), likedIds(), recentPlays(50)]);
+  const row = root.querySelector<HTMLElement>("#ytm-my-wave");
+  if (!row?.isConnected) return;
+  const likes: Record<string, LikeValue> = {};
+  for (const id of liked) likes[id] = "like";
+  const recommendations = rankMyWave(tracks, likes, history);
+  row.replaceChildren();
+  const shelf = row.closest<HTMLElement>(".ytm-shelf");
+  if (!recommendations.length) {
+    shelf?.remove();
+    return;
+  }
+  for (const recommendation of recommendations) {
+    const { track } = recommendation;
+    const local = webTracks.get(track.id);
+    if (!local) continue;
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "ytm-card";
+    card.title = recommendation.reason;
+    const title = document.createElement("span");
+    title.className = "ytm-card-title";
+    title.textContent = track.name;
+    const sub = document.createElement("span");
+    sub.className = "ytm-card-sub";
+    sub.textContent = `${track.artist ?? "Unknown artist"} · ${recommendation.reason}`;
+    card.append(title, sub);
+    card.addEventListener("click", () => void playWebTracks([local]));
+    row.appendChild(card);
+  }
+  makeCarousel(row);
+}
 
 /** Render the "Continue listening" shelf into the given root
  *  (draw() and update() share this — one card renderer, no drift). */
@@ -263,7 +367,16 @@ function showTrackMenu(
       const t = all[index];
       if (!t) return;
       const at = (app.queueCurrent ?? -1) + 1;
-      const path = t.kernelPath ?? (await registerWebBytes(t.id, new Uint8Array((await loadStoredBytes(t.id)) ?? []), t.extension));
+      let path = t.kernelPath;
+      if (!path) {
+        const bytes = await loadStoredBytes(t.id);
+        if (!bytes?.byteLength) {
+          setToast(`Could not load "${t.name.slice(0, 30)}" from browser storage`);
+          return;
+        }
+        path = await registerWebBytes(t.id, new Uint8Array(bytes), t.extension);
+        t.kernelPath = path;
+      }
       const rg = t.lufs != null ? NORMALIZE_TARGET_LUFS - t.lufs : null;
       q.splice(at, 0, { path, title: t.name, artist: t.artist, replaygain_track_db: rg, replaygain_album_db: null });
       await setQueue(q);
@@ -322,11 +435,18 @@ function showTrackMenu(
 }
 
 async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
-  const queue = [];
+  const queue: Array<{ path: string; title: string; artist: string | null; replaygain_track_db: number | null; replaygain_album_db: number | null; bpm: number | null }> = [];
+  let playableIndex = 0;
   for (const t of tracks) {
+    const storedBytes = t.file ? null : await loadStoredBytes(t.id);
+    if (!t.file && (!storedBytes || storedBytes.byteLength === 0)) {
+      setToast(`Could not load "${t.name.slice(0, 30)}" from browser storage`);
+      continue;
+    }
+    if (tracks.indexOf(t) < index) playableIndex += 1;
     t.kernelPath = t.file
       ? await registerWebFile(t.file)
-      : await registerWebBytes(t.id, new Uint8Array((await loadStoredBytes(t.id)) ?? []), t.extension);
+      : await registerWebBytes(t.id, new Uint8Array(storedBytes!), t.extension);
     // W8: measured LUFS feeds the ReplayGain track gain when the DSP
     // mode is on; the kernel treats it exactly like a file tag.
     const rg = t.lufs != null ? NORMALIZE_TARGET_LUFS - t.lufs : null;
@@ -340,7 +460,8 @@ async function doPlayWebTracks(tracks: WebTrack[], index = 0): Promise<void> {
     });
   }
   await setQueue(queue);
-  await playQueueIndex(index);
+  if (!queue.length) return;
+  await playQueueIndex(Math.min(playableIndex, queue.length - 1));
 }
 
 /** Play a PLAYLIST by id: resolve stored tracks -> queue (lazy bytes,
@@ -359,10 +480,21 @@ export async function playWebTracksByIds(playlistId: string, startIndex = 0): Pr
         name: stored.name,
         artist: stored.artist,
         album: stored.album,
+        genre: stored.genre ?? null,
+        year: stored.year ?? null,
         durationMs: stored.durationMs,
         file: null,
         extension: stored.extension,
         lufs: stored.lufs ?? null,
+        lyrics: stored.lyrics ?? null,
+        lyrics_language: stored.lyrics_language ?? null,
+        lyrics_translation: stored.lyrics_translation ?? null,
+        lyrics_translation_language: stored.lyrics_translation_language ?? null,
+        artwork_data_url: stored.artwork_data_url ?? null,
+        source_url: stored.source_url ?? null,
+        source_provider: stored.source_provider ?? null,
+        video_url: stored.video_url ?? null,
+        metadata_source: stored.metadata_source ?? null,
         kernelPath: null,
       });
     }
@@ -386,7 +518,8 @@ export async function playUrlTrack(
   unlockAudio();
   const list = queueWholeList.length ? queueWholeList : [{ url, title, artist, durationMs }];
   const queue = [];
-  for (const item of list) {
+  const playableSourceIndexes: number[] = [];
+  for (const [sourceIndex, item] of list.entries()) {
     const ext = (item.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase();
     try {
       const res = await fetch(item.url);
@@ -402,6 +535,7 @@ export async function playUrlTrack(
         replaygain_album_db: null as number | null,
         bpm: null as number | null,
       });
+      playableSourceIndexes.push(sourceIndex);
     } catch (e) {
       setToast(`Could not load "${item.title.slice(0, 30)}": ${String(e).slice(0, 60)}`);
     }
@@ -410,29 +544,35 @@ export async function playUrlTrack(
   // LUFS honesty for remote tracks too: the kernel measures on the
   // registered bytes... the measurement API takes bytes directly:
   try {
-    const first = queue[0];
     // Measure only the STARTING track (bounded 60s) — like local ingest.
-    const firstItem = list[startIndex] ?? list[0];
+    const firstAtOrAfter = playableSourceIndexes.findIndex((sourceIndex) => sourceIndex >= startIndex);
+    const requestedQueueIndex = firstAtOrAfter >= 0 ? firstAtOrAfter : playableSourceIndexes.length - 1;
+    const requestedSourceIndex = playableSourceIndexes[requestedQueueIndex] ?? playableSourceIndexes[0] ?? 0;
+    const firstItem = list[requestedSourceIndex] ?? list[0];
     const res = await fetch(firstItem.url);
     const bytes = new Uint8Array(await res.arrayBuffer());
     const lufs = await analyzeLufs(bytes, (firstItem.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase());
     if (lufs != null) {
-      (first as { replaygain_track_db: number | null }).replaygain_track_db = -14 - lufs;
+      (queue[requestedQueueIndex] as { replaygain_track_db: number | null }).replaygain_track_db = -14 - lufs;
     }
-    void first;
   } catch {
     /* no measurement -> no normalization (honest) */
   }
   await setQueue(queue);
-  await playQueueIndex(startIndex);
-  void recordPlay({ id: url, title, artist });
+  const firstAtOrAfter = playableSourceIndexes.findIndex((sourceIndex) => sourceIndex >= startIndex);
+  const playableIndex = firstAtOrAfter >= 0 ? firstAtOrAfter : queue.length - 1;
+  await playQueueIndex(playableIndex);
+  const started = list[playableSourceIndexes[playableIndex] ?? playableSourceIndexes[0] ?? 0] ?? list[0];
+  void recordPlay({ id: started.url, title: started.title, artist: started.artist });
 }
 
 async function render(root: HTMLElement) {
+  activeHomeRoot = root;
   root.innerHTML = `
     <div class="ytm-search">
       ${icon("search", 22)}
       <input id="home-search-input" type="search" placeholder="Search" />
+      <button class="btn" id="home-import-playlist" type="button">▤ Playlists & import</button>
     </div>
     <div class="ytm-chips" id="home-chips"></div>
     <div id="ytm-shelves"></div>
@@ -443,6 +583,9 @@ async function render(root: HTMLElement) {
   const empty = root.querySelector<HTMLElement>("#ytm-empty")!;
   const chips = root.querySelector<HTMLElement>("#home-chips")!;
   const search = root.querySelector<HTMLInputElement>("#home-search-input");
+  root.querySelector<HTMLButtonElement>("#home-import-playlist")?.addEventListener("click", () => {
+    window.location.hash = "#/playlists";
+  });
 
   function draw(query: string): void {
     // Chips row (spec 4.1): All / Songs / Playlists / Recent — the
@@ -530,6 +673,14 @@ async function render(root: HTMLElement) {
       drawTracklist(all);
     }
     if (keepTracks && all.length && activeChip === "all") {
+      shelves.insertAdjacentHTML(
+        "afterbegin",
+        `<div class="ytm-shelf" id="ytm-my-wave-shelf">
+           <div class="ytm-shelf-head"><span class="ytm-shelf-title">My Wave · from your library</span></div>
+           <div class="ytm-shelf-row" id="ytm-my-wave"></div>
+         </div>`,
+      );
+      void renderMyWave(shelves);
       drawQuickMix(all);
     }
   }
@@ -574,7 +725,7 @@ async function render(root: HTMLElement) {
       // Embedded artwork (async): replace the placeholder icon only if
       // this row is still on screen when the URL resolves (a re-draw
       // may have replaced the list meanwhile).
-      void trackArtworkUrl(t.id).then((url) => {
+      void (t.artwork_data_url ? Promise.resolve(t.artwork_data_url) : trackArtworkUrl(t.id)).then((url) => {
         if (!url || !thumb.isConnected) return;
         thumb.style.backgroundImage = `url("${url}")`;
         thumb.style.backgroundSize = "cover";
@@ -595,6 +746,19 @@ async function render(root: HTMLElement) {
       main.append(title, meta);
       row.append(idx, thumb, main, dur);
       // Context menu (YTM ⋯): add to playlist / play next.
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "ytm-track-edit";
+      edit.title = "Edit track information";
+      edit.textContent = "Edit in player";
+      edit.addEventListener("click", (e) => {
+        e.stopPropagation();
+        window.location.hash = "#/player";
+        void playWebTracks(all, i).catch((error) => {
+          setToast(`Не удалось открыть трек: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      });
+      row.appendChild(edit);
       const more = document.createElement("button");
       more.type = "button";
       more.className = "ytm-track-more";
@@ -605,7 +769,10 @@ async function render(root: HTMLElement) {
         showTrackMenu(more, t.id, t.name, all, i);
       });
       row.appendChild(more);
-      row.addEventListener("click", () => void playWebTracks(all, i));
+      row.addEventListener("click", () => {
+        window.location.hash = "#/player";
+        void playWebTracks(all, i);
+      });
       list.appendChild(row);
     });
   }
@@ -691,7 +858,7 @@ async function render(root: HTMLElement) {
       ext = document.createElement("div");
       ext.className = "ytm-shelf";
       ext.id = "ytm-external";
-      ext.innerHTML = `<div class="ytm-shelf-head"><span class="ytm-shelf-title">Found online</span><span class="ytm-shelf-more">30-second previews</span></div><div class="ytm-shelf-row" id="ytm-ext-row"></div>`;
+      ext.innerHTML = `<div class="ytm-shelf-head"><span class="ytm-shelf-title">Found online</span><span class="ytm-shelf-more">Previews available for some tracks</span></div><div class="ytm-shelf-row" id="ytm-ext-row"></div>`;
       shelves.prepend(ext);
     }
     const row = ext.querySelector<HTMLElement>("#ytm-ext-row")!;
@@ -742,6 +909,10 @@ async function render(root: HTMLElement) {
     if (!files?.length) return;
     let added = 0;
     for (const file of Array.from(files)) {
+      const validation = validateAudioFile(file);
+      if (validation) { setToast(`${file.name}: ${validation}`); continue; }
+      const duplicateKey = importDuplicateKey(file);
+      if (importedFileKeys.has(duplicateKey)) { setToast(`${file.name}: already imported`); continue; }
       const id = crypto.randomUUID();
       const stem = file.name.replace(/\.[^.]+$/, "");
       const dashIdx = stem.indexOf(" - ");
@@ -753,6 +924,9 @@ async function render(root: HTMLElement) {
       const artist = tags.artist ?? (dashIdx > 0 ? stem.slice(0, dashIdx) : null);
       const album = tags.album;
       const durationMs = tags.durationMs;
+      const artworkDataUrl = tags.picture
+        ? `data:${tags.picture.format};base64,${bytesToBase64(tags.picture.data)}`
+        : null;
       // W8 loudness: measure R128 LUFS from the file bytes (the SAME
       // decode path playback uses — the measurement is honest by
       // construction). Best-effort: a failure leaves the track
@@ -764,7 +938,12 @@ async function render(root: HTMLElement) {
       } catch {
         lufs = null;
       }
-      registerWebTrack({ id, name, artist, album, durationMs, file, lufs });
+      importedFileKeys.add(duplicateKey);
+      registerWebTrack({
+        id, name, artist, album, genre: tags.genre ?? null, year: tags.year ?? null, durationMs, file, lufs,
+        artwork_data_url: artworkDataUrl,
+        metadata_source: "embedded-tags",
+      });
       // Embedded cover art (best-effort): extracted from the tags, stored
       // as a Blob; a storage failure never blocks the ingest.
       if (tags.picture) {
@@ -780,11 +959,25 @@ async function render(root: HTMLElement) {
           name,
           artist,
           album,
+          genre: tags.genre ?? null,
+          year: tags.year ?? null,
           durationMs,
-          extension: (file.name.split(".").pop() ?? "").toLowerCase(),
+          extension: audioExtension(file.name),
           bytes: await file.arrayBuffer(),
           addedAt: Date.now(),
           lufs,
+          lyrics: null,
+          lyrics_language: null,
+          lyrics_translation: null,
+          lyrics_translation_language: null,
+          artwork_data_url: artworkDataUrl,
+          source_url: null,
+          source_provider: null,
+          video_url: null,
+          metadata_source: "local-file",
+          source_file_name: file.name,
+          source_file_size: file.size,
+          source_file_last_modified: file.lastModified,
         });
       } catch (e) {
         // Storage failure is LOUD: the user believes their library is
@@ -804,15 +997,29 @@ async function render(root: HTMLElement) {
     const restored = await getAllTracks();
     if (restored.length && webTracks.size === 0) {
       for (const t of restored) {
+        if (t.source_file_name && t.source_file_size != null && t.source_file_last_modified != null) {
+          importedFileKeys.add(importDuplicateKey({ name: t.source_file_name, size: t.source_file_size, lastModified: t.source_file_last_modified }));
+        }
         registerWebTrack({
           id: t.id,
           name: t.name,
           artist: t.artist,
           album: t.album,
+          genre: t.genre ?? null,
+          year: t.year ?? null,
           durationMs: t.durationMs,
           file: null,
           extension: t.extension,
           lufs: t.lufs ?? null,
+          lyrics: t.lyrics ?? null,
+          lyrics_language: t.lyrics_language ?? null,
+          lyrics_translation: t.lyrics_translation ?? null,
+          lyrics_translation_language: t.lyrics_translation_language ?? null,
+          artwork_data_url: t.artwork_data_url ?? null,
+          source_url: t.source_url ?? null,
+          source_provider: t.source_provider ?? null,
+          video_url: t.video_url ?? null,
+          metadata_source: t.metadata_source ?? null,
         });
       }
       draw(search?.value.toLowerCase() ?? "");
@@ -859,6 +1066,8 @@ function update(root: HTMLElement) {
       void renderHistory(root);
     }
   }
+  const waveRow = root.querySelector("#ytm-my-wave");
+  if (activeChip === "all" && waveRow) void renderMyWave(root);
 }
 
 export const homePage: Page = {

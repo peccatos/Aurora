@@ -61,6 +61,19 @@ pub struct Track {
     /// is NOT silently resolved — the analyzer keeps the range it actually
     /// observed (see `aurora-decoder`'s tempo analyzer).
     pub bpm: Option<f64>,
+    /// Plain or synced lyrics supplied by a tag, user, or provider.
+    pub lyrics: Option<String>,
+    pub lyrics_language: Option<String>,
+    /// Optional translated lyrics; never presented as the original text.
+    pub lyrics_translation: Option<String>,
+    pub lyrics_translation_language: Option<String>,
+    /// Embedded or user-selected artwork as a data URL.
+    pub artwork_data_url: Option<String>,
+    /// Provenance for remote enrichment/import.
+    pub source_url: Option<String>,
+    pub source_provider: Option<String>,
+    pub video_url: Option<String>,
+    pub metadata_source: Option<String>,
 }
 
 impl Track {
@@ -83,6 +96,15 @@ impl Track {
             replaygain_track_db: None,
             replaygain_album_db: None,
             bpm: None,
+            lyrics: None,
+            lyrics_language: None,
+            lyrics_translation: None,
+            lyrics_translation_language: None,
+            artwork_data_url: None,
+            source_url: None,
+            source_provider: None,
+            video_url: None,
+            metadata_source: None,
         }
     }
 

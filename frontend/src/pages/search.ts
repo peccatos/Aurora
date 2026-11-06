@@ -11,7 +11,7 @@ import { navigate } from "../router";
 import { kvGet, kvPut } from "../library-db";
 import { setToast } from "../state";
 import { unlockAudio } from "../audio-bridge";
-import { searchTracks, addPreviewToQueue, type SearchHit } from "../search-service";
+import { searchTracks, searchArtists, searchArtistTracks, addPreviewToQueue, type ArtistSearchHit, type SearchHit } from "../search-service";
 import { listPlaylists } from "../playlist-service";
 import { icon } from "../styles/ytm-icons";
 import { trackArtworkUrl } from "../artwork-store";
@@ -109,6 +109,7 @@ async function render(root: HTMLElement) {
   // half (responses may arrive out of order).
   let timer: ReturnType<typeof setTimeout> | null = null;
   let seq = 0;
+  let onlineSeq = 0;
 
   function schedule(): void {
     if (timer) clearTimeout(timer);
@@ -278,7 +279,7 @@ async function render(root: HTMLElement) {
   /** Online catalog hits ("Found online"): the home drawExternal card
    *  pattern — DOM API for third-party data, https-only artwork,
    *  preview play buttons. */
-  function drawOnlineCards(hits: SearchHit[]): HTMLElement | null {
+  function drawOnlineCards(hits: SearchHit[], heading = "Найдено онлайн"): HTMLElement | null {
     if (!hits.length) return null;
     const shelf = document.createElement("div");
     shelf.className = "ytm-shelf";
@@ -290,7 +291,7 @@ async function render(root: HTMLElement) {
     title.textContent = "Найдено онлайн";
     const more = document.createElement("span");
     more.className = "ytm-shelf-more";
-    more.textContent = "превью 30 секунд";
+    more.textContent = "превью доступны не для всех треков";
     head.append(title, more);
     const row = document.createElement("div");
     row.className = "ytm-shelf-row";
@@ -336,23 +337,78 @@ async function render(root: HTMLElement) {
     const query = q.trim();
     if (query.length < 3) return; // same floor as home: no 1-2 char network spam
     const my = ++seq;
-    searchTracks(query)
-      .then((hits) => {
-        if (my !== seq) return; // stale response
-        if (input.value.trim() !== query) return; // user moved on
-        const shelf = drawOnlineCards(hits);
+    const online = ++onlineSeq;
+    void Promise.allSettled([searchTracks(query), searchArtists(query)]).then(([trackResult, artistResult]) => {
+      if (my !== seq || online !== onlineSeq || input.value.trim() !== query) return;
+      if (trackResult.status === "fulfilled") {
+        const shelf = drawOnlineCards(trackResult.value);
         if (shelf) results.appendChild(shelf);
-        else if (filter === "online") {
-          const empty = document.createElement("p");
-          empty.className = "hint";
-          empty.textContent = "В онлайне ничего не найдено.";
-          results.appendChild(empty);
-        }
-      })
-      .catch(() => {
-        /* offline / API blocked: local results only — honest silence */
-      });
+      }
+      if (artistResult.status === "fulfilled") {
+        const shelf = drawArtistCards(artistResult.value);
+        if (shelf) results.appendChild(shelf);
+      }
+      if (trackResult.status === "rejected" && artistResult.status === "rejected" && filter === "online") {
+        const empty = document.createElement("p");
+        empty.className = "hint";
+        empty.textContent = "Онлайн-каталоги недоступны. Попробуйте позже.";
+        results.appendChild(empty);
+      }
+    });
   }
+
+  function drawArtistCards(artists: ArtistSearchHit[]): HTMLElement | null {
+    if (!artists.length) return null;
+    const shelf = document.createElement("div");
+    shelf.className = "ytm-shelf";
+    const head = document.createElement("div");
+    head.className = "ytm-shelf-head";
+    const title = document.createElement("span");
+    title.className = "ytm-shelf-title";
+    title.textContent = "Исполнители из iTunes";
+    head.appendChild(title);
+    const row = document.createElement("div");
+    row.className = "ytm-shelf-row";
+    shelf.append(head, row);
+    for (const artist of artists.slice(0, 8)) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ytm-card";
+      const name = document.createElement("div");
+      name.className = "ytm-card-title";
+      name.textContent = artist.artist;
+      const genre = document.createElement("div");
+      genre.className = "ytm-card-sub";
+      genre.textContent = artist.genre ?? "Исполнитель";
+      button.append(name, genre);
+      button.addEventListener("click", () => {
+        button.disabled = true;
+        button.title = "Загружаем треки исполнителя…";
+        const request = ++seq;
+        ++onlineSeq;
+        void searchArtistTracks(artist.artist).then((hits) => {
+          if (request !== seq) return;
+          if (input.value.trim().length) input.value = "";
+          results.replaceChildren();
+          const shelf = drawOnlineCards(hits, `Треки исполнителя: ${artist.artist}`);
+          if (shelf) results.appendChild(shelf);
+          else {
+            const message = document.createElement("p");
+            message.className = "hint";
+            message.textContent = `В каталоге iTunes не найдены треки исполнителя ${artist.artist}.`;
+            results.appendChild(message);
+          }
+          syncHash("");
+        }).catch(() => {
+          button.disabled = false;
+          button.title = "Не удалось загрузить треки. Нажмите, чтобы повторить.";
+        });
+      });
+      row.appendChild(button);
+    }
+    return shelf;
+  }
+
 
   function draw(q: string): void {
     results.innerHTML = "";

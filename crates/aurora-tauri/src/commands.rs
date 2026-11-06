@@ -225,6 +225,43 @@ pub async fn list_tracks(state: K<'_>) -> Result<Vec<TrackDto>, CommandError> {
     state.kernel.list_tracks().await.map_err(map_err)
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct TrackEnrichmentInput {
+    pub track_id: String,
+    pub lyrics: Option<String>,
+    pub lyrics_language: Option<String>,
+    pub lyrics_translation: Option<String>,
+    pub lyrics_translation_language: Option<String>,
+    pub artwork_data_url: Option<String>,
+    pub source_url: Option<String>,
+    pub source_provider: Option<String>,
+    pub video_url: Option<String>,
+    pub metadata_source: Option<String>,
+}
+
+#[tauri::command]
+pub async fn set_track_enrichment(
+    input: TrackEnrichmentInput,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    let enrichment = aurora_storage::TrackEnrichment {
+        lyrics: input.lyrics,
+        lyrics_language: input.lyrics_language,
+        lyrics_translation: input.lyrics_translation,
+        lyrics_translation_language: input.lyrics_translation_language,
+        artwork_data_url: input.artwork_data_url,
+        source_url: input.source_url,
+        source_provider: input.source_provider,
+        video_url: input.video_url,
+        metadata_source: input.metadata_source,
+    };
+    state
+        .kernel
+        .set_track_enrichment(&input.track_id, &enrichment)
+        .await
+        .map_err(map_err)
+}
+
 #[tauri::command]
 pub async fn search_library(query: String, state: K<'_>) -> Result<Vec<TrackDto>, CommandError> {
     state.kernel.search_library(&query).await.map_err(map_err)
@@ -780,6 +817,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             queue_add_tracks,
             list_tracks,
             search_library,
+            set_track_enrichment,
             list_playlists,
             create_playlist,
             rename_playlist,

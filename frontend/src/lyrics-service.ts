@@ -36,6 +36,34 @@ interface LrcLibHit {
   syncedLyrics: string | null;
 }
 
+function normalized(value: string | null | undefined): string {
+  return value?.trim().toLocaleLowerCase() ?? "";
+}
+
+/** Prefer an exact artist/title match, then the closest known duration.
+ * LRCLIB search order is not a stable relevance contract. */
+function chooseHit(
+  hits: readonly LrcLibHit[],
+  artist: string | null,
+  title: string,
+  durationS: number | null,
+): LrcLibHit | null {
+  const usable = hits.filter((hit) => !hit.instrumental && (hit.syncedLyrics || hit.plainLyrics));
+  if (!usable.length) return null;
+  const wantedArtist = normalized(artist);
+  const wantedTitle = normalized(title);
+  return usable
+    .map((hit, index) => {
+      const titleMatch = normalized(hit.trackName) === wantedTitle;
+      const artistMatch = normalized(hit.artistName) === wantedArtist;
+      const durationDelta = durationS != null && hit.duration != null
+        ? Math.abs(hit.duration - durationS)
+        : Number.POSITIVE_INFINITY;
+      return { hit, index, score: (titleMatch ? 4 : 0) + (artistMatch ? 4 : 0), durationDelta };
+    })
+    .sort((a, b) => b.score - a.score || a.durationDelta - b.durationDelta || a.index - b.index)[0]?.hit ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // LRC parsing
 // ---------------------------------------------------------------------------
@@ -72,7 +100,11 @@ const CACHE_KEY = (artist: string, title: string) => `lyrics:${artist.toLowerCas
 
 /** Fetch lyrics for a track. Cache-first (IndexedDB kv), network second.
  *  Null = no lyrics found (the panel shows an honest "not found"). */
-export async function getLyrics(artist: string | null, title: string): Promise<LyricsResult | null> {
+export async function getLyrics(
+  artist: string | null,
+  title: string,
+  durationS: number | null = null,
+): Promise<LyricsResult | null> {
   if (!title.trim()) return null;
   const key = CACHE_KEY(artist ?? "", title);
   try {
@@ -90,10 +122,8 @@ export async function getLyrics(artist: string | null, title: string): Promise<L
     const res = await fetch(url, { signal: ctrl.signal });
     if (!res.ok) return null;
     const hits = (await res.json()) as LrcLibHit[];
-    // Prefer a synced non-instrumental hit; duration closeness breaks ties.
-    const usable = hits.filter((h) => !h.instrumental && (h.syncedLyrics || h.plainLyrics));
-    if (!usable.length) return null;
-    const best = usable[0];
+    const best = chooseHit(hits, artist, title, durationS);
+    if (!best) return null;
     const lines = best.syncedLyrics
       ? parseLrc(best.syncedLyrics)
       : (best.plainLyrics ?? "").split(/\r?\n/).map((t) => ({ timeS: null, text: t }));
@@ -132,4 +162,15 @@ export function activeLineIndex(lines: LyricLine[], posS: number): number {
     if (t != null && t <= posS + 0.15) active = i;
   }
   return active;
+}
+
+
+/** Convert a lyrics response into editable plain text. */
+export function lyricsToText(result: LyricsResult): string {
+  return result.lines.map((line) => line.text).join("\n");
+}
+
+/** Parse plain lyrics or LRC input into display lines, preserving timestamps. */
+export function parseLyricsText(text: string): LyricLine[] {
+  return text.includes("[") ? parseLrc(text) : text.split(/\r?\n/).map((line) => ({ timeS: null, text: line.trim() })).filter((line) => line.text);
 }

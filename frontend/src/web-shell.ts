@@ -49,6 +49,7 @@ const NAV: NavEntry[] = [
 const LIBRARY_NAV: NavEntry[] = [
   { route: "playlists", label: "Плейлисты", icon: "queue" },
   { route: "eq", label: "Эквалайзер", icon: "eq" },
+  { route: "effects", label: "Effects & Tools", icon: "eq" },
   { route: "settings", label: "Настройки", icon: "settings" },
 ];
 
@@ -507,7 +508,12 @@ export function bindWebPlayerBar(): void {
     // 0..100 -> dB: 100% = 0 dB (unity), 50% ~ -14 dB, 0% = -80 dB.
     const db = pct <= 0 ? -80 : 60 * Math.log10(pct / 100);
     try {
-      await invoke("set_dsp", { config: { ...(app.dsp ?? {}), volume_db: db } });
+      if (app.dsp) {
+        app.dsp.volume_db = db;
+        await invoke("set_dsp", { config: structuredClone(app.dsp) });
+        const { kvPut } = await import("./library-db");
+        await kvPut("dsp", app.dsp);
+      }
     } catch {
       /* kernel busy — retried on the next change */
     }

@@ -1052,6 +1052,22 @@ impl PlayerKernel {
         Ok(tracks.iter().map(TrackDto::from_track).collect())
     }
 
+    /// Persist user-supplied lyrics, translation, artwork, source and video metadata.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn set_track_enrichment(
+        &self,
+        track_id: &str,
+        enrichment: &aurora_storage::TrackEnrichment,
+    ) -> Result<(), KernelError> {
+        let library = self.library.lock().await;
+        let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
+        aurora_storage::set_track_enrichment(service.pool(), track_id, enrichment)
+            .await
+            .map_err(|e| KernelError::Library {
+                message: e.to_string(),
+            })
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub async fn search_library(&self, query: &str) -> Result<Vec<TrackDto>, KernelError> {
         let library = self.library.lock().await;

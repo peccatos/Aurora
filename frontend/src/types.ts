@@ -56,6 +56,16 @@ export interface TrackDto {
   duration_ms: number | null;
   replaygain_track_db: number | null;
   replaygain_album_db: number | null;
+  bpm?: number | null;
+  lyrics: string | null;
+  lyrics_language: string | null;
+  lyrics_translation: string | null;
+  lyrics_translation_language: string | null;
+  artwork_data_url: string | null;
+  source_url: string | null;
+  source_provider: string | null;
+  video_url: string | null;
+  metadata_source: string | null;
   display: string;
   duration_display: string;
 }

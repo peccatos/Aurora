@@ -41,8 +41,24 @@ interface ITunesResult {
   previewUrl?: string;
 }
 
-async function searchItunes(query: string, limit = 20): Promise<SearchHit[]> {
-  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=${limit}`;
+interface ITunesArtistResult {
+  artistId: number;
+  artistName: string;
+  primaryGenreName?: string;
+  artistLinkUrl?: string;
+}
+
+export interface ArtistSearchHit {
+  artistId: number;
+  artist: string;
+  genre: string | null;
+  /** Official iTunes artist page, when supplied by the catalog. */
+  linkUrl: string | null;
+}
+
+async function searchItunes(query: string, limit = 20, artistOnly = false): Promise<SearchHit[]> {
+  const artistParam = artistOnly ? "&attribute=artistTerm" : "";
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song${artistParam}&limit=${limit}`;
   const res = await fetchWithTimeout(url, 5000);
   if (!res.ok) throw new Error(`iTunes: HTTP ${res.status}`);
   const data = (await res.json()) as { results: ITunesResult[] };
@@ -57,6 +73,27 @@ async function searchItunes(query: string, limit = 20): Promise<SearchHit[]> {
       : null,
     previewUrl: r.previewUrl ?? null,
   }));
+}
+
+/** Search the official iTunes catalog for artists. */
+export async function searchArtists(query: string, limit = 12): Promise<ArtistSearchHit[]> {
+  if (!query.trim()) return [];
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=musicArtist&limit=${limit}`;
+  const res = await fetchWithTimeout(url, 5000);
+  if (!res.ok) throw new Error(`iTunes: HTTP ${res.status}`);
+  const data = (await res.json()) as { results?: ITunesArtistResult[] };
+  return (data.results ?? []).map((artist) => ({
+    artistId: artist.artistId,
+    artist: artist.artistName,
+    genre: artist.primaryGenreName ?? null,
+    linkUrl: artist.artistLinkUrl ?? null,
+  }));
+}
+
+/** Search tracks in iTunes constrained to an artist name. */
+export async function searchArtistTracks(artist: string, limit = 50): Promise<SearchHit[]> {
+  if (!artist.trim()) return [];
+  return searchItunes(artist, limit, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -154,15 +191,15 @@ export async function searchTracks(query: string): Promise<SearchHit[]> {
   if (deezer.status === "fulfilled") hits.push(...deezer.value);
   if (mb.status === "fulfilled") hits.push(...mb.value);
 
-  // Dedup: same title+artist (case-insensitive), preview-bearing
-  // sources first (iTunes, then Deezer; MB is metadata-only).
-  const seen = new Set<string>();
-  return hits.filter((h) => {
-    const key = `${h.title.toLowerCase()}|${h.artist.toLowerCase()}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // Dedup: retain the richer result when catalogs return the same track.
+  // iTunes is first, but a duplicate may only have a preview from Deezer.
+  const deduped = new Map<string, SearchHit>();
+  for (const hit of hits) {
+    const key = `${hit.title.trim().toLocaleLowerCase()}|${hit.artist.trim().toLocaleLowerCase()}`;
+    const current = deduped.get(key);
+    if (!current || (!current.previewUrl && hit.previewUrl)) deduped.set(key, hit);
+  }
+  return [...deduped.values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -206,8 +243,8 @@ export async function addPreviewToQueue(hit: SearchHit): Promise<boolean> {
     await playQueueIndex(0);
     setToast(`Preview: ${hit.title} — ${hit.artist}`);
     return true;
-  } catch (e) {
-    setToast(`Preview failed: ${String(e)}`);
+  } catch {
+    setToast("Preview could not be loaded. Check your connection and try again.");
     return false;
   }
 }

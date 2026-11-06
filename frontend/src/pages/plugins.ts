@@ -1,11 +1,13 @@
 /** Plugins page: VST3 scan, attach, chain, editor, generic params, presets. */
 
-import { invoke } from "../invoke";
+import { invoke, platform } from "../invoke";
+import { pickDirectory } from "../file-picker";
 import type { Page } from "../router";
 import { setToast } from "../state";
 import type { VstParamDto, VstPresetDto, VstPluginDto, VstSlot } from "../types";
 
 let found: VstPluginDto[] = [];
+let extraFolder: string | null = null;
 let slots: VstSlot[] = [];
 let paramsFor: { path: string; class_id: string } | null = null;
 let paramsList: VstParamDto[] = [];
@@ -41,6 +43,11 @@ function renderChain(root: HTMLElement) {
 }
 
 function render(root: HTMLElement) {
+  if (platform === "web") {
+    root.innerHTML = `<section class="page"><header class="page-head"><div><p class="overline">Desktop toolchain</p><h1 class="page-title">Plugins</h1></div></header><p class="hint">Native VST3 plugins are available only in the Aurora desktop app. Browser playback supports the Equalizer, reverb, speed, and per-track DSP profiles.</p><div class="page-actions"><button class="btn" id="plugins-web-effects" type="button">Open browser effects</button></div></section>`;
+    root.querySelector<HTMLButtonElement>("#plugins-web-effects")?.addEventListener("click", () => { window.location.hash = "#/effects"; });
+    return;
+  }
   root.innerHTML = `
     <section class="page">
       <header class="page-head">
@@ -49,26 +56,55 @@ function render(root: HTMLElement) {
           <h1 class="page-title">Plugins</h1>
         </div>
         <div class="page-actions">
-          <button class="btn" id="vst-scan" type="button">Scan…</button>
+          <button class="btn" id="vst-pick" type="button">Extra folder...</button>
+          <button class="btn" id="vst-scan" type="button">Scan...</button>
           <button class="btn" id="vst-clear" type="button">Chain off</button>
         </div>
       </header>
 
       <ul id="vst-list" class="vst-list"></ul>
+      <p class="hint" id="vst-extra"></p>
       <p class="hint" id="vst-note"></p>
       <p class="hint">Plugins run in isolated helper processes — a crashing plugin never takes the player down. Active plugins disable bit-perfect (honest report).</p>
     </section>
   `;
+
+  root.querySelector<HTMLButtonElement>("#vst-pick")?.addEventListener("click", async () => {
+    const btn = root.querySelector<HTMLButtonElement>("#vst-pick");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Choosing...";
+    }
+    try {
+      const picked = await pickDirectory();
+      if (picked) {
+        extraFolder = picked;
+        updateExtraFolder(root);
+        note("Extra VST3 folder selected - press Scan... to search it.");
+      } else if (platform === "web") {
+        note("Extra folder picking is available in the desktop app; standard scan remains available.");
+      }
+    } catch (e) {
+      note(`folder selection failed: ${String(e)}`, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Extra folder...";
+      }
+    }
+  });
 
   root.querySelector<HTMLButtonElement>("#vst-scan")?.addEventListener("click", async () => {
     const btn = root.querySelector<HTMLButtonElement>("#vst-scan");
     try {
       if (btn) {
         btn.disabled = true;
-        btn.textContent = "Scanning…";
+        btn.textContent = "Scanning...";
       }
-      note("scanning VST3 folders (crash-safe out-of-process probe)…");
-      found = await invoke<VstPluginDto[]>("scan_vst_plugins", { extraFolder: null });
+      const pickBtn = root.querySelector<HTMLButtonElement>("#vst-pick");
+      if (pickBtn) pickBtn.disabled = true;
+      note("scanning VST3 folders (crash-safe out-of-process probe)...");
+      found = await invoke<VstPluginDto[]>("scan_vst_plugins", { extraFolder });
       if (!found.length) {
         note("no VST3 plugins found — install one into %LOCALAPPDATA%\\VST3");
         return;
@@ -79,8 +115,10 @@ function render(root: HTMLElement) {
     } finally {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "Scan…";
+        btn.textContent = "Scan...";
       }
+      const pickBtn = root.querySelector<HTMLButtonElement>("#vst-pick");
+      if (pickBtn) pickBtn.disabled = false;
       update(root);
     }
   });
@@ -118,7 +156,22 @@ function render(root: HTMLElement) {
     })
     .catch(() => {});
 
+  updateExtraFolder(root);
   update(root);
+}
+
+function updateExtraFolder(root: HTMLElement) {
+  const el = root.querySelector<HTMLElement>("#vst-extra");
+  if (!el) return;
+  if (extraFolder) {
+    el.textContent = `Extra scan folder: ${extraFolder}`;
+    el.title = extraFolder;
+  } else {
+    el.textContent = platform === "web"
+      ? "Extra folder scanning is available in the desktop app."
+      : "No extra folder selected - standard VST3 paths will be scanned.";
+    el.removeAttribute("title");
+  }
 }
 
 function update(root: HTMLElement) {
@@ -355,7 +408,7 @@ function update(root: HTMLElement) {
       ? `${slots.length} plugin${slots.length > 1 ? "s" : ""} in chain — active while a track plays`
       : found.length
         ? "found plugins above; attach one to enable"
-        : "chain off — press Scan…",
+        : "chain off — press Scan...",
   );
 }
 

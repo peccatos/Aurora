@@ -9,12 +9,18 @@
  *  keeps its fallback icon, nothing is faked.
  */
 
-import { getArtwork } from "./library-db";
+import { getArtwork, getTrack } from "./library-db";
 
 const MAX_CACHED_URLS = 64;
 
 const urlCache = new Map<string, string>(); // insertion order = LRU order
 const pending = new Map<string, Promise<string | null>>();
+
+export function invalidateTrackArtworkUrl(trackId: string): void {
+  const url = urlCache.get(trackId);
+  if (url) revokeUrl(url);
+  urlCache.delete(trackId);
+}
 
 function revokeUrl(url: string): void {
   try {
@@ -46,6 +52,12 @@ export async function trackArtworkUrl(trackId: string): Promise<string | null> {
       blob = await getArtwork(trackId);
     } catch {
       blob = null; // storage error: honest null, caller keeps fallback
+    }
+    try {
+      const dataUrl = (await getTrack(trackId))?.artwork_data_url;
+      if (dataUrl) return dataUrl;
+    } catch {
+      /* no persisted data URL available */
     }
     if (!blob) return null;
     const url = URL.createObjectURL(blob);

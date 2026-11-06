@@ -26,6 +26,8 @@ import { decksPage } from "./pages/decks";
 import { playlistsPage, playlistDetailPage } from "./pages/playlists";
 import { searchPage } from "./pages/search";
 import { historyPage } from "./pages/history";
+import { genresPage } from "./pages/genres";
+import { effectsPage } from "./pages/effects";
 import {
   isWebShell,
   renderWebShell,
@@ -43,6 +45,7 @@ registerPage(libraryPage);
 registerPage(eqPage);
 registerPage(pluginsPage);
 registerPage(settingsPage);
+registerPage(effectsPage);
 // Decks page is native-only on the web shell (deck engines have no
 // ring consumer there — deck_play would be silent "playing"). The
 // page itself stays registered for the desktop shell.
@@ -53,6 +56,7 @@ if (isWebShell()) {
   registerPage(playlistDetailPage);
   registerPage(searchPage);
   registerPage(historyPage);
+  registerPage(genresPage);
 }
 
 const shell = document.querySelector<HTMLDivElement>("#app");
@@ -243,6 +247,7 @@ shell!.innerHTML = `
       <button class="nav-item" data-route="decks" type="button">Decks</button>
       <button class="nav-item" data-route="eq" type="button">Equalizer</button>
       <button class="nav-item" data-route="plugins" type="button">Plugins</button>
+      <button class="nav-item" data-route="effects" type="button">Effects & Tools</button>
       <button class="nav-item" data-route="settings" type="button">Settings</button>
       <div class="rail-foot">
         <span class="rail-meta" id="rail-count"></span>
@@ -572,8 +577,7 @@ function currentPos(): number {
 // Boot
 // ---------------------------------------------------------------------------
 
-void loadDsp();
-void pollStatus();
+void loadDsp().then(() => pollStatus());
 
 // Keep the library count in the rail fresh.
 async function updateRailCount(): Promise<void> {

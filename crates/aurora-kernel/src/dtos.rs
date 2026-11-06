@@ -47,6 +47,15 @@ pub struct TrackDto {
     pub replaygain_album_db: Option<f64>,
     /// Measured tempo (BPM), when analyzed.
     pub bpm: Option<f64>,
+    pub lyrics: Option<String>,
+    pub lyrics_language: Option<String>,
+    pub lyrics_translation: Option<String>,
+    pub lyrics_translation_language: Option<String>,
+    pub artwork_data_url: Option<String>,
+    pub source_url: Option<String>,
+    pub source_provider: Option<String>,
+    pub video_url: Option<String>,
+    pub metadata_source: Option<String>,
     /// "Artist - Title" (file stem when untagged): the correct name.
     pub display: String,
     /// Duration formatted "m:ss" for list rows.
@@ -76,6 +85,15 @@ impl TrackDto {
             replaygain_track_db: t.replaygain_track_db,
             replaygain_album_db: t.replaygain_album_db,
             bpm: t.bpm,
+            lyrics: t.lyrics.clone(),
+            lyrics_language: t.lyrics_language.clone(),
+            lyrics_translation: t.lyrics_translation.clone(),
+            lyrics_translation_language: t.lyrics_translation_language.clone(),
+            artwork_data_url: t.artwork_data_url.clone(),
+            source_url: t.source_url.clone(),
+            source_provider: t.source_provider.clone(),
+            video_url: t.video_url.clone(),
+            metadata_source: t.metadata_source.clone(),
             display: t.display_line(),
             duration_display,
         }

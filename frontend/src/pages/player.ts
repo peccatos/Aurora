@@ -5,11 +5,18 @@
 import { invoke } from "../invoke";
 import type { Page } from "../router";
 import { app, setToast } from "../state";
-import { renderArtwork } from "../artwork";
-import type { PlaybackStatus } from "../types";
+import { invalidateArtwork, renderArtwork } from "../artwork";
+import { updateWebTrackArtwork } from "../library-db";
+import { invalidateTrackArtworkUrl } from "../artwork-store";
+import type { PlaybackStatus, TrackDto } from "../types";
+import { saveTrackEnrichment } from "../track-enrichment-service";
+import { getWebTrackByPath } from "./home";
+import { validateVideoUrl } from "../video-url";
 import {
   getLyrics,
   activeLineIndex,
+  lyricsToText,
+  parseLyricsText,
   type LyricsResult,
 } from "../lyrics-service";
 
@@ -37,6 +44,9 @@ let lyricsKey: string | null = null;
 let lyricsState: "loading" | "none" | "ready" = "loading";
 let lyricsAutoScroll = true;
 let lyricsUserScrollUntil = 0;
+let lyricsEditText = "";
+let lyricsEditTranslation = "";
+let lyricsEditTrackId: string | null = null;
 
 async function loadWave(path: string) {
   if (waveCache.has(path)) {
@@ -59,56 +69,158 @@ function fmtTime(s: number): string {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
+function currentLibraryTrack(): TrackDto | null {
+  const path = app.queueCurrent != null
+    ? app.queueTracks[app.queueCurrent]?.path
+    : app.selectedPath;
+  const desktop = app.library.tracks.find((track) => track.path === path);
+  if (desktop) return desktop;
+  const web = path ? getWebTrackByPath(path) : null;
+  if (!web) return null;
+  return {
+    id: web.id,
+    path: `web://${web.id}`,
+    title: web.name,
+    artist: web.artist,
+    album: web.album,
+    genre: web.genre,
+    year: web.year,
+    track_number: null,
+    format: web.extension,
+    duration_ms: web.durationMs,
+    replaygain_track_db: null,
+    replaygain_album_db: null,
+    bpm: null,
+    lyrics: web.lyrics,
+    lyrics_language: web.lyrics_language,
+    lyrics_translation: web.lyrics_translation,
+    lyrics_translation_language: web.lyrics_translation_language,
+    artwork_data_url: web.artwork_data_url,
+    source_url: web.source_url,
+    source_provider: web.source_provider,
+    video_url: web.video_url,
+    metadata_source: web.metadata_source,
+    display: web.name,
+    duration_display: "",
+  };
+}
+
+function resetLyricsEditor(track: TrackDto | null) {
+  if (track?.id === lyricsEditTrackId) return;
+  lyricsEditTrackId = track?.id ?? null;
+  lyricsEditText = track?.lyrics ?? (lyrics ? lyricsToText(lyrics) : "");
+  lyricsEditTranslation = track?.lyrics_translation ?? "";
+}
+
 async function loadLyrics(root: HTMLElement, artist: string | null, title: string | null) {
+  const stored = currentLibraryTrack();
+  resetLyricsEditor(stored);
+  const key = stored?.id ?? `${artist ?? ""}|${title ?? ""}`;
+  if (key === lyricsKey) return;
+  lyricsKey = key;
+  if (stored?.lyrics) {
+    lyrics = null;
+    lyricsState = "ready";
+    drawLyrics(root);
+    return;
+  }
   if (!title) {
     lyrics = null;
     lyricsState = "none";
     drawLyrics(root);
     return;
   }
-  const key = `${artist ?? ""}|${title}`;
-  if (key === lyricsKey) return;
-  lyricsKey = key;
   lyrics = null;
   lyricsState = "loading";
   drawLyrics(root);
-  const res = await getLyrics(artist, title);
+  const res = await getLyrics(artist, title, stored?.duration_ms != null ? stored.duration_ms / 1000 : null);
   if (lyricsKey !== key) return; // track changed mid-fetch
   lyrics = res;
   lyricsState = res ? "ready" : "none";
+  if (res && stored && !stored.lyrics) lyricsEditText = lyricsToText(res);
   drawLyrics(root);
 }
 
 function drawLyrics(root: HTMLElement) {
   const box = root.querySelector<HTMLElement>("#np-lyrics");
   if (!box) return;
+  const stored = currentLibraryTrack();
+  resetLyricsEditor(stored);
   box.innerHTML = "";
-  if (lyricsState === "loading") {
+  const displayLyrics = stored?.lyrics
+    ? parseStoredLyrics(stored.lyrics)
+    : lyrics?.lines ?? [];
+  if (lyricsState === "loading" && !stored?.lyrics) {
     const p = document.createElement("p");
     p.className = "np-lyrics-hint";
     p.textContent = "Searching lyrics…";
     box.appendChild(p);
-    return;
-  }
-  if (lyricsState === "none" || !lyrics) {
+  } else if (!displayLyrics.length) {
     const p = document.createElement("p");
     p.className = "np-lyrics-hint";
-    p.textContent = "No lyrics found — drop a .lrc file on the page to add one.";
+    p.textContent = "No lyrics found — enter text below to add one.";
     box.appendChild(p);
-    return;
+  } else {
+    displayLyrics.forEach((line, i) => {
+      const el = document.createElement("p");
+      el.className = "np-lyrics-line";
+      el.dataset.lineIdx = String(i);
+      el.textContent = line.text || "♪";
+      box.appendChild(el);
+    });
+    const src = document.createElement("p");
+    src.className = "np-lyrics-source";
+    src.textContent = stored?.lyrics ? "Saved in Aurora library" : `${lyrics?.synced ? "Synced" : "Plain"} lyrics · LRCLIB · ${lyrics?.trackName ?? ""}`;
+    box.appendChild(src);
   }
-  lyrics.lines.forEach((line, i) => {
-    const el = document.createElement("p");
-    el.className = "np-lyrics-line";
-    el.dataset.lineIdx = String(i);
-    el.textContent = line.text || "♪";
-    box.appendChild(el);
+
+  const editor = document.createElement("div");
+  editor.className = "np-lyrics-editor";
+  editor.innerHTML = `<label>Текст песни<textarea id="lyrics-edit-text" rows="5"></textarea></label><label>Перевод<textarea id="lyrics-edit-translation" rows="4"></textarea></label><button class="btn" id="lyrics-save" type="button">Сохранить текст</button><p class="np-lyrics-hint" id="lyrics-save-hint"></p>`;
+  const text = editor.querySelector<HTMLTextAreaElement>("#lyrics-edit-text");
+  const translation = editor.querySelector<HTMLTextAreaElement>("#lyrics-edit-translation");
+  if (text) text.value = lyricsEditText;
+  if (translation) translation.value = lyricsEditTranslation;
+  editor.querySelector<HTMLButtonElement>("#lyrics-save")?.addEventListener("click", async () => {
+    if (!stored) {
+      setToast("Сохранение доступно для треков открытой библиотеки");
+      return;
+    }
+    lyricsEditText = text?.value ?? "";
+    lyricsEditTranslation = translation?.value ?? "";
+    const button = editor.querySelector<HTMLButtonElement>("#lyrics-save");
+    const hint = editor.querySelector<HTMLElement>("#lyrics-save-hint");
+    if (button) button.disabled = true;
+    try {
+      await saveTrackEnrichment({
+        track_id: stored.id,
+        lyrics: lyricsEditText || null,
+        lyrics_language: stored.lyrics_language,
+        lyrics_translation: lyricsEditTranslation || null,
+        lyrics_translation_language: stored.lyrics_translation_language,
+      });
+      stored.lyrics = lyricsEditText || null;
+      stored.lyrics_translation = lyricsEditTranslation || null;
+      const webTrack = getWebTrackByPath(stored.path);
+      if (webTrack) {
+        webTrack.lyrics = stored.lyrics;
+        webTrack.lyrics_translation = stored.lyrics_translation;
+      }
+      if (hint) hint.textContent = "Сохранено";
+      window.dispatchEvent(new CustomEvent("aurora:web-track-metadata-updated", { detail: { id: stored.id } }));
+    } catch (error) {
+      if (hint) hint.textContent = error instanceof Error ? error.message : "Не удалось сохранить";
+    } finally {
+      if (button) button.disabled = false;
+    }
   });
-  void 0;
-  const src = document.createElement("p");
-  src.className = "np-lyrics-source";
-  src.textContent = `${lyrics.synced ? "Synced" : "Plain"} lyrics · LRCLIB · ${lyrics.trackName}`;
-  box.appendChild(src);
+  box.appendChild(editor);
+}
+
+function parseStoredLyrics(text: string): Array<{ timeS: number | null; text: string }> {
+  return text.includes("[")
+    ? parseLyricsText(text)
+    : text.split(/\r?\n/).map((line) => ({ timeS: null, text: line })).filter((line) => line.text);
 }
 
 function scrollLyrics(root: HTMLElement, posS: number) {
@@ -140,11 +252,23 @@ function render(root: HTMLElement) {
           <button class="np-av-btn" data-av="video" type="button" disabled title="Видео недоступно">Видео</button>
         </div>
         <div class="np-art" id="np-art"><span class="art-glyph">♪</span></div>
+        <label class="np-cover-picker" id="np-cover-picker" hidden>Изменить обложку<input id="track-cover-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" /></label>
+        <p class="np-lyrics-hint" id="track-cover-hint" role="status" aria-live="polite"></p>
       </div>
       <div class="np-side">
         <p class="overline">Сейчас играет</p>
         <h1 class="np-title" id="np-title">Ничего не играет</h1>
         <p class="np-artist" id="np-artist">Откройте файл или выберите из библиотеки</p>
+        <section class="np-metadata-editor" id="np-web-metadata" hidden>
+          <label>Название<input id="track-meta-title" type="text" maxlength="300" /></label>
+          <label>Исполнитель<input id="track-meta-artist" type="text" maxlength="300" /></label>
+          <label>Альбом<input id="track-meta-album" type="text" maxlength="300" /></label>
+          <label>Жанр<input id="track-meta-genre" type="text" maxlength="120" /></label>
+          <label>Год<input id="track-meta-year" type="number" min="1000" max="9999" /></label>
+          <label>Видео URL (YouTube/Vimeo, HTTPS)<input id="track-video-url" type="url" maxlength="500" /></label>
+          <button class="btn" id="track-meta-save" type="button">Сохранить данные трека</button>
+          <p class="np-lyrics-hint" id="track-meta-hint"></p>
+        </section>
 
         <div class="wave-seek" id="wave-seek">
           <canvas id="wave-canvas" width="640" height="56"></canvas>
@@ -205,6 +329,88 @@ function render(root: HTMLElement) {
   // Close: back to home (web shell) / queue (desktop keeps old nav).
   root.querySelector<HTMLButtonElement>("#np-close-btn")?.addEventListener("click", () => {
     window.location.hash = "#/home";
+  });
+
+  root.querySelector<HTMLInputElement>("#track-cover-file")?.addEventListener("change", async (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    const track = currentLibraryTrack();
+    const hint = root.querySelector<HTMLElement>("#track-cover-hint");
+    if (!track?.path.startsWith("web://")) return;
+    if (!/^image\/(jpeg|png|webp|gif)$/.test(file.type) || file.size > 8 * 1024 * 1024) {
+      if (hint) hint.textContent = "Выберите JPG, PNG, WebP или GIF размером до 8 МБ";
+      return;
+    }
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("Не удалось прочитать изображение"));
+        reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Некорректное изображение"));
+        reader.readAsDataURL(file);
+      });
+      await updateWebTrackArtwork(track.id, file, dataUrl);
+      const webTrack = getWebTrackByPath(track.path);
+      if (webTrack) webTrack.artwork_data_url = dataUrl;
+      invalidateArtwork(track.path);
+      invalidateTrackArtworkUrl(track.id);
+      const art = root.querySelector<HTMLElement>("#np-art");
+      if (art) await renderArtwork(art, track.path);
+      const bg = root.querySelector<HTMLElement>("#np-bg");
+      if (bg) bg.style.backgroundImage = `url("${dataUrl}")`;
+      if (hint) hint.textContent = "Обложка сохранена";
+      window.dispatchEvent(new CustomEvent("aurora:web-track-metadata-updated", { detail: { id: track.id } }));
+    } catch (error) {
+      if (hint) hint.textContent = error instanceof Error ? error.message : "Не удалось сохранить обложку";
+    }
+  });
+
+  // Edit metadata for imported web-library tracks; desktop metadata remains unchanged.
+  root.querySelector<HTMLButtonElement>("#track-meta-save")?.addEventListener("click", async () => {
+    const track = currentLibraryTrack();
+    if (!track?.path.startsWith("web://")) return;
+    const editor = root.querySelector<HTMLElement>("#np-web-metadata");
+    const button = editor?.querySelector<HTMLButtonElement>("#track-meta-save");
+    const hint = editor?.querySelector<HTMLElement>("#track-meta-hint");
+    const value = (selector: string) => editor?.querySelector<HTMLInputElement>(selector)?.value.trim() ?? "";
+    const yearText = value("#track-meta-year");
+    const year = yearText ? Number(yearText) : null;
+    if (year !== null && (!Number.isInteger(year) || year < 1000 || year > 9999)) {
+      if (hint) hint.textContent = "Укажите год от 1000 до 9999";
+      return;
+    }
+    const name = value("#track-meta-title") || "Без названия";
+    const artist = value("#track-meta-artist") || null;
+    const album = value("#track-meta-album") || null;
+    const genre = value("#track-meta-genre") || null;
+    const video_url = value("#track-video-url") || null;
+    const videoError = validateVideoUrl(video_url ?? "");
+    if (videoError) { if (hint) hint.textContent = videoError; return; }
+    if (button) button.disabled = true;
+    if (hint) hint.textContent = "Сохраняю…";
+    try {
+      await saveTrackEnrichment({ track_id: track.id, name, artist, album, genre, year, video_url });
+      track.title = name;
+      track.artist = artist;
+      track.album = album;
+      track.genre = genre;
+      track.year = year;
+      const webTrack = getWebTrackByPath(track.path);
+      if (webTrack) Object.assign(webTrack, { name, artist, album, genre, year, video_url });
+      const queued = app.queueTracks.find((item) => item.path === track.path);
+      if (queued) {
+        queued.title = name;
+        queued.artist = artist;
+      }
+      if (hint) hint.textContent = "Сохранено";
+      update(root);
+      window.dispatchEvent(new CustomEvent("aurora:web-track-metadata-updated", { detail: { id: track.id } }));
+    } catch (error) {
+      if (hint) hint.textContent = error instanceof Error ? error.message : "Не удалось сохранить";
+    } finally {
+      if (button) button.disabled = false;
+    }
   });
 
   // Seek by clicking/dragging on the waveform.
@@ -375,12 +581,36 @@ function update(root: HTMLElement) {
 
   if (current) {
     const stem = current.path.split(/[\\/]/).pop() ?? current.path;
-    if (titleEl) titleEl.textContent = current.title ?? stem;
-    if (artistEl) artistEl.textContent = current.artist ?? "—";
+    const stored = currentLibraryTrack();
+    if (titleEl) titleEl.textContent = stored?.title ?? current.title ?? stem;
+    if (artistEl) artistEl.textContent = stored?.artist ?? current.artist ?? "—";
   } else if (app.selectedPath) {
     const stem = app.selectedPath.split(/[\\/]/).pop() ?? app.selectedPath;
     if (titleEl) titleEl.textContent = stem;
     if (artistEl) artistEl.textContent = "";
+  }
+
+  const metaTrack = currentLibraryTrack();
+  const metaEditor = root.querySelector<HTMLElement>("#np-web-metadata");
+  const coverPicker = root.querySelector<HTMLElement>("#np-cover-picker");
+  if (coverPicker) coverPicker.hidden = !metaTrack?.path.startsWith("web://");
+  if (metaEditor) {
+    const isWebTrack = Boolean(metaTrack?.path.startsWith("web://"));
+    metaEditor.hidden = !isWebTrack;
+    if (isWebTrack && metaTrack) {
+      const fields: Array<[string, string]> = [
+        ["#track-meta-title", metaTrack.title ?? ""],
+        ["#track-meta-artist", metaTrack.artist ?? ""],
+        ["#track-meta-album", metaTrack.album ?? ""],
+        ["#track-meta-genre", metaTrack.genre ?? ""],
+        ["#track-meta-year", metaTrack.year == null ? "" : String(metaTrack.year)],
+        ["#track-video-url", metaTrack.video_url ?? ""],
+      ];
+      for (const [selector, value] of fields) {
+        const input = metaEditor.querySelector<HTMLInputElement>(selector);
+        if (input && document.activeElement !== input && input.value !== value) input.value = value;
+      }
+    }
   }
 
   const art = root.querySelector<HTMLElement>("#np-art");

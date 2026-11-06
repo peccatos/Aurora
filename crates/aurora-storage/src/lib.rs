@@ -171,6 +171,36 @@ fn row_to_track(row: &sqlx::sqlite::SqliteRow) -> Track {
         .ok()
         .flatten();
     track.bpm = row.try_get::<Option<f64>, _>("bpm").ok().flatten();
+    track.lyrics = row.try_get::<Option<String>, _>("lyrics").ok().flatten();
+    track.lyrics_language = row
+        .try_get::<Option<String>, _>("lyrics_language")
+        .ok()
+        .flatten();
+    track.lyrics_translation = row
+        .try_get::<Option<String>, _>("lyrics_translation")
+        .ok()
+        .flatten();
+    track.lyrics_translation_language = row
+        .try_get::<Option<String>, _>("lyrics_translation_language")
+        .ok()
+        .flatten();
+    track.artwork_data_url = row
+        .try_get::<Option<String>, _>("artwork_data_url")
+        .ok()
+        .flatten();
+    track.source_url = row
+        .try_get::<Option<String>, _>("source_url")
+        .ok()
+        .flatten();
+    track.source_provider = row
+        .try_get::<Option<String>, _>("source_provider")
+        .ok()
+        .flatten();
+    track.video_url = row.try_get::<Option<String>, _>("video_url").ok().flatten();
+    track.metadata_source = row
+        .try_get::<Option<String>, _>("metadata_source")
+        .ok()
+        .flatten();
     track
 }
 
@@ -189,8 +219,10 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
         r#"
         INSERT INTO tracks (
             id, path, title, artist, album, genre, year, track_number,
-            format, duration_ms, replaygain_track_db, replaygain_album_db, bpm
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            format, duration_ms, replaygain_track_db, replaygain_album_db, bpm,
+            lyrics, lyrics_language, lyrics_translation, lyrics_translation_language,
+            artwork_data_url, source_url, source_provider, video_url, metadata_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             path = excluded.path,
             title = excluded.title,
@@ -203,7 +235,16 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
             duration_ms = excluded.duration_ms,
             replaygain_track_db = excluded.replaygain_track_db,
             replaygain_album_db = excluded.replaygain_album_db,
-            bpm = COALESCE(excluded.bpm, tracks.bpm)
+            bpm = COALESCE(excluded.bpm, tracks.bpm),
+            lyrics = COALESCE(excluded.lyrics, tracks.lyrics),
+            lyrics_language = COALESCE(excluded.lyrics_language, tracks.lyrics_language),
+            lyrics_translation = COALESCE(excluded.lyrics_translation, tracks.lyrics_translation),
+            lyrics_translation_language = COALESCE(excluded.lyrics_translation_language, tracks.lyrics_translation_language),
+            artwork_data_url = COALESCE(excluded.artwork_data_url, tracks.artwork_data_url),
+            source_url = COALESCE(excluded.source_url, tracks.source_url),
+            source_provider = COALESCE(excluded.source_provider, tracks.source_provider),
+            video_url = COALESCE(excluded.video_url, tracks.video_url),
+            metadata_source = COALESCE(excluded.metadata_source, tracks.metadata_source)
         "#,
     )
     .bind(track.id.0.to_string())
@@ -219,6 +260,15 @@ pub async fn upsert_track(pool: &SqlitePool, track: &Track) -> Result<bool, Stor
     .bind(track.replaygain_track_db)
     .bind(track.replaygain_album_db)
     .bind(track.bpm)
+    .bind(&track.lyrics)
+    .bind(&track.lyrics_language)
+    .bind(&track.lyrics_translation)
+    .bind(&track.lyrics_translation_language)
+    .bind(&track.artwork_data_url)
+    .bind(&track.source_url)
+    .bind(&track.source_provider)
+    .bind(&track.video_url)
+    .bind(&track.metadata_source)
     .execute(pool)
     .await?;
     Ok(was_new)
@@ -292,6 +342,45 @@ pub async fn track_by_path(pool: &SqlitePool, path: &str) -> Result<Option<Track
         .fetch_optional(pool)
         .await?;
     Ok(row.as_ref().map(row_to_track))
+}
+
+/// User-edited or provider-enriched lyrics and media links for a track.
+#[derive(Debug, Clone, Default)]
+pub struct TrackEnrichment {
+    pub lyrics: Option<String>,
+    pub lyrics_language: Option<String>,
+    pub lyrics_translation: Option<String>,
+    pub lyrics_translation_language: Option<String>,
+    pub artwork_data_url: Option<String>,
+    pub source_url: Option<String>,
+    pub source_provider: Option<String>,
+    pub video_url: Option<String>,
+    pub metadata_source: Option<String>,
+}
+
+pub async fn set_track_enrichment(
+    pool: &SqlitePool,
+    track_id: &str,
+    enrichment: &TrackEnrichment,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "UPDATE tracks SET lyrics = ?, lyrics_language = ?, lyrics_translation = ?, \
+         lyrics_translation_language = ?, artwork_data_url = ?, source_url = ?, \
+         source_provider = ?, video_url = ?, metadata_source = ? WHERE id = ?",
+    )
+    .bind(&enrichment.lyrics)
+    .bind(&enrichment.lyrics_language)
+    .bind(&enrichment.lyrics_translation)
+    .bind(&enrichment.lyrics_translation_language)
+    .bind(&enrichment.artwork_data_url)
+    .bind(&enrichment.source_url)
+    .bind(&enrichment.source_provider)
+    .bind(&enrichment.video_url)
+    .bind(&enrichment.metadata_source)
+    .bind(track_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Persist a measured BPM for one track.
@@ -600,6 +689,48 @@ mod tests {
             library_roots(&pool).await.unwrap(),
             vec!["C:/music".to_string(), "D:/flac".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn track_enrichment_roundtrip_survives_rescan() {
+        let pool = pool().await;
+        let t = track("m/enriched.flac", Some("Enriched"), Some("Aurora"));
+        upsert_track(&pool, &t).await.unwrap();
+
+        let enrichment = TrackEnrichment {
+            lyrics: Some("[00:01.00] hello".into()),
+            lyrics_language: Some("en".into()),
+            lyrics_translation: Some("привет".into()),
+            lyrics_translation_language: Some("ru".into()),
+            artwork_data_url: Some("data:image/jpeg;base64,abc".into()),
+            source_url: Some("https://example.test/track".into()),
+            source_provider: Some("example".into()),
+            video_url: Some("https://example.test/video".into()),
+            metadata_source: Some("user".into()),
+        };
+        set_track_enrichment(&pool, &t.id.0.to_string(), &enrichment)
+            .await
+            .unwrap();
+
+        let saved = all_tracks(&pool).await.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].lyrics.as_deref(), Some("[00:01.00] hello"));
+        assert_eq!(saved[0].lyrics_translation.as_deref(), Some("привет"));
+        assert_eq!(
+            saved[0].artwork_data_url.as_deref(),
+            Some("data:image/jpeg;base64,abc")
+        );
+        assert_eq!(saved[0].source_provider.as_deref(), Some("example"));
+        assert_eq!(
+            saved[0].video_url.as_deref(),
+            Some("https://example.test/video")
+        );
+
+        // A normal rescan/upsert with no enrichment must retain the saved fields.
+        upsert_track(&pool, &t).await.unwrap();
+        let rescanned = all_tracks(&pool).await.unwrap();
+        assert_eq!(rescanned[0].lyrics.as_deref(), Some("[00:01.00] hello"));
+        assert_eq!(rescanned[0].metadata_source.as_deref(), Some("user"));
     }
 
     #[tokio::test]

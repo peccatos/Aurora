@@ -164,6 +164,7 @@ export async function playQueueIndex(idx: number): Promise<number | null> {
   const cur = app.queueTracks[idx];
   if (cur) app.selectedPath = cur.path;
   await loadStatus();
+  void import("./dsp-profiles").then(({ applyDspProfile }) => applyDspProfile(cur?.path ?? null)).catch(() => undefined);
   notify();
   return app.queueCurrent;
 }
@@ -183,6 +184,7 @@ export async function nextTrack(): Promise<QueueDto | null> {
     app.queueCurrent = q.current;
     const cur = q.tracks[q.current ?? 0];
     if (cur) app.selectedPath = cur.path;
+    void import("./dsp-profiles").then(({ applyDspProfile }) => applyDspProfile(cur?.path ?? null)).catch(() => undefined);
     notify();
   } else {
     app.queueCurrent = null;
@@ -198,6 +200,7 @@ export async function prevTrack(): Promise<QueueDto> {
   app.queueCurrent = q.current;
   const cur = q.tracks[q.current ?? 0];
   if (cur) app.selectedPath = cur.path;
+  void import("./dsp-profiles").then(({ applyDspProfile }) => applyDspProfile(cur?.path ?? null)).catch(() => undefined);
   notify();
   await loadStatus();
   return q;

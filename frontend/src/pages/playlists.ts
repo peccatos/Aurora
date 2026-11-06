@@ -17,6 +17,7 @@ import {
   reorderPlaylist,
 } from "../playlist-service";
 import { getAllTracks, type StoredTrack } from "../library-db";
+import { importWebPlaylist } from "../web-playlist-import";
 
 /** Play a playlist: resolve track ids -> entries, queue them. The play
  *  pipeline (register bytes, LUFS) lives with the Home module — reimport
@@ -77,13 +78,22 @@ function renderList(root: HTMLElement) {
     <div class="ytm-playlists-head">
       <h1 class="page-title">Playlists</h1>
       <button class="btn" id="pl-new" type="button">＋ New playlist</button>
+      <button class="btn" id="pl-import-button" type="button">⇩ Import playlist</button>
+      <input id="pl-import" class="visually-hidden-file" type="file" accept=".m3u,.m3u8,.pls,.json,.csv,.txt" aria-label="Choose a playlist file" />
+      <button class="btn" id="pl-back-home" type="button">⌂ Home</button>
     </div>
     <div class="ytm-shelf-row" id="pl-grid"></div>
     <p class="hint" id="pl-empty"></p>
+    <section class="pl-import-report" id="pl-import-report" aria-live="polite" hidden></section>
   `;
 
   const grid = root.querySelector<HTMLElement>("#pl-grid")!;
   const empty = root.querySelector<HTMLElement>("#pl-empty")!;
+
+  root.querySelector<HTMLButtonElement>("#pl-back-home")?.addEventListener("click", () => navigate("home"));
+  root.querySelector<HTMLButtonElement>("#pl-import-button")?.addEventListener("click", () => {
+    root.querySelector<HTMLInputElement>("#pl-import")?.click();
+  });
 
   root.querySelector<HTMLButtonElement>("#pl-new")?.addEventListener("click", async () => {
     const name = window.prompt("Playlist name");
@@ -91,6 +101,43 @@ function renderList(root: HTMLElement) {
     const pl = await createPlaylist(name);
     setToast(`Created "${pl.name}"`);
     navigate(`playlist?id=${pl.id}`);
+  });
+
+  root.querySelector<HTMLInputElement>("#pl-import")?.addEventListener("change", async (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    try {
+      const requestedName = window.prompt("Playlist name", file.name.replace(/\.[^.]+$/, ""));
+      if (requestedName === null) return;
+      const report = await importWebPlaylist(file, requestedName);
+      setToast(`Imported "${report.playlist.name}": ${report.matched} matched` + (report.unmatched.length ? `, ${report.unmatched.length} not found` : ""));
+      renderList(root);
+      const reportBox = root.querySelector<HTMLElement>("#pl-import-report");
+      if (reportBox) {
+        reportBox.hidden = false;
+        const heading = document.createElement("h2");
+        heading.textContent = `Import report: ${report.matched} matched, ${report.unmatched.length} not found`;
+        const close = document.createElement("button");
+        close.type = "button";
+        close.className = "btn";
+        close.textContent = "Dismiss";
+        close.addEventListener("click", () => reportBox.remove());
+        reportBox.append(heading, close);
+        if (report.unmatched.length) {
+          const list = document.createElement("ul");
+          for (const item of report.unmatched) {
+            const row = document.createElement("li");
+            row.textContent = item;
+            list.appendChild(row);
+          }
+          reportBox.appendChild(list);
+        }
+      }
+    } catch (error) {
+      setToast(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 
   void (async () => {
@@ -146,6 +193,26 @@ function renderDetail(root: HTMLElement, playlistId: string) {
   const tracksEl = root.querySelector<HTMLElement>("#pl-tracks")!;
   const emptyEl = root.querySelector<HTMLElement>("#pl-empty-tracks")!;
 
+  let dragId: string | null = null;
+  tracksEl.addEventListener("dragstart", (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>(".ytm-track-row");
+    dragId = row?.dataset.dragId ?? null;
+  });
+  tracksEl.addEventListener("dragover", (e) => e.preventDefault());
+  tracksEl.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    const row = (e.target as HTMLElement).closest<HTMLElement>(".ytm-track-row");
+    if (!row || !dragId) return;
+    const ids = [...tracksEl.querySelectorAll<HTMLElement>(".ytm-track-row")].map(
+      (item) => item.dataset.dragId,
+    );
+    const toIndex = Math.max(0, ids.indexOf(row.dataset.dragId));
+    const movingId = dragId;
+    dragId = null;
+    await reorderPlaylist(playlistId, movingId, toIndex);
+    await draw();
+  });
+
   async function draw() {
     const pl = await getPlaylist(playlistId);
     if (!pl) {
@@ -173,25 +240,6 @@ function renderDetail(root: HTMLElement, playlistId: string) {
         await removeFromPlaylist(playlistId, trackId);
         await draw();
       },
-    });
-    // Drag reorder between rows.
-    let dragId: string | null = null;
-    tracksEl.addEventListener("dragstart", (e) => {
-      const row = (e.target as HTMLElement).closest<HTMLElement>(".ytm-track-row");
-      dragId = row?.dataset.dragId ?? null;
-    });
-    tracksEl.addEventListener("dragover", (e) => e.preventDefault());
-    tracksEl.addEventListener("drop", async (e) => {
-      e.preventDefault();
-      const row = (e.target as HTMLElement).closest<HTMLElement>(".ytm-track-row");
-      if (!row || !dragId) return;
-      const ids = [...tracksEl.querySelectorAll<HTMLElement>(".ytm-track-row")].map(
-        (r) => r.dataset.dragId,
-      );
-      const toIndex = Math.max(0, ids.indexOf(row.dataset.dragId));
-      await reorderPlaylist(playlistId, dragId, toIndex);
-      dragId = null;
-      await draw();
     });
   }
 
