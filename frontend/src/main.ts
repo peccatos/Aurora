@@ -27,6 +27,7 @@ import { playlistsPage, playlistDetailPage } from "./pages/playlists";
 import { searchPage } from "./pages/search";
 import { historyPage } from "./pages/history";
 import { genresPage } from "./pages/genres";
+import { artistPage } from "./pages/artist";
 import { effectsPage } from "./pages/effects";
 import {
   isWebShell,
@@ -57,6 +58,7 @@ if (isWebShell()) {
   registerPage(searchPage);
   registerPage(historyPage);
   registerPage(genresPage);
+  registerPage(artistPage);
 }
 
 const shell = document.querySelector<HTMLDivElement>("#app");

@@ -318,10 +318,41 @@
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Shelf: a horizontal row of cards (YTM home)                          */
-/* ------------------------------------------------------------------ */
+/* Local artist route */
+.ytm-artist-page {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 28px 24px 100px;
+}
+.ytm-artist-hero {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin: 34px 0 20px;
+}
+.artist-avatar {
+  width: 148px;
+  height: 148px;
+  flex-shrink: 0;
+}
+.ytm-artist-actions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 34px;
+}
+.artist-track-row {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+@media (max-width: 640px) {
+  .ytm-artist-hero { align-items: flex-start; flex-direction: column; }
+  .artist-avatar { width: 112px; height: 112px; }
+}
 
+/* Existing responsive/card styles follow. */
 .ytm-shelf {
   margin-bottom: 40px;
 }
@@ -417,9 +448,7 @@
   box-shadow: var(--ytm-shadow);
   opacity: 0;
   transform: translateY(6px);
-  transition:
-    opacity 0.15s,
-    transform 0.15s;
+  transition: opacity 0.15s, transform 0.15s;
   cursor: pointer;
 }
 
@@ -429,15 +458,8 @@
   transform: translateY(0);
 }
 
-.ytm-card-play:hover {
-  background: var(--ytm-accent-hover);
-}
-
-.ytm-card-play svg {
-  width: 22px;
-  height: 22px;
-  fill: #fff;
-}
+.ytm-card-play:hover { background: var(--ytm-accent-hover); }
+.ytm-card-play svg { width: 22px; height: 22px; fill: #fff; }
 
 .ytm-card-title {
   font-size: 14px;
@@ -461,12 +483,11 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Player bar (bottom, desktop)                                        */
+/* Player bar (desktop) */
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
-/* Player bar (bottom, YTM three-zone: left meta / center transport /
-   right controls; thin full-width progress strip on the bar's top). */
+/* Player bar (YTM three-zone) */
 /* ------------------------------------------------------------------ */
 
 .ytm-player {

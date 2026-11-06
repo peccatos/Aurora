@@ -31,7 +31,7 @@ async function getStoredTrack(id: string): Promise<StoredTrack | null> {
   return all.find((t) => t.id === id) ?? null;
 }
 
-interface WebTrack {
+export interface WebTrack {
   id: string;
   name: string;
   artist: string | null;
@@ -1151,4 +1151,3 @@ export const homePage: Page = {
 };
 
 export { playWebTracks };
-export type { WebTrack };

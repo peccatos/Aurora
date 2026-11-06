@@ -382,6 +382,11 @@ async function render(root: HTMLElement) {
       genre.textContent = artist.genre ?? "Исполнитель";
       button.append(name, genre);
       button.addEventListener("click", () => {
+        const local = getWebTracks().filter((track) => track.artist?.trim().toLocaleLowerCase() === artist.artist.trim().toLocaleLowerCase());
+        if (local.length) {
+          navigate(`artist?name=${encodeURIComponent(artist.artist)}`);
+          return;
+        }
         button.disabled = true;
         button.title = "Загружаем треки исполнителя…";
         const request = ++seq;
