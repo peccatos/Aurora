@@ -7,6 +7,7 @@
 pub mod audio;
 pub mod library;
 pub mod playback;
+pub mod sync;
 
 pub use audio::{
     AudioFormat, AudioTransformation, ChannelLayout, OutputDiagnostics, OutputIntegrity, PcmFormat,
@@ -14,3 +15,8 @@ pub use audio::{
 };
 pub use library::{Album, Artist, Playlist, Track, TrackId};
 pub use playback::{PlaybackMode, PlaybackState};
+pub use sync::{
+    AppliedOperations, ConflictPolicy, LocalPlaylistTrack, RemotePage, RemotePlaylist,
+    RemoteProvider, RemoteTrack, RetryPolicy, SyncCapabilities, SyncError, SyncOperation, SyncPlan,
+    page, plan_sync, track_match_key,
+};
