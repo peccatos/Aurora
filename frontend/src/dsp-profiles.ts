@@ -15,8 +15,11 @@ function clone(config: DspConfig): DspConfig {
 }
 
 export async function getDspProfiles(): Promise<Profiles> {
-  if (platform !== "web") return {};
-  try { return (await kvGet<Profiles>(KEY)) ?? {}; } catch { return {}; }
+  try {
+    if (platform === "web") return (await kvGet<Profiles>(KEY)) ?? {};
+    const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
+    return raw ? (JSON.parse(raw) as Profiles) : {};
+  } catch { return {}; }
 }
 
 export async function saveDspProfile(trackId: string, config = app.dsp): Promise<void> {
