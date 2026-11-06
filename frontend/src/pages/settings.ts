@@ -1,6 +1,8 @@
 /** Settings page: output device, bit-perfect (exclusive + verify), files. */
 
 import { invoke, platform } from "../invoke";
+import { PROVIDERS } from "../provider-registry";
+import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, startAuthorization } from "../accounts";
 import { pickAudioFiles } from "../file-picker";
 import type { Page } from "../router";
 import { app, loadStatus, setQueue, setToast, trackToQueueTrack } from "../state";
@@ -50,11 +52,9 @@ function render(root: HTMLElement) {
           <span class="hint" id="server-status">Checking configuration…</span>
         </div>
         <p class="hint">Configured with a library URL above. Aurora reads the public library.json; no sign-in or token is used.</p>
-        <div class="settings-row">
-          <strong>Streaming accounts</strong>
-          <span class="hint">Not connected</span>
-        </div>
-        <p class="hint">OAuth sign-in is not available yet. No provider credentials or account backend are configured, so connect buttons are intentionally not shown.</p>
+        <div id="account-cards" class="account-cards" aria-live="polite"></div>
+        <p class="hint">Aurora stores only connection metadata here. Tokens remain in the native/backend secure store; providers without a configured adapter cannot start authorization.</p>
+        <p class="hint" id="account-callback-status" role="status"></p>
       </div>
 
       <div class="eq-card">
@@ -73,6 +73,52 @@ function render(root: HTMLElement) {
   `;
 
   const deviceSel = root.querySelector<HTMLSelectElement>("#device-select");
+
+  const accountCards = root.querySelector<HTMLElement>("#account-cards");
+  if (accountCards) {
+    accountCards.innerHTML = PROVIDERS
+      .filter((provider) => provider.availability !== "unsupported")
+      .map((provider) => {
+        const account = getAccountRecord(provider.id);
+        const configured = hasProviderAuthAdapter(provider.id);
+        const state = account?.state === "connected" ? "Connected" : account?.state === "error" ? `Error: ${account.lastError ?? "authorization failed"}` : "Not connected";
+        const action = account?.state === "connected"
+          ? `<button class="btn" data-account-action="disconnect" data-provider="${provider.id}" type="button">Disconnect</button>`
+          : `<button class="btn" data-account-action="connect" data-provider="${provider.id}" type="button" ${configured ? "" : "disabled"}>${configured ? "Connect" : "Adapter unavailable"}</button>`;
+        return `<div class="settings-row account-card"><div><strong>${provider.name}</strong><div class="hint">${state}</div></div><div>${action}</div></div>`;
+      }).join("");
+    accountCards.addEventListener("click", async (event) => {
+      const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-account-action]");
+      const provider = button?.dataset.provider;
+      if (!button || !provider) return;
+      button.disabled = true;
+      try {
+        if (button.dataset.accountAction === "connect") {
+          const url = await startAuthorization(provider);
+          window.location.assign(url);
+        } else {
+          await disconnectAccount(provider);
+          render(root);
+        }
+      } catch (error) {
+        const status = root.querySelector<HTMLElement>("#account-callback-status");
+        if (status) { status.textContent = String(error); status.className = "hint warn"; }
+        button.disabled = false;
+      }
+    });
+  }
+
+  // Report callback errors without treating a browser callback as a token exchange.
+  const callbackStatus = root.querySelector<HTMLElement>("#account-callback-status");
+  const callbackParams = new URLSearchParams(window.location.search);
+  const callbackError = callbackParams.get("error");
+  if (callbackStatus && callbackError) {
+    callbackStatus.textContent = `Authorization failed: ${callbackParams.get("error_description") ?? callbackError}`;
+    callbackStatus.className = "hint warn";
+  } else if (callbackStatus && callbackParams.has("code")) {
+    callbackStatus.textContent = "Authorization callback received, but no provider adapter is configured to exchange it. No account was connected.";
+    callbackStatus.className = "hint warn";
+  }
 
   // Server library URL: persisted (kv); empty = feature hidden.
   const serverUrlInput = root.querySelector<HTMLInputElement>("#server-url");
