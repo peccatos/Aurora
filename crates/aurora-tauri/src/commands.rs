@@ -142,7 +142,7 @@ pub fn play_track(request: PlayRequest, state: K<'_>) -> Result<PlaybackStatus, 
 }
 
 #[tauri::command]
-pub fn set_track_dsp(
+pub async fn set_track_dsp(
     track_path: String,
     config: aurora_dsp::DspConfig,
     state: K<'_>,
@@ -150,12 +150,15 @@ pub fn set_track_dsp(
     state
         .kernel
         .set_track_dsp(track_path, config)
-        .map_err(map_err)
+        .map_err(map_err)?;
+    state.kernel.persist_dsp_settings().await.map_err(map_err)
 }
 
 #[tauri::command]
-pub fn clear_track_dsp(track_path: String, state: K<'_>) -> Result<bool, CommandError> {
-    state.kernel.clear_track_dsp(&track_path).map_err(map_err)
+pub async fn clear_track_dsp(track_path: String, state: K<'_>) -> Result<bool, CommandError> {
+    let removed = state.kernel.clear_track_dsp(&track_path).map_err(map_err)?;
+    state.kernel.persist_dsp_settings().await.map_err(map_err)?;
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +469,13 @@ pub fn get_dsp(state: K<'_>) -> Result<aurora_dsp::DspConfig, CommandError> {
 }
 
 #[tauri::command]
-pub fn set_dsp(
+pub async fn set_dsp(
     config: aurora_dsp::DspConfig,
     state: K<'_>,
 ) -> Result<aurora_dsp::DspConfig, CommandError> {
-    state.kernel.set_dsp(config).map_err(map_err)
+    let result = state.kernel.set_dsp(config).map_err(map_err)?;
+    state.kernel.persist_dsp_settings().await.map_err(map_err)?;
+    Ok(result)
 }
 
 /// Phase 5: probe WASAPI exclusive-mode support for the playing format.
@@ -973,6 +978,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                                 *kernel.library.lock().await = Some(service);
                                 *kernel.library_path_slot.lock().expect("path slot") =
                                     Some(db_path.clone());
+                                if let Err(e) = kernel.load_dsp_settings().await {
+                                    tracing::warn!(%e, "cannot load persisted DSP settings");
+                                }
                                 tracing::info!(
                                     path = %db_path.display(),
                                     count,

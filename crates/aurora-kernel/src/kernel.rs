@@ -315,6 +315,75 @@ impl PlayerKernel {
             .is_some())
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn load_dsp_settings(&self) -> Result<(), KernelError> {
+        let library = self.library.lock().await;
+        let service = library.as_ref().ok_or(KernelError::LibraryNotOpen)?;
+        let mut loaded_any = false;
+        if let Some(raw) = aurora_storage::get_setting(service.pool(), "dsp.global.v1")
+            .await
+            .map_err(KernelError::from)?
+        {
+            if let Ok(config) = serde_json::from_str(&raw) {
+                *self.dsp.lock().map_err(|_| KernelError::Poisoned)? = config;
+                loaded_any = true;
+            }
+        }
+        if let Some(raw) = aurora_storage::get_setting(service.pool(), "dsp.track.v1")
+            .await
+            .map_err(KernelError::from)?
+        {
+            if let Ok(profiles) = serde_json::from_str(&raw) {
+                self.track_dsp
+                    .lock()
+                    .map_err(|_| KernelError::Poisoned)?
+                    .replace(profiles);
+                loaded_any = true;
+            }
+        }
+        drop(library);
+        if !loaded_any {
+            self.persist_dsp_settings().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn persist_dsp_settings(&self) -> Result<(), KernelError> {
+        let library = self.library.lock().await;
+        let Some(service) = library.as_ref() else {
+            // Playback remains usable while the asynchronous desktop library
+            // bootstrap is still opening SQLite.
+            return Ok(());
+        };
+        let global = self.dsp.lock().map_err(|_| KernelError::Poisoned)?.clone();
+        let tracks = self
+            .track_dsp
+            .lock()
+            .map_err(|_| KernelError::Poisoned)?
+            .snapshot()
+            .clone();
+        aurora_storage::set_setting(
+            service.pool(),
+            "dsp.global.v1",
+            &serde_json::to_string(&global).map_err(|e| KernelError::Library {
+                message: e.to_string(),
+            })?,
+        )
+        .await
+        .map_err(KernelError::from)?;
+        aurora_storage::set_setting(
+            service.pool(),
+            "dsp.track.v1",
+            &serde_json::to_string(&tracks).map_err(|e| KernelError::Library {
+                message: e.to_string(),
+            })?,
+        )
+        .await
+        .map_err(KernelError::from)?;
+        Ok(())
+    }
+
     pub fn set_dsp(
         &self,
         config: aurora_dsp::DspConfig,

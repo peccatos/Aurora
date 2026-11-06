@@ -21,6 +21,12 @@ impl DspProfileResolver {
     pub fn resolve<'a>(&'a self, track_key: &str, fallback: &'a DspConfig) -> &'a DspConfig {
         self.profiles.get(track_key).unwrap_or(fallback)
     }
+    pub fn snapshot(&self) -> &HashMap<String, DspConfig> {
+        &self.profiles
+    }
+    pub fn replace(&mut self, profiles: HashMap<String, DspConfig>) {
+        self.profiles = profiles;
+    }
 }
 
 #[cfg(test)]
