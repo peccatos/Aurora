@@ -36,6 +36,27 @@ function render(root: HTMLElement) {
         <p class="hint">A static library.json on the server lists your tracks and videos (url, title, artist, durationMs, license). The server must allow CORS. Tracks appear in Search → "Your server".</p>
       </div>
 
+      <div class="eq-card" aria-labelledby="accounts-heading">
+        <header class="card-head">
+          <p class="overline" id="accounts-heading">Accounts &amp; providers</p>
+        </header>
+        <div class="settings-row">
+          <strong>Local library</strong>
+          <span class="hint ok">Available</span>
+        </div>
+        <p class="hint">Your music is stored in this app’s library. No online account is required.</p>
+        <div class="settings-row">
+          <strong>Your music server</strong>
+          <span class="hint" id="server-status">Checking configuration…</span>
+        </div>
+        <p class="hint">Configured with a library URL above. Aurora reads the public library.json; no sign-in or token is used.</p>
+        <div class="settings-row">
+          <strong>Streaming accounts</strong>
+          <span class="hint">Not connected</span>
+        </div>
+        <p class="hint">OAuth sign-in is not available yet. No provider credentials or account backend are configured, so connect buttons are intentionally not shown.</p>
+      </div>
+
       <div class="eq-card">
         <header class="card-head">
           <p class="overline">Integrity</p>
@@ -56,7 +77,13 @@ function render(root: HTMLElement) {
   // Server library URL: persisted (kv); empty = feature hidden.
   const serverUrlInput = root.querySelector<HTMLInputElement>("#server-url");
   void import("../server-library-service").then(async (svc) => {
-    if (serverUrlInput) serverUrlInput.value = await svc.getServerUrl();
+    const configuredUrl = await svc.getServerUrl();
+    if (serverUrlInput) serverUrlInput.value = configuredUrl;
+    const status = root.querySelector<HTMLElement>("#server-status");
+    if (status) {
+      status.textContent = configuredUrl ? "Configured" : "Not configured";
+      status.className = configuredUrl ? "hint ok" : "hint";
+    }
   });
   root.querySelector<HTMLButtonElement>("#server-save")?.addEventListener("click", async () => {
     const url = serverUrlInput?.value.trim() ?? "";

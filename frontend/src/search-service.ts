@@ -13,9 +13,10 @@
 
 import { platform, registerWebFile, invoke } from "./invoke";
 import { setQueue, playQueueIndex, setToast } from "./state";
+import { type ProviderAdapter, type ProviderId, type ProviderTrack, searchWithAdapter } from "./provider-registry";
 
-export interface SearchHit {
-  source: "itunes" | "deezer" | "musicbrainz";
+export interface SearchHit extends ProviderTrack {
+  source: ProviderId;
   title: string;
   artist: string;
   album: string | null;
@@ -64,6 +65,7 @@ async function searchItunes(query: string, limit = 20, artistOnly = false): Prom
   const data = (await res.json()) as { results: ITunesResult[] };
   return data.results.map((r) => ({
     source: "itunes" as const,
+    provider: "itunes" as const,
     title: r.trackName,
     artist: r.artistName,
     album: r.collectionName ?? null,
@@ -120,6 +122,7 @@ async function searchMusicbrainz(query: string, limit = 20): Promise<SearchHit[]
   const data = (await res.json()) as { recordings?: MbRecording[] };
   return (data.recordings ?? []).map((r) => ({
     source: "musicbrainz" as const,
+    provider: "musicbrainz" as const,
     title: r.title,
     artist: r.artistCredits?.map((a) => a.name).join(", ") ?? "Unknown",
     album: r.releases?.[0]?.title ?? null,
@@ -127,6 +130,7 @@ async function searchMusicbrainz(query: string, limit = 20): Promise<SearchHit[]
     artworkUrl: null,
     previewUrl: null,
     mbid: r.id,
+    externalId: r.id,
   }));
 }
 
@@ -170,6 +174,7 @@ async function searchDeezer(query: string, limit = 20): Promise<SearchHit[]> {
   const data = (await res.json()) as { data?: DeezerTrack[] };
   return (data.data ?? []).map((t) => ({
     source: "deezer" as const,
+    provider: "deezer" as const,
     title: t.title,
     artist: t.artist?.name ?? "Unknown",
     album: t.album?.title ?? null,

@@ -16,6 +16,7 @@ pub mod lufs;
 pub mod pipeline;
 pub mod resample;
 pub mod reverb;
+pub mod tools;
 
 pub use biquad::{Biquad, BiquadKind, BiquadParams};
 pub use eq::{EqBand, EqBandKind, EqChain, Equalizer};
@@ -24,3 +25,4 @@ pub use gain::{Gain, ReplayGainMode, TpdfDither};
 pub use pipeline::{DspConfig, DspPipeline, ReplayGainModeDef};
 pub use resample::Resampler;
 pub use reverb::Reverb;
+pub use tools::{Tools, ToolsParams};

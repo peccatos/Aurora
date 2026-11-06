@@ -498,7 +498,7 @@ async function render(root: HTMLElement) {
                 }
                 try {
                   await playUrlTrack(url, hit.title, hit.creator, hit.durationS ? hit.durationS * 1000 : null, [
-                    { url, title: hit.title, artist: hit.creator, license: hit.license },
+                    { url, title: hit.title, artist: hit.creator, license: hit.license, archiveIdentifier: hit.identifier, itemUrl: hit.itemUrl },
                   ], 0);
                 } catch (e) {
                   console.error("[aurora] free-track play failed:", e);

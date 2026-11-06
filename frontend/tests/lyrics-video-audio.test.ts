@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { activeLineIndex, parseLrc, parseLyricsText } from "../src/lyrics-service.ts";
+import { activeLineIndex, getLyrics, parseLrc, parseLyricsText } from "../src/lyrics-service.ts";
 import { validateVideoUrl } from "../src/video-url.ts";
 import { importDuplicateKey, validateAudioFile } from "../src/audio-import.ts";
 
@@ -21,14 +21,47 @@ describe("lyrics parsing", () => {
       { timeS: null, text: "second" },
     ]);
   });
+
+  it("fetches and selects a usable network result when storage is unavailable", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify([
+      { id: 1, trackName: "Other", artistName: "Other", duration: 100, instrumental: false, plainLyrics: "wrong", syncedLyrics: null },
+      { id: 2, trackName: "Song", artistName: "Artist", duration: 180, instrumental: false, plainLyrics: null, syncedLyrics: "[00:01.00]hello" },
+    ]), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const result = await getLyrics("Artist", "Song", 180);
+      assert.deepEqual(result?.lines, [{ timeS: 1, text: "hello" }]);
+      assert.equal(result?.synced, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("returns null for malformed or unsuccessful lyric responses", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => new Response(String(input).includes("malformed") ? "not-json" : "", { status: String(input).includes("malformed") ? 200 : 503 });
+    try {
+      assert.equal(await getLyrics("Artist", "Malformed", null), null);
+      assert.equal(await getLyrics("Artist", "Unavailable", null), null);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("safe video URLs", () => {
-  it("allows only exact HTTPS YouTube and Vimeo hosts", () => {
+  it("allows direct HTTPS YouTube and Vimeo video URLs", () => {
     assert.equal(validateVideoUrl("https://www.youtube.com/watch?v=x"), null);
+    assert.equal(validateVideoUrl("https://youtu.be/x?t=30"), null);
+    assert.equal(validateVideoUrl("https://vimeo.com/123456"), null);
     assert.equal(validateVideoUrl("http://youtube.com/watch?v=x"), "Video URL must use HTTPS");
     assert.equal(validateVideoUrl("https://evil.youtube.com/watch?v=x"), "Video host is not supported");
     assert.equal(validateVideoUrl("https://youtube.com@evil.example/"), "Credentials are not allowed in video URLs");
+    assert.equal(validateVideoUrl("https://youtube.com/"), "Enter a direct video URL");
+    assert.equal(validateVideoUrl("https://vimeo.com/channels/staffpicks"), "Enter a direct video URL");
+    assert.equal(validateVideoUrl("https://www.youtube.com/watch"), "Enter a direct video URL");
+    assert.equal(validateVideoUrl("//www.youtube.com/watch?v=x"), "Enter a complete HTTPS video URL");
+    assert.equal(validateVideoUrl(`https://youtu.be/${"x".repeat(500)}`), "Video URL must be 500 characters or fewer");
     assert.equal(validateVideoUrl(""), null);
   });
 });

@@ -23,6 +23,7 @@ import { likedIds, type LikeValue } from "../likes-service";
 import { listPlaylists, onPlaylistsChanged } from "../playlist-service";
 import { makeCarousel } from "../carousel";
 import { importDuplicateKey, validateAudioFile, audioExtension } from "../audio-import";
+import { fetchFreeTrackBytes, maxFreeImportBytes, type FreeTrackHit, isCreativeCommonsLicense } from "../free-music-service";
 
 /** Fetch one stored track by id (byte-loading helper). */
 async function getStoredTrack(id: string): Promise<StoredTrack | null> {
@@ -55,6 +56,7 @@ interface WebTrack {
   source_provider: string | null;
   video_url: string | null;
   metadata_source: string | null;
+  provenance: StoredTrack["provenance"];
   /** The web:// path registered with the kernel (after first play). */
   kernelPath: string | null;
 }
@@ -77,10 +79,11 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 export function registerWebTrack(
-  t: Omit<WebTrack, "kernelPath" | "extension" | "lufs" | "lyrics" | "lyrics_language" | "lyrics_translation" | "lyrics_translation_language" | "artwork_data_url" | "source_url" | "source_provider" | "video_url" | "metadata_source" | "genre" | "year"> & { extension?: string; lufs?: number | null; genre?: string | null; year?: number | null; lyrics?: string | null; lyrics_language?: string | null; lyrics_translation?: string | null; lyrics_translation_language?: string | null; artwork_data_url?: string | null; source_url?: string | null; source_provider?: string | null; video_url?: string | null; metadata_source?: string | null },
+  t: Omit<WebTrack, "kernelPath" | "extension" | "lufs" | "lyrics" | "lyrics_language" | "lyrics_translation" | "lyrics_translation_language" | "artwork_data_url" | "source_url" | "source_provider" | "video_url" | "metadata_source" | "provenance" | "genre" | "year"> & { extension?: string; lufs?: number | null; genre?: string | null; year?: number | null; lyrics?: string | null; lyrics_language?: string | null; lyrics_translation?: string | null; lyrics_translation_language?: string | null; artwork_data_url?: string | null; source_url?: string | null; source_provider?: string | null; video_url?: string | null; metadata_source?: string | null; provenance?: StoredTrack["provenance"] },
 ) {
   webTracks.set(t.id, {
     ...t,
+    provenance: t.provenance ?? null,
     lufs: t.lufs ?? null,
     genre: t.genre ?? null,
     year: t.year ?? null,
@@ -495,11 +498,51 @@ export async function playWebTracksByIds(playlistId: string, startIndex = 0): Pr
         source_provider: stored.source_provider ?? null,
         video_url: stored.video_url ?? null,
         metadata_source: stored.metadata_source ?? null,
+        provenance: stored.provenance ?? null,
         kernelPath: null,
       });
     }
   }
   await playWebTracks(tracks, startIndex);
+}
+
+/** Read an HTTPS server track with a deadline and bounded streaming body. */
+async function fetchBoundedHttpsBytes(url: string): Promise<Uint8Array> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: "error" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const header = res.headers.get("content-length");
+    const declared = header === null ? null : Number(header);
+    if (declared !== null && (!Number.isSafeInteger(declared) || declared < 0)) throw new Error("Audio source has an invalid size");
+    if (declared !== null && declared > maxFreeImportBytes) throw new Error("Audio source is larger than 512 MB");
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error("Audio source returned no readable body");
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxFreeImportBytes) {
+          await reader.cancel();
+          throw new Error("Audio source is larger than 512 MB");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    if (!total || (declared !== null && declared !== total)) throw new Error("Audio source size is invalid");
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return bytes;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A remote, FULL track (legal sources: the owner's server, or CC
@@ -512,21 +555,50 @@ export async function playUrlTrack(
   title: string,
   artist: string | null,
   durationMs: number | null = null,
-  queueWholeList: Array<{ url: string; title: string; artist: string | null; durationMs?: number | null; license?: string | null }> = [],
+  queueWholeList: Array<{ url: string; title: string; artist: string | null; durationMs?: number | null; license?: string | null; archiveIdentifier?: string; itemUrl?: string }> = [],
   startIndex = 0,
 ): Promise<void> {
   unlockAudio();
   const list = queueWholeList.length ? queueWholeList : [{ url, title, artist, durationMs }];
   const queue = [];
+  const loadedBytes = new Map<number, Uint8Array>();
   const playableSourceIndexes: number[] = [];
   for (const [sourceIndex, item] of list.entries()) {
     const ext = (item.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase();
     try {
-      const res = await fetch(item.url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      let bytes: Uint8Array;
+      if (item.archiveIdentifier) {
+        if (!isCreativeCommonsLicense(item.license ?? null)) throw new Error("Creative Commons license attribution is missing");
+        const hit: FreeTrackHit = { identifier: item.archiveIdentifier, title: item.title, creator: item.artist, file: item.url.split("/").pop() ?? "", durationS: item.durationMs ? item.durationMs / 1000 : null, license: item.license ?? null, itemUrl: item.itemUrl ?? `https://archive.org/details/${item.archiveIdentifier}` };
+        bytes = await fetchFreeTrackBytes(hit, item.url);
+      } else {
+        const parsed = new URL(item.url);
+        if (parsed.protocol !== "https:") throw new Error("Audio source must use HTTPS");
+        bytes = await fetchBoundedHttpsBytes(item.url);
+      }
       const id = crypto.randomUUID();
+      loadedBytes.set(sourceIndex, bytes);
       const path = await registerWebBytes(id, bytes, ext);
+      if (item.archiveIdentifier) {
+        const itemUrl = item.itemUrl ?? `https://archive.org/details/${item.archiveIdentifier}`;
+        const existing = (await getAllTracks()).find((track) =>
+          track.provenance?.provider === "archive.org" &&
+          track.provenance.identifier === item.archiveIdentifier &&
+          track.provenance.downloadUrl === item.url,
+        );
+        if (!existing) {
+          await putTrack({
+            id, name: item.title, artist: item.artist, album: null, durationMs: item.durationMs ?? null,
+            extension: ext, bytes: bytes.slice().buffer, addedAt: Date.now(), source_url: item.url,
+            source_provider: "archive.org", metadata_source: item.license ?? "Creative Commons",
+            provenance: {
+              provider: "archive.org", identifier: item.archiveIdentifier, itemUrl,
+              downloadUrl: item.url, licenseUrl: item.license!, creator: item.artist,
+              importedAt: new Date().toISOString(),
+            },
+          });
+        }
+      }
       queue.push({
         path,
         title: item.title,
@@ -549,8 +621,8 @@ export async function playUrlTrack(
     const requestedQueueIndex = firstAtOrAfter >= 0 ? firstAtOrAfter : playableSourceIndexes.length - 1;
     const requestedSourceIndex = playableSourceIndexes[requestedQueueIndex] ?? playableSourceIndexes[0] ?? 0;
     const firstItem = list[requestedSourceIndex] ?? list[0];
-    const res = await fetch(firstItem.url);
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    const bytes = loadedBytes.get(requestedSourceIndex);
+    if (!bytes) throw new Error("Audio bytes were not retained for analysis");
     const lufs = await analyzeLufs(bytes, (firstItem.url.split("?")[0].split(".").pop() ?? "mp3").toLowerCase());
     if (lufs != null) {
       (queue[requestedQueueIndex] as { replaygain_track_db: number | null }).replaygain_track_db = -14 - lufs;
@@ -1003,6 +1075,7 @@ async function render(root: HTMLElement) {
         registerWebTrack({
           id: t.id,
           name: t.name,
+          provenance: t.provenance ?? null,
           artist: t.artist,
           album: t.album,
           genre: t.genre ?? null,

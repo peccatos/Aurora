@@ -39,6 +39,16 @@ export interface StoredTrack {
   source_provider?: string | null;
   video_url?: string | null;
   metadata_source?: string | null;
+  /** JSON-serializable origin and license record for remote imports. */
+  provenance?: {
+    provider: string;
+    identifier: string;
+    itemUrl: string;
+    downloadUrl: string;
+    licenseUrl: string;
+    creator: string | null;
+    importedAt: string;
+  } | null;
   source_file_name?: string | null;
   source_file_size?: number | null;
   source_file_last_modified?: number | null;

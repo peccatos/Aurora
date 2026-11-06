@@ -24,6 +24,9 @@ pub enum CommandError {
     Metadata {
         message: String,
     },
+    Credential {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for CommandError {
@@ -35,6 +38,7 @@ impl std::fmt::Display for CommandError {
             CommandError::Library { message } => write!(f, "library error: {message}"),
             CommandError::LibraryNotOpen => write!(f, "library is not open"),
             CommandError::Metadata { message } => write!(f, "metadata error: {message}"),
+            CommandError::Credential { message } => write!(f, "credential error: {message}"),
         }
     }
 }

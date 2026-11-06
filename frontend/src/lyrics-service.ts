@@ -8,7 +8,7 @@
  * no match, the Lyrics panel says "not found", never placeholder text.
  */
 
-import { kvGet, kvPut } from "./library-db";
+import { kvGet, kvPut } from "./library-db.ts";
 
 export interface LyricLine {
   /** Line start time in seconds (null = unsynced header/footer lines). */

@@ -5,6 +5,7 @@
 //! player is `aurora-kernel`.
 
 pub mod commands;
+pub mod credentials;
 pub mod error;
 
 pub use commands::builder;

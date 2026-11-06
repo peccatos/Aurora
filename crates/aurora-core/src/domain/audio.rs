@@ -102,6 +102,8 @@ pub enum AudioTransformation {
     /// A third-party VST3 plugin is processing the signal (ADR 0004).
     /// Reported with the plugin's display name in diagnostics.
     ExternalPlugin,
+    /// Portable built-in playback tools such as balance, width, phase, and soft clip.
+    EffectTools,
 }
 
 // ---------------------------------------------------------------------------

@@ -21,15 +21,27 @@ export async function getDspProfiles(): Promise<Profiles> {
 
 export async function saveDspProfile(trackId: string, config = app.dsp): Promise<void> {
   if (!trackId.trim() || !config) throw new Error("A track is required");
-  const profiles = await getDspProfiles();
-  profiles[trackId] = clone(config);
-  if (platform === "web") await kvPut(KEY, profiles);
+  const saved = clone(config);
+  if (platform === "web") {
+    const profiles = await getDspProfiles();
+    profiles[trackId] = saved;
+    await kvPut(KEY, profiles);
+  } else {
+    await invoke("set_track_dsp", { trackPath: trackId, config: saved });
+  }
 }
 
 export async function resetDspProfile(trackId: string): Promise<void> {
-  const profiles = await getDspProfiles();
-  delete profiles[trackId];
-  if (platform === "web") await kvPut(KEY, profiles);
+  // Invalidate an in-flight profile read before changing storage. Without
+  // this, a slow apply can overwrite the reset with the deleted profile.
+  ++applyGeneration;
+  if (platform === "web") {
+    const profiles = await getDspProfiles();
+    delete profiles[trackId];
+    await kvPut(KEY, profiles);
+  } else {
+    await invoke("clear_track_dsp", { trackPath: trackId });
+  }
   if (app.dsp && app.selectedPath === trackId) await invoke("set_dsp", { config: clone(app.dsp) });
 }
 

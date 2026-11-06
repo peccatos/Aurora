@@ -35,6 +35,7 @@ pub struct PlayerKernel {
     /// Persisted DSP configuration: the UI edits this and every new
     /// playback picks it up.
     pub dsp: Mutex<aurora_dsp::DspConfig>,
+    pub track_dsp: Mutex<crate::dsp::DspProfileResolver>,
     /// Playback queue with the current index.
     pub queue: Mutex<TrackQueue>,
     /// Track library (SQLite + scanner). None until `open_library` runs.
@@ -71,6 +72,7 @@ impl PlayerKernel {
             events: Arc::new(EventSubscribers::new()),
             engine: Mutex::new(PlaybackEngine::new()),
             dsp: Mutex::new(aurora_dsp::DspConfig::default()),
+            track_dsp: Mutex::new(crate::dsp::DspProfileResolver::default()),
             queue: Mutex::new(TrackQueue::default()),
             #[cfg(not(target_family = "wasm"))]
             library: tokio::sync::Mutex::new(None),
@@ -160,7 +162,12 @@ impl PlayerKernel {
     pub fn play_track(&self, request: PlayRequest) -> Result<PlaybackStatus, KernelError> {
         let device = self.resolve_device(request.device.as_deref())?;
         let dsp = if request.dsp == aurora_dsp::DspConfig::default() {
-            self.dsp.lock().map_err(|_| KernelError::Poisoned)?.clone()
+            let global = self.dsp.lock().map_err(|_| KernelError::Poisoned)?.clone();
+            self.track_dsp
+                .lock()
+                .map_err(|_| KernelError::Poisoned)?
+                .resolve(&request.path, &global)
+                .clone()
         } else {
             request.dsp
         };
@@ -219,7 +226,13 @@ impl PlayerKernel {
                 .map_err(|_| KernelError::Poisoned)?
                 .as_deref(),
         )?;
-        let dsp = self.dsp.lock().map_err(|_| KernelError::Poisoned)?.clone();
+        let global = self.dsp.lock().map_err(|_| KernelError::Poisoned)?.clone();
+        let dsp = self
+            .track_dsp
+            .lock()
+            .map_err(|_| KernelError::Poisoned)?
+            .resolve(&track.path, &global)
+            .clone();
         let mut engine = self.engine.lock().map_err(|_| KernelError::Poisoned)?;
         engine.stop();
         let rg = track
@@ -279,6 +292,27 @@ impl PlayerKernel {
     pub fn get_dsp(&self) -> Result<aurora_dsp::DspConfig, KernelError> {
         let dsp = self.dsp.lock().map_err(|_| KernelError::Poisoned)?;
         Ok(dsp.clone())
+    }
+
+    pub fn set_track_dsp(
+        &self,
+        track_path: String,
+        config: aurora_dsp::DspConfig,
+    ) -> Result<(), KernelError> {
+        self.track_dsp
+            .lock()
+            .map_err(|_| KernelError::Poisoned)?
+            .set(track_path, config);
+        Ok(())
+    }
+
+    pub fn clear_track_dsp(&self, track_path: &str) -> Result<bool, KernelError> {
+        Ok(self
+            .track_dsp
+            .lock()
+            .map_err(|_| KernelError::Poisoned)?
+            .remove(track_path)
+            .is_some())
     }
 
     pub fn set_dsp(

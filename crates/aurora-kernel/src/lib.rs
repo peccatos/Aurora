@@ -13,6 +13,7 @@
 
 pub mod artwork;
 pub mod decks;
+pub mod dsp;
 pub mod dtos;
 pub mod error;
 pub mod events;
@@ -24,6 +25,7 @@ pub mod queue;
 pub mod watch;
 
 pub use decks::Deck;
+pub use dsp::DspProfileResolver;
 pub use dtos::*;
 pub use error::KernelError;
 pub use events::{EventSubscribers, KernelEvent, Subscription};

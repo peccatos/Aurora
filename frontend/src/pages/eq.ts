@@ -35,6 +35,7 @@ function defaultDsp(): DspConfig {
     replaygain: "off",
     reverb: { room_size: 0.5, damping: 0.3, wet: 0, width: 1, input_lowpass: 0 },
     speed: 1,
+    tools: { balance: 0, phase_invert_left: false, stereo_width: 1, soft_clip: 0 },
   };
 }
 
@@ -266,6 +267,7 @@ export async function loadDsp() {
       const saved = await kvGet<DspConfig>("dsp");
       if (saved) {
         app.dsp = saved;
+        app.dsp.tools ??= { balance: 0, phase_invert_left: false, stereo_width: 1, soft_clip: 0 };
         try {
           await invoke("set_dsp", { config: saved });
         } catch {

@@ -32,6 +32,9 @@ pub struct DspConfig {
     /// as if it were at r*speed.
     #[serde(default = "default_speed")]
     pub speed: f32,
+    /// Portable Orchard-inspired playback tools. Defaults to bypassed.
+    #[serde(default)]
+    pub tools: crate::tools::ToolsParams,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -56,6 +59,7 @@ impl Default for DspConfig {
             replaygain: ReplayGainModeDef::Off,
             reverb: crate::reverb::ReverbParams::default(),
             speed: 1.0,
+            tools: crate::tools::ToolsParams::default(),
         }
     }
 }
@@ -74,6 +78,7 @@ impl DspConfig {
             && self.replaygain == ReplayGainModeDef::Off
             && self.reverb.is_bypassed()
             && (self.speed - 1.0).abs() < 1e-6
+            && self.tools.is_bypassed()
     }
 
     /// All transformations this configuration reports when active.
@@ -82,11 +87,14 @@ impl DspConfig {
         if let Some(t) = self.eq.transformation() {
             out.push(t);
         }
-        if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
-            out.push(AudioTransformation::Gain);
-        }
         if !self.reverb.is_bypassed() {
             out.push(AudioTransformation::Reverb);
+        }
+        if !self.tools.is_bypassed() {
+            out.push(AudioTransformation::EffectTools);
+        }
+        if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
+            out.push(AudioTransformation::Gain);
         }
         if (self.speed - 1.0).abs() > 1e-6 {
             out.push(AudioTransformation::Resampling);
@@ -103,6 +111,7 @@ impl DspConfig {
 pub struct DspPipeline {
     eq_chain: Option<crate::eq::EqChain>,
     reverb: Option<crate::reverb::Reverb>,
+    tools: Option<crate::tools::Tools>,
     speed_active: bool,
     volume: Gain,
     /// Interleaved samples carried over between chunks: the resampler
@@ -192,6 +201,12 @@ impl DspPipeline {
         // device rate t. When only speed is active and t == r, the
         // output is 1/s times the input per second — 2.0x speed halves
         // the output, exactly "playing twice as fast".
+        let tools = if config.tools.is_bypassed() {
+            None
+        } else {
+            Some(crate::tools::Tools::new(config.tools))
+        };
+
         let speed = config.speed.clamp(0.5, 2.0);
         let speed_active = (speed - 1.0).abs() > 1e-6;
 
@@ -230,6 +245,7 @@ impl DspPipeline {
         Ok(Self {
             eq_chain,
             reverb,
+            tools,
             speed_active,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
@@ -255,6 +271,10 @@ impl DspPipeline {
 
         if let Some(rv) = self.reverb.as_mut() {
             rv.process_interleaved(interleaved);
+        }
+
+        if let Some(tools) = self.tools.as_mut() {
+            tools.process_interleaved(interleaved, self.channels);
         }
 
         // ReplayGain before volume: the tag sets loudness, volume trims it.
@@ -368,6 +388,9 @@ impl DspPipeline {
         if self.resampler.is_some() {
             out.push(AudioTransformation::Resampling);
         }
+        if self.tools.is_some() {
+            out.push(AudioTransformation::EffectTools);
+        }
         out
     }
 
@@ -387,6 +410,7 @@ impl DspPipeline {
         self.eq_chain.is_none()
             && !self.speed_active
             && self.reverb.is_none()
+            && self.tools.is_none()
             && self.volume.is_unity()
             && self.replaygain_db.is_none()
             && self.resampler.is_none()
@@ -512,6 +536,25 @@ mod tests {
         );
         assert_eq!(pl.output_format().sample_rate, 48_000);
         assert_eq!(pl.output_format().sample_format, SampleFormat::Float);
+    }
+
+    #[test]
+    fn active_tools_are_compiled_applied_and_reported() {
+        let mut config = DspConfig::default();
+        config.tools.balance = 1.0;
+        config.tools.soft_clip = 0.5;
+        let source = f32_stereo(44_100);
+        let mut pipeline = DspPipeline::compile(&config, source, None, None).expect("compile");
+        assert!(
+            pipeline
+                .transformations()
+                .contains(&AudioTransformation::EffectTools)
+        );
+        assert!(!pipeline.is_passthrough());
+        let mut samples = vec![1.0, 0.5];
+        let output = pipeline.process(&mut samples);
+        assert!(output[0].abs() < 1e-6);
+        assert!(output[1].is_finite() && output[1] > 0.0);
     }
 
     #[test]

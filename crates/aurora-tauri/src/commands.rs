@@ -50,6 +50,40 @@ fn map_err(e: KernelError) -> CommandError {
 type K<'a> = State<'a, AppState>;
 
 // ---------------------------------------------------------------------------
+// Native OAuth credential metadata
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn oauth_credential_status(
+    provider: String,
+    account_id: String,
+) -> Result<crate::credentials::CredentialStatus, CommandError> {
+    crate::credentials::status(&provider, &account_id).map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn store_oauth_credential(
+    provider: String,
+    account_id: String,
+    secret: String,
+) -> Result<(), CommandError> {
+    crate::credentials::store(&provider, &account_id, &secret).map_err(|e| {
+        CommandError::Credential {
+            message: e.to_string(),
+        }
+    })
+}
+
+#[tauri::command]
+pub fn remove_oauth_credential(provider: String, account_id: String) -> Result<(), CommandError> {
+    crate::credentials::remove(&provider, &account_id).map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Version / playback basics
 // ---------------------------------------------------------------------------
 
@@ -105,6 +139,23 @@ pub fn seek(position_s: f64, state: K<'_>) -> Result<PlaybackStatus, CommandErro
 #[tauri::command]
 pub fn play_track(request: PlayRequest, state: K<'_>) -> Result<PlaybackStatus, CommandError> {
     state.kernel.play_track(request).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn set_track_dsp(
+    track_path: String,
+    config: aurora_dsp::DspConfig,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    state
+        .kernel
+        .set_track_dsp(track_path, config)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn clear_track_dsp(track_path: String, state: K<'_>) -> Result<bool, CommandError> {
+    state.kernel.clear_track_dsp(&track_path).map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +855,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             app_version,
+            oauth_credential_status,
+            store_oauth_credential,
+            remove_oauth_credential,
             app_name,
             playback_modes,
             library_status,
@@ -830,6 +884,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             playback_status,
             playback_position,
             play_track,
+            set_track_dsp,
+            clear_track_dsp,
             get_dsp,
             set_dsp,
             seek,

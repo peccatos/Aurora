@@ -27,6 +27,12 @@ export interface DspConfig {
   replaygain: "off" | "track" | "album";
   reverb: ReverbParams;
   speed: number;
+  tools: {
+    balance: number;
+    phase_invert_left: boolean;
+    stereo_width: number;
+    soft_clip: number;
+  };
 }
 
 export interface QueueTrack {
