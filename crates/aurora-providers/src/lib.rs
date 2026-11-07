@@ -213,6 +213,7 @@ impl Coordinator {
     /// Completes OAuth without exposing credentials. The pending session is consumed only
     /// after token exchange, profile lookup, and storage all succeed. A failed exchange or
     /// storage operation leaves it available for a corrected retry.
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_with_exchange(
         &self,
         provider: &str,
@@ -1275,6 +1276,7 @@ pub mod profile {
 }
 
 /// Completes the native code exchange and profile lookup. The returned token set must stay native.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_authorization<T: profile::Transport>(
     coordinator: &Coordinator,
     provider: &str,
@@ -1571,14 +1573,12 @@ pub mod playlist {
             items: p
                 .items
                 .into_iter()
-                .filter_map(|x| {
-                    Some(RemotePlaylist {
-                        provider: RemoteProvider::Youtube,
-                        id: x.id,
-                        name: x.snippet.title,
-                        tracks: vec![],
-                        revision: None,
-                    })
+                .map(|x| RemotePlaylist {
+                    provider: RemoteProvider::Youtube,
+                    id: x.id,
+                    name: x.snippet.title,
+                    tracks: vec![],
+                    revision: None,
                 })
                 .collect(),
             next_cursor: p.next_page_token,
