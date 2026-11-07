@@ -2,7 +2,7 @@
 
 import { invoke, platform } from "../invoke";
 import { PROVIDERS } from "../provider-registry";
-import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, refreshAccountStatus, startAuthorization } from "../accounts";
+import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, markAuthorizationPending, markAuthorizationTimeout, recordAuthorizationError, refreshAccountStatus, startAuthorization } from "../accounts";
 import { pickAudioFiles } from "../file-picker";
 import type { Page } from "../router";
 import { app, loadStatus, setQueue, setToast, trackToQueueTrack } from "../state";
@@ -84,10 +84,10 @@ function render(root: HTMLElement, syncAccounts = true) {
       .map((provider) => {
         const account = getAccountRecord(provider.id);
         const configured = hasProviderAuthAdapter(provider.id);
-        const state = account?.state === "connected" ? "Connected" : account?.state === "error" ? `Error: ${account.lastError ?? "authorization failed"}` : "Not connected";
+        const state = account?.state === "connected" ? "Connected" : account?.state === "error" ? `Error: ${account.lastError ?? "authorization failed"}` : account?.state === "timeout" ? "Timed out — try again" : account?.state === "pending" ? "Waiting for browser sign-in…" : "Not connected";
         const action = account?.state === "connected"
           ? `<button class="btn" data-account-action="disconnect" data-provider="${provider.id}" type="button">Disconnect</button>`
-          : `<button class="btn" data-account-action="connect" data-provider="${provider.id}" type="button" ${configured ? "" : "disabled"}>${configured ? "Connect" : "Adapter unavailable"}</button>`;
+          : `<button class="btn" data-account-action="connect" data-provider="${provider.id}" type="button" ${configured ? "" : "disabled"}>${configured ? "Connect" : "Adapter unavailable"}</button>${configured ? ` <button class="btn" data-account-action="check" data-provider="${provider.id}" type="button">Check connection</button>` : ""}`;
         return `<div class="settings-row account-card"><div><strong>${provider.name}</strong><div class="hint">${state}</div></div><div>${action}</div></div>`;
       }).join("");
     accountCards.addEventListener("click", async (event) => {
@@ -99,8 +99,6 @@ function render(root: HTMLElement, syncAccounts = true) {
         if (button.dataset.accountAction === "connect") {
           const url = await startAuthorization(provider);
           if (platform !== "tauri") throw new Error("Provider authorization is available only in the desktop app");
-          // Keep Aurora mounted while OAuth completes in the system browser.
-          // The callback listener belongs to the native runtime, not this webview.
           const link = document.createElement("a");
           link.href = url;
           link.target = "_blank";
@@ -111,7 +109,24 @@ function render(root: HTMLElement, syncAccounts = true) {
             status.replaceChildren(link);
             status.className = "hint";
           }
+          markAuthorizationPending(provider);
+          const deadline = Date.now() + 2 * 60 * 1000;
+          const poll = async (): Promise<void> => {
+            try {
+              const account = await refreshAccountStatus(provider);
+              if (account?.state === "connected") { render(root, false); return; }
+              if (Date.now() >= deadline) { markAuthorizationTimeout(provider); render(root, false); return; }
+              window.setTimeout(() => void poll(), 1500);
+            } catch (error) {
+              recordAuthorizationError(provider, String(error));
+              render(root, false);
+            }
+          };
+          void poll();
           button.disabled = false;
+        } else if (button.dataset.accountAction === "check") {
+          await refreshAccountStatus(provider);
+          render(root, false);
         } else {
           await disconnectAccount(provider);
           render(root);

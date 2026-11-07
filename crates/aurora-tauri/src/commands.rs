@@ -120,6 +120,14 @@ fn map_err(e: KernelError) -> CommandError {
 
 type K<'a> = State<'a, AppState>;
 
+fn canonical_provider(provider: &str) -> Result<String, CommandError> {
+    aurora_providers::canonical_provider_id(provider)
+        .map(str::to_owned)
+        .ok_or_else(|| CommandError::Provider {
+            message: "provider is not configured".into(),
+        })
+}
+
 #[tauri::command]
 pub fn provider_config_status(
     state: K<'_>,
@@ -132,6 +140,7 @@ pub async fn oauth_begin(
     provider: String,
     state: K<'_>,
 ) -> Result<aurora_providers::AuthorizationStart, CommandError> {
+    let provider = canonical_provider(&provider)?;
     state
         .providers
         .begin(&provider, &state.oauth)
@@ -158,11 +167,7 @@ pub async fn provider_account_status(
     provider: String,
     state: K<'_>,
 ) -> Result<Option<ProviderAccountMetadata>, CommandError> {
-    if provider.trim().is_empty() {
-        return Err(CommandError::Provider {
-            message: "provider is empty".into(),
-        });
-    }
+    let provider = canonical_provider(&provider)?;
     Ok(state.oauth_metadata.lock().await.get(&provider).cloned())
 }
 
@@ -171,12 +176,15 @@ pub async fn oauth_poll(
     provider: String,
     state: K<'_>,
 ) -> Result<Option<ProviderAccountMetadata>, CommandError> {
-    let Some((redirect_uri, callback)) = state.oauth.peek_completed(&provider).await else {
+    let provider = canonical_provider(&provider)?;
+    let Some((callback_state, redirect_uri, callback)) =
+        state.oauth.peek_completed(&provider).await
+    else {
         return Ok(state.oauth_metadata.lock().await.get(&provider).cloned());
     };
-    // The callback is single-use; consume it before exchanging the code.
-    state.oauth.clear_completed(&provider).await;
     let aurora_providers::CallbackResult::Code { code, verifier } = callback else {
+        // A denial is terminal, unlike exchange/profile/storage failures.
+        state.oauth.clear_completed(&callback_state).await;
         return Err(CommandError::Provider {
             message: "authorization denied".into(),
         });
@@ -243,7 +251,7 @@ pub async fn oauth_poll(
         .lock()
         .await
         .insert(provider, metadata.clone());
-    state.oauth.clear_completed(&metadata.provider).await;
+    state.oauth.clear_completed(&callback_state).await;
     Ok(Some(metadata))
 }
 
@@ -253,13 +261,9 @@ pub async fn provider_disconnect(
     account_id: Option<String>,
     state: K<'_>,
 ) -> Result<(), CommandError> {
-    if provider.trim().is_empty() {
-        return Err(CommandError::Provider {
-            message: "provider is empty".into(),
-        });
-    }
+    let provider = canonical_provider(&provider)?;
     state.oauth.disconnect(&provider).await;
-    state.oauth.clear_completed(&provider).await;
+    state.oauth.clear_completed_provider(&provider).await;
     let stored_account_id = state.oauth_accounts.lock().await.remove(&provider);
     let account_id = stored_account_id.or(account_id);
     if let Some(account_id) = account_id {
@@ -278,6 +282,7 @@ pub fn provider_capabilities(
     provider: String,
     state: K<'_>,
 ) -> Result<aurora_providers::ProviderStatus, CommandError> {
+    let provider = canonical_provider(&provider)?;
     state
         .providers
         .status(&provider)
