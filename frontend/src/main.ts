@@ -5,8 +5,10 @@
 
 import { invoke, platform } from "./invoke";
 import { registerDesktopProviderAdapters } from "./desktop-provider-adapter";
+import { registerWebProviderAdapters } from "./web-provider-adapter";
 
 registerDesktopProviderAdapters();
+registerWebProviderAdapters();
 import { onKernelEvent } from "./invoke";
 const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
   import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));

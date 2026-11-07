@@ -98,15 +98,18 @@ function render(root: HTMLElement, syncAccounts = true) {
       try {
         if (button.dataset.accountAction === "connect") {
           const url = await startAuthorization(provider);
-          if (platform !== "tauri") throw new Error("Provider authorization is available only in the desktop app");
           const link = document.createElement("a");
           link.href = url;
           link.target = "_blank";
           link.rel = "noopener noreferrer";
           link.textContent = "Continue sign-in in your browser";
+          const opened = platform === "web" ? window.open(url, "_blank", "noopener,noreferrer") : null;
           const status = root.querySelector<HTMLElement>("#account-callback-status");
           if (status) {
-            status.replaceChildren(link);
+            status.replaceChildren(
+              document.createTextNode(platform === "web" && opened ? "Sign-in opened in a secure provider window. " : platform === "web" ? "Popup blocked — " : "Continue sign-in in your browser: "),
+              link,
+            );
             status.className = "hint";
           }
           markAuthorizationPending(provider);
@@ -139,11 +142,11 @@ function render(root: HTMLElement, syncAccounts = true) {
     });
   }
 
-  // Native OAuth owns the callback listener and token exchange. Web never
-  // parses callback query parameters or receives authorization codes.
+  // The backend/native adapter owns callback handling and token exchange. The
+  // page never parses callback query parameters or receives authorization codes.
   const callbackStatus = root.querySelector<HTMLElement>("#account-callback-status");
-  if (callbackStatus && platform === "web") {
-    callbackStatus.textContent = "Online provider sign-in is available in the Aurora desktop app.";
+  if (callbackStatus && platform === "web" && !hasProviderAuthAdapter("spotify") && !hasProviderAuthAdapter("youtube-music")) {
+    callbackStatus.textContent = "Online provider sign-in is not configured for this deployment.";
     callbackStatus.className = "hint";
   }
 
