@@ -4,6 +4,9 @@
  *  routes in ./router (hash-based: #/player, #/queue, …). */
 
 import { invoke, platform } from "./invoke";
+import { registerDesktopProviderAdapters } from "./desktop-provider-adapter";
+
+registerDesktopProviderAdapters();
 import { onKernelEvent } from "./invoke";
 const open = (...a: Parameters<typeof import("@tauri-apps/plugin-dialog")["open"]>) =>
   import("@tauri-apps/plugin-dialog").then((m) => m.open(...a));
@@ -253,7 +256,7 @@ shell!.innerHTML = `
       <button class="nav-item" data-route="settings" type="button">Settings</button>
       <div class="rail-foot">
         <span class="rail-meta" id="rail-count"></span>
-        <span class="rail-ver">Aurora 0.1.0</span>
+        <span class="rail-ver">Aurora 0.2.0</span>
       </div>
     </nav>
 

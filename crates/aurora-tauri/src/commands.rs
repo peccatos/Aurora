@@ -3,7 +3,8 @@
 //! One command = one kernel call + DTO translation. No business logic
 //! lives here: the music player IS `aurora-kernel`.
 
-use std::sync::Arc;
+use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 use aurora_kernel::{
     BitPerfectVerdict, DeckDto, ExclusivePlayResult, ExclusiveProbe, ImportReport, KernelError,
@@ -16,16 +17,86 @@ use tauri_plugin_global_shortcut::ShortcutState;
 
 use crate::error::CommandError;
 
+struct NativeTokenTransport {
+    client: reqwest::Client,
+}
+
+impl NativeTokenTransport {
+    fn new() -> Result<Self, CommandError> {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map(|client| Self { client })
+            .map_err(|e| CommandError::Provider {
+                message: format!("native HTTP client unavailable: {e}"),
+            })
+    }
+}
+
+impl aurora_providers::token::Transport for NativeTokenTransport {
+    fn send<'a>(
+        &'a self,
+        request: aurora_providers::token::TokenRequest,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        aurora_providers::token::TokenResponse,
+                        aurora_providers::token::TransportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let access = request
+                .form
+                .iter()
+                .find(|(key, _)| key == "access_token")
+                .map(|(_, value)| value);
+            let response = if let Some(access) = access {
+                self.client
+                    .get(request.endpoint)
+                    .bearer_auth(access)
+                    .send()
+                    .await
+            } else {
+                self.client
+                    .post(request.endpoint)
+                    .form(&request.form)
+                    .send()
+                    .await
+            }
+            .map_err(|_| aurora_providers::token::TransportError::Failed)?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| aurora_providers::token::TransportError::Failed)?
+                .to_vec();
+            Ok(aurora_providers::token::TokenResponse { status, body })
+        })
+    }
+}
+
 /// Managed application state: the kernel + the shell-side pieces that
 /// are Tauri-specific (nothing but the GUI session, which is native).
 pub struct AppState {
     pub kernel: Arc<PlayerKernel>,
+    pub providers: aurora_providers::ProviderRegistry,
+    pub oauth: aurora_providers::Coordinator,
+    pub oauth_accounts: Mutex<HashMap<String, String>>,
+    pub oauth_metadata: Mutex<HashMap<String, ProviderAccountMetadata>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             kernel: Arc::new(PlayerKernel::new()),
+            providers: aurora_providers::ProviderRegistry::from_environment(),
+            oauth: aurora_providers::Coordinator::default(),
+            oauth_accounts: Mutex::new(HashMap::new()),
+            oauth_metadata: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -49,6 +120,172 @@ fn map_err(e: KernelError) -> CommandError {
 
 type K<'a> = State<'a, AppState>;
 
+#[tauri::command]
+pub fn provider_config_status(
+    state: K<'_>,
+) -> Result<Vec<aurora_providers::ProviderStatus>, CommandError> {
+    Ok(state.providers.statuses())
+}
+
+#[tauri::command]
+pub async fn oauth_begin(
+    provider: String,
+    state: K<'_>,
+) -> Result<aurora_providers::AuthorizationStart, CommandError> {
+    state
+        .providers
+        .begin(&provider, &state.oauth)
+        .await
+        .map_err(|e| CommandError::Provider {
+            message: e.to_string(),
+        })
+}
+
+/// Sanitized account metadata crossing IPC. Secrets, authorization codes, and
+/// PKCE material are intentionally absent from this contract.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderAccountMetadata {
+    pub provider: String,
+    pub subject: String,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+    pub capabilities: Vec<String>,
+    pub connected_at: String,
+}
+
+#[tauri::command]
+pub async fn provider_account_status(
+    provider: String,
+    state: K<'_>,
+) -> Result<Option<ProviderAccountMetadata>, CommandError> {
+    if provider.trim().is_empty() {
+        return Err(CommandError::Provider {
+            message: "provider is empty".into(),
+        });
+    }
+    Ok(state.oauth_metadata.lock().await.get(&provider).cloned())
+}
+
+#[tauri::command]
+pub async fn oauth_poll(
+    provider: String,
+    state: K<'_>,
+) -> Result<Option<ProviderAccountMetadata>, CommandError> {
+    let Some((redirect_uri, callback)) = state.oauth.peek_completed(&provider).await else {
+        return Ok(state.oauth_metadata.lock().await.get(&provider).cloned());
+    };
+    // The callback is single-use; consume it before exchanging the code.
+    state.oauth.clear_completed(&provider).await;
+    let aurora_providers::CallbackResult::Code { code, verifier } = callback else {
+        return Err(CommandError::Provider {
+            message: "authorization denied".into(),
+        });
+    };
+    let config = state
+        .providers
+        .config(&provider)
+        .ok_or_else(|| CommandError::Provider {
+            message: "provider is not configured".into(),
+        })?;
+    let transport = Arc::new(NativeTokenTransport::new()?);
+    let client_secret = std::env::var(match provider.as_str() {
+        "spotify" => "AURORA_SPOTIFY_CLIENT_SECRET",
+        "youtube-music" => "AURORA_YOUTUBE_MUSIC_CLIENT_SECRET",
+        _ => {
+            return Err(CommandError::Provider {
+                message: "provider is not configured".into(),
+            });
+        }
+    })
+    .unwrap_or_default();
+    let client = aurora_providers::token::Client::new(
+        config,
+        client_secret,
+        transport,
+        Duration::from_secs(30),
+    )
+    .map_err(|e| CommandError::Provider {
+        message: e.to_string(),
+    })?;
+    let tokens = client
+        .exchange_code(&code, &redirect_uri, &verifier)
+        .await
+        .map_err(|e| CommandError::Provider {
+            message: e.to_string(),
+        })?;
+    let (profile, tokens) =
+        client
+            .profile_with_refresh(tokens)
+            .await
+            .map_err(|e| CommandError::Provider {
+                message: e.to_string(),
+            })?;
+    crate::credentials::store_token_set(&provider, &profile.account_id, &tokens).map_err(|e| {
+        CommandError::Credential {
+            message: e.to_string(),
+        }
+    })?;
+    let metadata = ProviderAccountMetadata {
+        provider: provider.clone(),
+        subject: profile.account_id.clone(),
+        display_name: profile.account_id,
+        avatar_url: None,
+        capabilities: vec!["identity".into()],
+        connected_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state
+        .oauth_accounts
+        .lock()
+        .await
+        .insert(provider.clone(), metadata.subject.clone());
+    state
+        .oauth_metadata
+        .lock()
+        .await
+        .insert(provider, metadata.clone());
+    state.oauth.clear_completed(&metadata.provider).await;
+    Ok(Some(metadata))
+}
+
+#[tauri::command]
+pub async fn provider_disconnect(
+    provider: String,
+    account_id: Option<String>,
+    state: K<'_>,
+) -> Result<(), CommandError> {
+    if provider.trim().is_empty() {
+        return Err(CommandError::Provider {
+            message: "provider is empty".into(),
+        });
+    }
+    state.oauth.disconnect(&provider).await;
+    state.oauth.clear_completed(&provider).await;
+    let stored_account_id = state.oauth_accounts.lock().await.remove(&provider);
+    let account_id = stored_account_id.or(account_id);
+    if let Some(account_id) = account_id {
+        crate::credentials::remove(&provider, &account_id).map_err(|e| {
+            CommandError::Credential {
+                message: e.to_string(),
+            }
+        })?;
+    }
+    state.oauth_metadata.lock().await.remove(&provider);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn provider_capabilities(
+    provider: String,
+    state: K<'_>,
+) -> Result<aurora_providers::ProviderStatus, CommandError> {
+    state
+        .providers
+        .status(&provider)
+        .map_err(|e| CommandError::Provider {
+            message: e.to_string(),
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Native OAuth credential metadata
 // ---------------------------------------------------------------------------
@@ -60,19 +297,6 @@ pub fn oauth_credential_status(
 ) -> Result<crate::credentials::CredentialStatus, CommandError> {
     crate::credentials::status(&provider, &account_id).map_err(|e| CommandError::Credential {
         message: e.to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn store_oauth_credential(
-    provider: String,
-    account_id: String,
-    secret: String,
-) -> Result<(), CommandError> {
-    crate::credentials::store(&provider, &account_id, &secret).map_err(|e| {
-        CommandError::Credential {
-            message: e.to_string(),
-        }
     })
 }
 
@@ -860,8 +1084,13 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             app_version,
+            provider_disconnect,
+            provider_account_status,
+            provider_config_status,
+            oauth_begin,
+            oauth_poll,
+            provider_capabilities,
             oauth_credential_status,
-            store_oauth_credential,
             remove_oauth_credential,
             app_name,
             playback_modes,

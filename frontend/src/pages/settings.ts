@@ -2,13 +2,13 @@
 
 import { invoke, platform } from "../invoke";
 import { PROVIDERS } from "../provider-registry";
-import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, startAuthorization } from "../accounts";
+import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, refreshAccountStatus, startAuthorization } from "../accounts";
 import { pickAudioFiles } from "../file-picker";
 import type { Page } from "../router";
 import { app, loadStatus, setQueue, setToast, trackToQueueTrack } from "../state";
 import type { BitPerfectVerdict, DeviceDto, ExclusivePlayResult, PlaybackStatus, QueueDto } from "../types";
 
-function render(root: HTMLElement) {
+function render(root: HTMLElement, syncAccounts = true) {
   root.innerHTML = `
     <section class="page">
       <header class="page-head">
@@ -76,6 +76,9 @@ function render(root: HTMLElement) {
 
   const accountCards = root.querySelector<HTMLElement>("#account-cards");
   if (accountCards) {
+    if (syncAccounts) void Promise.all(PROVIDERS.filter((provider) => hasProviderAuthAdapter(provider.id)).map((provider) => refreshAccountStatus(provider.id)))
+      .then(() => render(root, false))
+      .catch(() => { /* native status is optional; remain disconnected */ });
     accountCards.innerHTML = PROVIDERS
       .filter((provider) => provider.availability !== "unsupported")
       .map((provider) => {
@@ -95,7 +98,20 @@ function render(root: HTMLElement) {
       try {
         if (button.dataset.accountAction === "connect") {
           const url = await startAuthorization(provider);
-          window.location.assign(url);
+          if (platform !== "tauri") throw new Error("Provider authorization is available only in the desktop app");
+          // Keep Aurora mounted while OAuth completes in the system browser.
+          // The callback listener belongs to the native runtime, not this webview.
+          const link = document.createElement("a");
+          link.href = url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = "Continue sign-in in your browser";
+          const status = root.querySelector<HTMLElement>("#account-callback-status");
+          if (status) {
+            status.replaceChildren(link);
+            status.className = "hint";
+          }
+          button.disabled = false;
         } else {
           await disconnectAccount(provider);
           render(root);
@@ -108,16 +124,12 @@ function render(root: HTMLElement) {
     });
   }
 
-  // Report callback errors without treating a browser callback as a token exchange.
+  // Native OAuth owns the callback listener and token exchange. Web never
+  // parses callback query parameters or receives authorization codes.
   const callbackStatus = root.querySelector<HTMLElement>("#account-callback-status");
-  const callbackParams = new URLSearchParams(window.location.search);
-  const callbackError = callbackParams.get("error");
-  if (callbackStatus && callbackError) {
-    callbackStatus.textContent = `Authorization failed: ${callbackParams.get("error_description") ?? callbackError}`;
-    callbackStatus.className = "hint warn";
-  } else if (callbackStatus && callbackParams.has("code")) {
-    callbackStatus.textContent = "Authorization callback received, but no provider adapter is configured to exchange it. No account was connected.";
-    callbackStatus.className = "hint warn";
+  if (callbackStatus && platform === "web") {
+    callbackStatus.textContent = "Online provider sign-in is available in the Aurora desktop app.";
+    callbackStatus.className = "hint";
   }
 
   // Server library URL: persisted (kv); empty = feature hidden.

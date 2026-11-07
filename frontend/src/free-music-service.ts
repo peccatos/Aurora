@@ -45,14 +45,16 @@ export function validateArchiveDownloadUrl(value: string, identifier?: string): 
     return "Audio source host is not allowed";
   }
   const match = url.pathname.match(/^\/download\/([^/]+)\/(.+)$/);
-  if (!match || match[2].includes("/")) {
+  if (!match) {
     return "Audio source path is not an archive download";
   }
   try {
-    // URL.pathname preserves percent escapes, so reject encoded path separators
-    // before validating the apparently single-file download path.
+    // Archive filenames may contain directory components. Decode only to
+    // reject traversal; the fixed archive.org host and download prefix still
+    // constrain the request to the item identified above.
     const decodedFile = decodeURIComponent(match[2]);
-    if (decodedFile.includes("/") || decodedFile.includes("\\")) {
+    const segments = decodedFile.split(/[\\/]/);
+    if (decodedFile.includes("\\0") || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
       return "Audio source path is not an archive download";
     }
   } catch {

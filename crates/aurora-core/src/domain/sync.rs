@@ -309,9 +309,18 @@ pub fn plan_sync(
         })
         .collect();
     let remote_ids: Vec<_> = remote.tracks.iter().map(|track| track.id.clone()).collect();
+    // Newly added tracks do not have provider-assigned IDs yet, so a reorder
+    // operation built from the pre-write remote snapshot cannot describe the
+    // final playlist and may move existing tracks into the wrong slots. Their
+    // Add positions are authoritative; let the next sync reorder once IDs are
+    // known.
+    let has_additions = operations
+        .iter()
+        .any(|operation| matches!(operation, SyncOperation::Add { .. }));
     if conflict != ConflictPolicy::RemoteWins
         && desired_ids != remote_ids
         && !desired_ids.is_empty()
+        && !has_additions
     {
         if !capabilities.can_reorder_tracks {
             return Err(SyncError::Capability("reorder_tracks"));
@@ -341,6 +350,10 @@ impl AppliedOperations {
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
     }
 }
 

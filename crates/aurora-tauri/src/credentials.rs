@@ -1,9 +1,9 @@
 //! Native credential boundary for provider OAuth secrets.
 //!
-//! Secrets are kept exclusively in the operating-system credential store.
-//! This module deliberately has no read-secret operation: Tauri callers can
-//! store, remove, and inspect presence only.
+//! Token sets are serialized only inside this module and stored in the OS
+//! keyring. No command accepts or returns credential material.
 
+use aurora_providers::token::TokenSet;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -15,6 +15,8 @@ pub enum CredentialError {
     Store(String),
     #[error("provider and account identifiers must not be empty")]
     InvalidIdentifier,
+    #[error("stored credential is invalid")]
+    InvalidCredential,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,19 +34,25 @@ fn entry(provider: &str, account_id: &str) -> Result<keyring::Entry, CredentialE
     keyring::Entry::new(SERVICE, &username).map_err(|e| CredentialError::Store(e.to_string()))
 }
 
-pub fn store(provider: &str, account_id: &str, secret: &str) -> Result<(), CredentialError> {
-    if secret.is_empty() {
-        return Err(CredentialError::Store("secret must not be empty".into()));
-    }
+/// Store the complete token set. This is deliberately not exposed as a Tauri
+/// command; only native OAuth/API code may call it.
+pub(crate) fn store_token_set(
+    provider: &str,
+    account_id: &str,
+    tokens: &TokenSet,
+) -> Result<(), CredentialError> {
+    let encoded = tokens
+        .encode_native()
+        .map_err(|_| CredentialError::InvalidCredential)?;
+    let value = String::from_utf8(encoded).map_err(|_| CredentialError::InvalidCredential)?;
     entry(provider, account_id)?
-        .set_password(secret)
+        .set_password(&value)
         .map_err(|e| CredentialError::Store(e.to_string()))
 }
 
 pub fn remove(provider: &str, account_id: &str) -> Result<(), CredentialError> {
     match entry(provider, account_id)?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(CredentialError::Store(e.to_string())),
     }
 }
@@ -65,24 +73,19 @@ pub fn status(provider: &str, account_id: &str) -> Result<CredentialStatus, Cred
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn rejects_empty_identifiers_without_touching_store() {
         assert!(matches!(
             status("", "account"),
             Err(CredentialError::InvalidIdentifier)
         ));
-        assert!(matches!(
-            store("provider", "", "secret"),
-            Err(CredentialError::InvalidIdentifier)
-        ));
     }
-
     #[test]
-    fn rejects_empty_secret() {
-        assert!(matches!(
-            store("provider", "account", ""),
-            Err(CredentialError::Store(_))
-        ));
+    fn token_set_round_trips_without_frontend_dto() {
+        let tokens = TokenSet::decode_native(br#"{"access_token":"a","token_type":"Bearer","refresh_token":"r","scope":null,"expires_at_unix":4102444800}"#).unwrap();
+        let encoded = tokens.encode_native().unwrap();
+        let restored = TokenSet::decode_native(&encoded).unwrap();
+        assert_eq!(restored.access_token, "a");
+        assert_eq!(restored.refresh_token.as_deref(), Some("r"));
     }
 }

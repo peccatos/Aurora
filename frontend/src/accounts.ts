@@ -7,6 +7,7 @@
 
 import type { OAuthAccount, OAuthCallbackResult } from "./oauth.ts";
 import { normalizeOAuthAccount } from "./oauth.ts";
+import { canonicalProviderId } from "./provider-registry.ts";
 
 export type AccountConnectionState = "connected" | "disconnected" | "error";
 
@@ -18,12 +19,17 @@ export interface AccountRecord extends OAuthAccount {
 export interface ProviderAuthAdapter {
   readonly provider: string;
   beginAuthorization(): Promise<string>;
-  revoke(): Promise<void>;
+  getStatus(): Promise<OAuthAccount | null>;
+  revoke(accountId?: string): Promise<void>;
 }
 
 const STORAGE_KEY = "aurora.account-metadata.v1";
 const accounts = new Map<string, AccountRecord>();
 const adapters = new Map<string, ProviderAuthAdapter>();
+
+function providerKey(provider: string): string {
+  return canonicalProviderId(provider);
+}
 
 function storage(): Storage | null {
   try { return typeof localStorage === "undefined" ? null : localStorage; } catch { return null; }
@@ -62,27 +68,27 @@ export function listAccountRecords(): readonly AccountRecord[] {
 }
 
 export function getAccountRecord(provider: string): AccountRecord | null {
-  return accounts.get(provider.toLowerCase()) ?? null;
+  return accounts.get(providerKey(provider)) ?? null;
 }
 
 export function registerProviderAuthAdapter(adapter: ProviderAuthAdapter): void {
-  adapters.set(adapter.provider.toLowerCase(), adapter);
+  adapters.set(providerKey(adapter.provider), adapter);
 }
 
 export function hasProviderAuthAdapter(provider: string): boolean {
-  return adapters.has(provider.toLowerCase());
+  return adapters.has(providerKey(provider));
 }
 
 /** Starts only a configured real adapter; absent adapters fail closed. */
 export async function startAuthorization(provider: string): Promise<string> {
-  const adapter = adapters.get(provider.toLowerCase());
+  const adapter = adapters.get(providerKey(provider));
   if (!adapter) throw new Error(`${provider} authorization is not configured`);
   return adapter.beginAuthorization();
 }
 
 /** Records a callback outcome without exchanging or storing credentials. */
 export function recordCallback(provider: string, result: OAuthCallbackResult): void {
-  const key = provider.toLowerCase();
+  const key = providerKey(provider);
   const existing = accounts.get(key);
   if (result.kind === "error") {
     if (existing) accounts.set(key, { ...existing, state: "error", lastError: result.description ?? result.error });
@@ -91,12 +97,38 @@ export function recordCallback(provider: string, result: OAuthCallbackResult): v
 }
 
 export async function disconnectAccount(provider: string): Promise<void> {
-  const key = provider.toLowerCase();
+  const key = providerKey(provider);
   const existing = accounts.get(key);
   if (!existing) return;
   const adapter = adapters.get(key);
-  if (adapter) await adapter.revoke();
+  if (adapter) await adapter.revoke(existing.subject);
   accounts.delete(key);
+  save();
+}
+
+/** Synchronize sanitized provider identity/status from the native runtime. */
+export async function refreshAccountStatus(provider: string): Promise<AccountRecord | null> {
+  const key = providerKey(provider);
+  const adapter = adapters.get(key);
+  if (!adapter) return accounts.get(key) ?? null;
+  const account = await adapter.getStatus();
+  if (!account) {
+    accounts.delete(key);
+    save();
+    return null;
+  }
+  const sanitized = normalizeOAuthAccount({ ...account, provider: key });
+  const record: AccountRecord = { ...sanitized, state: "connected", lastError: null };
+  accounts.set(key, record);
+  save();
+  return record;
+}
+
+/** Records a native callback failure using sanitized text only. */
+export function recordAuthorizationError(provider: string, message: string): void {
+  const key = providerKey(provider);
+  const existing = accounts.get(key);
+  if (existing) accounts.set(key, { ...existing, state: "error", lastError: message.slice(0, 256) });
   save();
 }
 

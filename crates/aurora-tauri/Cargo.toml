@@ -6,9 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-aurora-core.workspace = true
 aurora-kernel.workspace = true
+aurora-core.workspace = true
 aurora-audio.workspace = true
+aurora-providers.workspace = true
 aurora-decoder.workspace = true
 aurora-library.workspace = true
 aurora-storage.workspace = true
@@ -17,12 +18,14 @@ aurora-dsp.workspace = true
 tauri.workspace = true
 keyring.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-global-shortcut = "2.4.1"
+chrono.workspace = true
 
 [lints]
 workspace = true

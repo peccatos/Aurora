@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/aurora-core",
+    "crates/aurora-providers",
     "crates/aurora-decoder",
     "crates/aurora-dsp",
     "crates/aurora-vst",
@@ -17,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -25,6 +26,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Internal crates
 aurora-core = { path = "crates/aurora-core" }
+aurora-providers = { path = "crates/aurora-providers" }
 aurora-decoder = { path = "crates/aurora-decoder" }
 aurora-dsp = { path = "crates/aurora-dsp" }
 aurora-vst = { path = "crates/aurora-vst" }
@@ -48,7 +50,7 @@ lofty = "0.25.5"
 blake3 = "1"
 
 # Runtime / persistence
-tokio = { version = "1", default-features = false, features = ["macros", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "sync", "time", "net", "io-util"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros", "chrono", "uuid"] }
 
 # Desktop
@@ -65,10 +67,13 @@ ctrlc = "3.5"
 # Shared infrastructure
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form"] }
 uuid = { version = "1", features = ["v4", "serde", "js"] }
 chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 thiserror = "2"
+base64 = "0.22"
+sha2 = "0.10"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -27,7 +27,7 @@ describe("account metadata boundary", () => {
   it("reports callback errors as metadata and revokes through the adapter", async () => {
     clearAccountMetadataForTests();
     let revoked = false;
-    registerProviderAuthAdapter({ provider: "spotify", beginAuthorization: async () => "https://provider.example/auth", revoke: async () => { revoked = true; } });
+    registerProviderAuthAdapter({ provider: "spotify", beginAuthorization: async () => "https://provider.example/auth", getStatus: async () => null, revoke: async () => { revoked = true; } });
     recordConnectedAccount({ provider: "spotify", subject: "u1", displayName: "Listener" });
     recordCallback("spotify", { kind: "error", error: "access_denied", description: "Denied", state: "state" });
     await disconnectAccount("spotify");

@@ -200,7 +200,7 @@ async function webInvoke<T>(cmd: string, args: InvokeArgs): Promise<T> {
     case "probe_exclusive":
       return k.probe_exclusive() as unknown as Promise<T>;
     case "app_version":
-      return "0.1.0-web" as T;
+      return "0.2.0-web" as T;
     case "app_name":
       return "Aurora Web" as T;
     case "list_output_devices":

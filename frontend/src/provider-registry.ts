@@ -12,6 +12,14 @@ export type ProviderId =
   | "youtube-music"
   | "soundcloud";
 
+/** Canonical IDs shared with the native provider registry. */
+export function canonicalProviderId(value: string): ProviderId {
+  const id = value.trim().toLowerCase();
+  if (id === "google-youtube" || id === "youtube") return "youtube-music";
+  if (descriptors.some((provider) => provider.id === id)) return id as ProviderId;
+  throw new Error(`Unknown provider: ${value}`);
+}
+
 export type ProviderAvailability = "available" | "oauth-required" | "unsupported";
 export type ProviderCapability =
   | "metadata-search"
