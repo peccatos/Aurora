@@ -538,28 +538,6 @@ fn csrf_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok())
 }
 
-/// Checks that the CSRF header echoes the readable CSRF cookie.
-///
-/// The cookie and the header are both attacker-supplied, so this is a
-/// well-formedness and consistency check, not an authorization decision: it
-/// stops a cross-site request that can set the header but cannot read the
-/// cookie from proceeding to the storage lookup, and it stops a malformed pair
-/// from being hashed at all. The authoritative check is
-/// [`authorize_csrf`], which compares the header against the *stored* hash
-/// bound to the session.
-#[allow(dead_code)] // kept as documented reference; authorization uses authorize_csrf
-pub(crate) fn csrf_matches_session(headers: &HeaderMap, csrf: &str) -> bool {
-    cookie_value(headers, CSRF_COOKIE).is_some_and(|cookie| {
-        limits::is_csrf_token(&cookie)
-            && cookie.len() == csrf.len()
-            && cookie
-                .bytes()
-                .zip(csrf.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
-    })
-}
-
 /// The TCP peer address of the request, when the connect-info service supplies
 /// one.
 ///
