@@ -13,6 +13,7 @@ members = [
     "crates/aurora-kernel",
     "crates/aurora-web",
     "crates/aurora-tauri",
+    "crates/aurora-api",
     "crates/aurora-app",
     "apps/desktop",
 ]
@@ -37,6 +38,7 @@ aurora-library = { path = "crates/aurora-library" }
 aurora-kernel = { path = "crates/aurora-kernel" }
 aurora-web = { path = "crates/aurora-web" }
 aurora-tauri = { path = "crates/aurora-tauri" }
+aurora-api = { path = "crates/aurora-api" }
 aurora-app = { path = "crates/aurora-app" }
 
 # Audio stack
@@ -78,6 +80,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 notify = "8"
+
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Tests
 tempfile = "3"
