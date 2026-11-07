@@ -28,3 +28,25 @@ Set `VITE_OAUTH_API_BASE_URL` to the backend’s HTTPS origin (or HTTPS path pre
 Copy `.env.example` for local shape only. Empty IDs and disabled providers are expected: the UI must show `Not configured` and fail closed. Never commit real IDs, secrets, tokens, or provider approval data. Endpoints and scopes are allow-listed by `aurora-providers`; arbitrary URLs and scopes are rejected.
 
 Canonical provider IDs are `spotify` and `youtube-music`. `google-youtube` is not a public account ID.
+
+## Browser media metadata (yt-dlp)
+
+The browser cannot spawn processes, so the same yt-dlp operations the Tauri shell exposes as sidecar commands are also served by the OAuth backend. Metadata only: downloads stay desktop-only, because a downloaded file belongs on the user's disk and a server is not that disk.
+
+`POST /api/media/metadata` — request body `{"url": "..."}`. The URL must be HTTPS, host on the shared allowlist (`archive.org`, `www.archive.org`, `youtube.com`, `www.youtube.com`, `youtu.be`), no userinfo, length-bounded; anything else is rejected with 403. The request requires the browser session (no OAuth account needed — media lookup is not a provider grant operation) plus the CSRF pair: session cookie, and the readable `__Host-aurora_csrf` cookie value echoed in the `X-CSRF-Token` header, validated against the stored hash bound to the session. It is charged to the `media` rate-limit bucket.
+
+The response is a sanitized camelCase DTO — `title`, `uploader`, `durationSeconds`, `webpageUrl`, `thumbnailUrl` — not yt-dlp's raw JSON. Fields are bounded and control-character-checked server-side; an off-allowlist `webpageUrl` or `thumbnailUrl` is rejected/dropped. Invocation uses `--no-playlist`, a 45-second timeout, and a 2 MiB output cap.
+
+`GET /api/media/ping` is unauthenticated and reports whether the deployment has a yt-dlp binary at all (`200 {"available":true}` / `503 {"available":false}`), so the UI can hide the feature instead of failing on first use. No DRM or protected-stream extraction is attempted; widening the allowlist is a product decision. Design details in docs/ADR/0006-oauth-backend.md.
+
+## Rate limiting
+
+The OAuth backend rate-limits every endpoint with fixed 60-second windows, enforced in-process: 30 requests per client IP and 120 per provider per window (media requests use the `media` bucket, not a provider's). Both counters are charged and the stricter one wins. Over-budget requests get `429` with a body of `{"error":"rate_limited","retryAfterSeconds":N}` and a `Retry-After` header rounded up so the retry lands in the next window.
+
+The client IP is the TCP peer address; `X-Forwarded-For` is not consulted. The counters are in-process state — per-instance. A deployment running more than one backend process gets independent limits, not a shared quota. Requests are also body-capped (8 KiB) before any handler runs.
+
+## Encrypted token storage
+
+Web OAuth tokens are stored encrypted, never plaintext: `AURORA_OAUTH_ENCRYPTION_KEY` must be set for the backend to start, must be base64url, and must decode to exactly 32 bytes. Token sets are sealed with AES-256-GCM (random 96-bit nonce prepended to the ciphertext) and only the ciphertext reaches SQLite.
+
+Sessions, CSRF tokens, and one-time `state` values are stored as SHA-256 hashes, not plaintext; the `state` transaction is claimed with a guarded `UPDATE` so a callback or replay can only succeed once. There is no key-rotation procedure yet — losing the key loses the stored grants (users re-connect); tracked in plan.md.

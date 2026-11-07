@@ -1,5 +1,6 @@
 mod guard;
 mod limits;
+mod media;
 mod playlists;
 
 use aurora_core::domain::sync::{RemotePage, RemotePlaylist, RemoteProvider};
@@ -32,7 +33,7 @@ use guard::RateLimiter;
 
 const SESSION_COOKIE: &str = "__Host-aurora_session";
 const CSRF_COOKIE: &str = "__Host-aurora_csrf";
-const CSRF_HEADER: &str = "x-csrf-token";
+pub(crate) const CSRF_HEADER: &str = "x-csrf-token";
 const TX_TTL: Duration = Duration::from_secs(600);
 
 /// How often, at most, opportunistic OAuth expiry cleanup runs. Cleanup is
@@ -412,6 +413,8 @@ pub fn router(state: AppState) -> Router {
             get(playlists::playlist_detail),
         )
         .route("/api/oauth/{provider}", delete(disconnect))
+        .route("/api/media/metadata", post(media::metadata))
+        .route("/api/media/ping", get(media::ping))
         .layer(middleware::from_fn(guard::bounded_body))
         .layer(
             CorsLayer::new()
@@ -561,7 +564,7 @@ pub(crate) fn csrf_matches_session(headers: &HeaderMap, csrf: &str) -> bool {
 /// extractor is optional by construction; the absence of an address is handled
 /// by the rate limiter, not by failing the request.
 #[derive(Clone, Copy)]
-struct PeerAddr(Option<SocketAddr>);
+pub(crate) struct PeerAddr(Option<SocketAddr>);
 
 impl<S: Send + Sync> axum::extract::OptionalFromRequestParts<S> for PeerAddr {
     type Rejection = std::convert::Infallible;
@@ -1283,12 +1286,9 @@ mod tests {
             youtube: None,
         }
     }
-    /// Expected to fail: tracking the CSRF idle-eviction limitation. The in-memory
-    /// `sqlite::memory:` pool opens one connection per checkout, so each request runs
-    /// against its own empty database and the session written by `handshake` is invisible
-    /// to the next handler call. Re-enable once the pool is capped to a single connection
-    /// (`max_connections(1)`) or migrated to a shared-cache file.
-    #[ignore = "needs a shared connection pool for in-memory SQLite"]
+    /// The no-cookie/no-origin path rejects before any storage access, so a
+    /// file-backed pool is not even required here — but it gets one anyway
+    /// (see `state_with_store`) so the test cannot silently depend on that.
     #[tokio::test]
     async fn rejects_foreign_origin() {
         let (app, _store) = state_with_store(config()).await;

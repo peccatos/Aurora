@@ -1583,3 +1583,189 @@ async fn health_and_ready_are_public_and_body_bearing() {
         assert!(!body_bytes(response).await.is_empty(), "{path}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// browser media endpoints (yt-dlp sidecar surface)
+// ---------------------------------------------------------------------------
+
+/// A `POST /api/media/metadata` request with a JSON body, optionally carrying
+/// origin, session and CSRF credentials.
+fn media_metadata_request(url: &str, sid: Option<&str>, csrf: Option<&str>) -> Request<Body> {
+    let mut builder = request(Method::POST, "/api/media/metadata")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, ORIGIN);
+    if let Some(sid) = sid {
+        builder = builder.header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"));
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header(CSRF_HEADER, csrf);
+    }
+    builder
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "url": url })).unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn media_metadata_rejects_a_non_allowlisted_url_before_any_auth() {
+    let h = Harness::new(vec![]).await;
+    // No session, no CSRF: the URL allowlist is the first gate, so a foreign
+    // host is refused with 403 without needing (or leaking) anything else.
+    let response = send(
+        &h.app,
+        media_metadata_request("https://vimeo.com/x", None, None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Even a fully authenticated request with a non-allowlisted URL is refused
+    // at the same gate.
+    let (sid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let response = send(
+        &h.app,
+        media_metadata_request("https://evil.example/watch?v=x", Some(&sid), Some(&csrf)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn media_metadata_rejects_a_missing_session_with_unauthorized() {
+    let h = Harness::new(vec![]).await;
+    let response = send(
+        &h.app,
+        media_metadata_request("https://youtu.be/abc", None, None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn media_metadata_rejects_a_session_without_a_csrf_header() {
+    let h = Harness::new(vec![]).await;
+    let (sid, _csrf, _, _) = begin(&h.app, "spotify").await;
+    let response = send(
+        &h.app,
+        media_metadata_request("https://youtu.be/abc", Some(&sid), None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // A session with a header-bound token that does not match is also refused.
+    let response = send(
+        &h.app,
+        media_metadata_request("https://youtu.be/abc", Some(&sid), Some("not-the-token")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn media_metadata_passes_the_gate_and_fails_only_at_the_sidecar() {
+    let h = Harness::new(successful_exchange("secret-access-token")).await;
+    let (sid, csrf) = connected_session(&h).await;
+    let response = send(
+        &h.app,
+        media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+    )
+    .await;
+    // The gate (origin, session, CSRF, rate limit) passed: what remains is the
+    // yt-dlp sidecar. Tests run with CWD = the crate directory, where no
+    // yt-dlp binary is staged, so the deterministic outcome is 503. If a
+    // sidecar happens to be resolvable anyway, it must either succeed with the
+    // sanitized DTO or still report unavailability — never a 4xx gate failure.
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::OK | StatusCode::BAD_GATEWAY
+        ),
+        "got {}",
+        response.status()
+    );
+    if response.status() == StatusCode::OK {
+        let body = body_json(response).await;
+        assert!(body["title"].is_string());
+        assert!(body["webpageUrl"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn media_ping_reports_an_available_flag_consistent_with_the_status() {
+    let h = Harness::new(vec![]).await;
+    let response = send(
+        &h.app,
+        request(Method::GET, "/api/media/ping")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let available = body["available"]
+        .as_bool()
+        .expect("ping must return a boolean `available` field");
+    assert_eq!(
+        available,
+        status == StatusCode::OK,
+        "status {status} must match the availability flag"
+    );
+    assert!(
+        matches!(status, StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE),
+        "got {status}"
+    );
+}
+
+#[tokio::test]
+async fn media_metadata_is_rate_limited_under_tiny_ceilings() {
+    let pool = aurora_storage::open_in_memory()
+        .await
+        .expect("in-memory database");
+    let transport = std::sync::Arc::new(FakeTransport::new(vec![]));
+    let mut state = aurora_api::test_state(
+        config(),
+        pool.clone(),
+        ENCRYPTION_KEY,
+        std::sync::Arc::new(ScriptedOAuthService {
+            transport: transport.clone(),
+        }),
+        Box::new(RecordingPlaylistHttp {
+            attempts: std::sync::Arc::new(AtomicUsize::new(0)),
+        }),
+    );
+    // One minute window, generous per-IP ceiling, a "media"-bucket ceiling of 2:
+    // the first two gated requests pass, the third is refused by the bucket.
+    aurora_api::with_rate_limits(&mut state, std::time::Duration::from_secs(60), 100, 2);
+    let app = router(state);
+
+    let (sid, csrf, _, _) = begin(&app, "spotify").await;
+    for i in 0..2 {
+        let response = send(
+            &app,
+            media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+        )
+        .await;
+        assert!(
+            response.status() != StatusCode::TOO_MANY_REQUESTS,
+            "request {i} must not be rate limited"
+        );
+    }
+    let limited = send(
+        &app,
+        media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_json(limited).await;
+    assert_eq!(body["error"], "rate_limited");
+    assert!(body["retryAfterSeconds"].is_u64());
+    // The charge is per provider bucket, not per session: a second session from
+    // the same client is still refused.
+    let (sid2, csrf2, _, _) = begin(&app, "spotify").await;
+    let still_limited = send(
+        &app,
+        media_metadata_request("https://youtu.be/abc", Some(&sid2), Some(&csrf2)),
+    )
+    .await;
+    assert_eq!(still_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+}

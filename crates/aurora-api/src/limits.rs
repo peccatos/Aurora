@@ -98,6 +98,43 @@ pub(crate) fn is_page_token(raw: &str) -> bool {
     is_base64url_token(raw, PAGE_TOKEN_LEN)
 }
 
+/// The yt-dlp media-source allowlist, shared by every path that validates a
+/// media URL (Tauri commands in `aurora-tauri`, the browser media endpoints
+/// here). One list, one definition: if a host is legal anywhere it is legal
+/// everywhere, and adding a source means editing this table (and its test).
+///
+/// Deliberately HTTPS-only sources that host content the user can legitimately
+/// download: the Internet Archive and YouTube's public video endpoints. This
+/// is the *policy* allowlist, not a technical restriction — extending it is a
+/// product decision about what Aurora will fetch, and it must not be widened
+/// to work around a failure.
+pub(crate) const MEDIA_ALLOWED_HOSTS: [&str; 5] = [
+    "archive.org",
+    "www.archive.org",
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+];
+
+/// A media-source URL: HTTPS, host on the allowlist, no userinfo, and a
+/// bounded total length so a hostile caller cannot hand us a multi-kilobyte
+/// "URL" to hold or spawn.
+pub(crate) fn is_media_url(raw: &str) -> bool {
+    const MAX_URL_LEN: usize = 2048;
+    if raw.len() > MAX_URL_LEN {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| MEDIA_ALLOWED_HOSTS.contains(&host.to_ascii_lowercase().as_str()))
+}
+
 /// A pagination cursor, dispatched on the provider that produced it.
 pub(crate) fn is_cursor(provider: &str, raw: &str) -> bool {
     match provider {
