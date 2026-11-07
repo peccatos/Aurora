@@ -50,7 +50,7 @@ const CSRF_COOKIE = "__Host-aurora_csrf";
  * cookie and echoes it in `X-CSRF-Token`. Read at call time so a rotated token is picked
  * up without a reload, and never cached in JS-accessible storage.
  */
-function csrfToken(): string | null {
+export function csrfToken(): string | null {
   if (typeof document === "undefined") return null;
   for (const part of document.cookie.split(";")) {
     const trimmed = part.trim();

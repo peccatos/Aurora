@@ -5,7 +5,7 @@
 
 import { invoke, platform } from "./invoke";
 import { registerDesktopProviderAdapters } from "./desktop-provider-adapter";
-import { registerWebProviderAdapters } from "./web-provider-adapter";
+import { registerWebProviderAdapters } from "./web-provider-adapter.ts";
 
 registerDesktopProviderAdapters();
 registerWebProviderAdapters();

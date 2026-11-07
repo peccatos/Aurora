@@ -1,4 +1,5 @@
-import { invoke, platform } from "./invoke";
+import { csrfToken } from "./web-provider-adapter.ts";
+import { invoke, platform } from "./invoke.ts";
 
 export interface MediaMetadata {
   title: string;
@@ -20,18 +21,32 @@ function validateAllowedUrl(raw: string): URL {
 function normalizeMetadata(raw: unknown): MediaMetadata {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Invalid metadata response");
   const value = raw as Record<string, unknown>;
-  if (typeof value.title !== "string" || typeof value.webpage_url !== "string") throw new Error("Invalid metadata response");
-  const webpage = validateAllowedUrl(value.webpage_url);
-  let thumbnail: string | null = null;
-  if (typeof value.thumbnail === "string") thumbnail = validateAllowedUrl(value.thumbnail).href;
+  // The Tauri command returns yt-dlp's raw JSON (snake_case); the browser API
+  // returns its sanitized DTO (camelCase). Both shapes are accepted, each
+  // field validated client-side — backend sanitization is never trusted.
+  const title = typeof value.title === "string" ? value.title : null;
+  const webpageRaw = typeof value.webpage_url === "string" ? value.webpage_url : typeof value.webpageUrl === "string" ? value.webpageUrl : null;
+  const uploaderRaw = typeof value.uploader === "string" ? value.uploader : typeof value.uploader === "string" ? value.uploader : null;
+  const durationRaw = typeof value.duration === "number" && Number.isFinite(value.duration) ? value.duration : typeof value.durationSeconds === "number" && Number.isFinite(value.durationSeconds) ? value.durationSeconds : null;
+  const thumbnailRaw = typeof value.thumbnail === "string" ? value.thumbnail : typeof value.thumbnailUrl === "string" ? value.thumbnailUrl : null;
+  if (title === null || webpageRaw === null) throw new Error("Invalid metadata response");
+  const webpage = validateAllowedUrl(webpageRaw);
+  const thumbnail = thumbnailRaw !== null ? validateAllowedUrl(thumbnailRaw).href : null;
   return {
-    title: value.title.slice(0, 500),
-    uploader: typeof value.uploader === "string" ? value.uploader.slice(0, 300) : null,
-    durationSeconds: typeof value.duration === "number" && Number.isFinite(value.duration) ? value.duration : null,
+    title: title.slice(0, 500),
+    uploader: uploaderRaw !== null ? uploaderRaw.slice(0, 300) : null,
+    durationSeconds: durationRaw,
     webpageUrl: webpage.href,
     thumbnailUrl: thumbnail,
   };
 }
+
+/** Test seam: the module reads its base URL from `import.meta.env`, which the
+ *  node test runner does not provide; the hook overrides it (null restores). */
+export function setMediaApiBaseForTests(base: string | null): void {
+  testApiBase = base;
+}
+let testApiBase: string | null = null;
 
 export async function getMediaMetadata(rawUrl: string): Promise<MediaMetadata> {
   const url = validateAllowedUrl(rawUrl).href;
@@ -39,14 +54,22 @@ export async function getMediaMetadata(rawUrl: string): Promise<MediaMetadata> {
     const result = await invoke<{ json: string }>("yt_dlp_metadata", { url });
     return normalizeMetadata(JSON.parse(result.json) as unknown);
   }
-  const base = import.meta.env?.VITE_MEDIA_API_BASE_URL?.trim();
+  const base = testApiBase ?? import.meta.env?.VITE_MEDIA_API_BASE_URL?.trim();
   if (!base) throw new Error("Media API is not configured in this browser deployment");
   const endpoint = new URL("/api/media/metadata", base);
   if (endpoint.protocol !== "https:") throw new Error("Media API must use HTTPS");
+  const token = csrfToken();
+  if (!token) throw new Error("No session CSRF token available for the media API");
+  // State-changing request: the session cookie alone is not enough, the
+  // session-bound CSRF token must be echoed in the header.
   const response = await fetch(endpoint, {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "X-CSRF-Token": token,
+    },
     body: JSON.stringify({ url }),
   });
   if (!response.ok) throw new Error(`Media API request failed (${response.status})`);
