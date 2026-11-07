@@ -91,12 +91,35 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let mut oauth_metadata = HashMap::new();
+        let mut oauth_accounts = HashMap::new();
+        for provider in ["spotify", "youtube-music"] {
+            if let Ok(Some(metadata)) = crate::credentials::load_metadata(provider) {
+                if matches!(crate::credentials::status(provider, &metadata.subject), Ok(status) if status.present)
+                {
+                    oauth_accounts.insert(provider.to_owned(), metadata.subject.clone());
+                    oauth_metadata.insert(
+                        provider.to_owned(),
+                        ProviderAccountMetadata {
+                            provider: metadata.provider,
+                            subject: metadata.subject,
+                            display_name: metadata.display_name,
+                            avatar_url: metadata.avatar_url,
+                            capabilities: metadata.capabilities,
+                            connected_at: metadata.connected_at,
+                        },
+                    );
+                } else {
+                    let _ = crate::credentials::remove_metadata(provider);
+                }
+            }
+        }
         Self {
             kernel: Arc::new(PlayerKernel::new()),
             providers: aurora_providers::ProviderRegistry::from_environment(),
             oauth: aurora_providers::Coordinator::default(),
-            oauth_accounts: Mutex::new(HashMap::new()),
-            oauth_metadata: Mutex::new(HashMap::new()),
+            oauth_accounts: Mutex::new(oauth_accounts),
+            oauth_metadata: Mutex::new(oauth_metadata),
         }
     }
 }
@@ -241,6 +264,17 @@ pub async fn oauth_poll(
         capabilities: vec!["identity".into()],
         connected_at: chrono::Utc::now().to_rfc3339(),
     };
+    crate::credentials::store_metadata(&crate::credentials::StoredAccountMetadata {
+        provider: metadata.provider.clone(),
+        subject: metadata.subject.clone(),
+        display_name: metadata.display_name.clone(),
+        avatar_url: metadata.avatar_url.clone(),
+        capabilities: metadata.capabilities.clone(),
+        connected_at: metadata.connected_at.clone(),
+    })
+    .map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })?;
     state
         .oauth_accounts
         .lock()
@@ -273,6 +307,9 @@ pub async fn provider_disconnect(
             }
         })?;
     }
+    crate::credentials::remove_metadata(&provider).map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })?;
     state.oauth_metadata.lock().await.remove(&provider);
     Ok(())
 }
