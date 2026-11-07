@@ -751,7 +751,20 @@ pub mod token {
         InvalidResponse,
         #[error("missing refresh token")]
         MissingRefreshToken,
+        #[error("provider rejected the grant; reauthorization required")]
+        InvalidGrant,
     }
+    impl Error {
+        /// Classifies a refresh failure as definitively requiring the user to
+        /// reauthorize. Only the provider telling us the grant itself is dead
+        /// counts: an HTTP 400/403 carrying `invalid_grant`, or a refresh token
+        /// we no longer hold. Transport faults, timeouts, 5xx, 429, and
+        /// unparsable responses are transient and must not disconnect the user.
+        pub fn requires_reauthorization(&self) -> bool {
+            matches!(self, Error::MissingRefreshToken | Error::InvalidGrant)
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     struct WireProfile {
         id: Option<String>,
@@ -822,7 +835,26 @@ pub mod token {
                 scope: Option<String>,
                 expires_at_unix: u64,
             }
+            if bytes.len() > 16 * 1024 {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "token payload too large",
+                )));
+            }
             let stored: Stored = serde_json::from_slice(bytes)?;
+            if stored.access_token.trim().is_empty()
+                || stored.access_token.len() > 8192
+                || stored.token_type != "Bearer"
+                || stored
+                    .refresh_token
+                    .as_ref()
+                    .is_some_and(|v| v.is_empty() || v.len() > 8192)
+            {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid token payload",
+                )));
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -986,7 +1018,14 @@ pub mod token {
                     TransportError::Failed => Error::Transport,
                 })?;
             if !(200..300).contains(&response.status) {
-                return Err(Error::Http(response.status));
+                // A rejected grant is definitive: retrying cannot help and the
+                // user must reauthorize. Anything else (5xx, 429, an unexpected
+                // 400) is transient and keeps the stored credentials intact.
+                return Err(if rejected_grant(response.status, &response.body) {
+                    Error::InvalidGrant
+                } else {
+                    Error::Http(response.status)
+                });
             }
             let parsed: WireTokenSet =
                 serde_json::from_slice(&response.body).map_err(|_| Error::InvalidResponse)?;
@@ -1002,6 +1041,24 @@ pub mod token {
                 expires_at: Instant::now() + lifetime,
             })
         }
+    }
+
+    /// Detects an OAuth error response that means the refresh token itself is
+    /// no longer usable. Both Spotify and Google answer a dead refresh token
+    /// with HTTP 400 and `"error": "invalid_grant"`; a 5xx or 429 never does,
+    /// so it stays a transient failure even if the body cannot be parsed.
+    fn rejected_grant(status: u16, body: &[u8]) -> bool {
+        if !matches!(status, 400 | 401 | 403) || body.len() > 16 * 1024 {
+            return false;
+        }
+        #[derive(serde::Deserialize)]
+        struct WireError {
+            error: Option<String>,
+        }
+        serde_json::from_slice::<WireError>(body)
+            .ok()
+            .and_then(|wire| wire.error)
+            .is_some_and(|error| error.eq_ignore_ascii_case("invalid_grant"))
     }
 
     fn allowlisted_endpoint(provider: &str, endpoint: &str) -> bool {
@@ -1107,6 +1164,110 @@ pub mod token {
                 Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
             let refreshed = client.refresh("old").await.unwrap();
             assert_eq!(refreshed.refresh_token.as_deref(), Some("old"));
+        }
+
+        #[tokio::test]
+        async fn refresh_omitting_rotation_keeps_previous_refresh_token() {
+            // A provider that answers without a refresh_token must not erase the
+            // stored secret, otherwise the next 401 is unrecoverable.
+            let fake = Arc::new(Fake {
+                responses: Mutex::new(vec![
+                    response(r#"{"access_token":"first","refresh_token":"r1","expires_in":0}"#),
+                    response(r#"{"access_token":"second","expires_in":3600}"#),
+                ]),
+            });
+            let client =
+                Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+            let initial = client
+                .exchange_code("code", "redirect", "verifier")
+                .await
+                .unwrap();
+            assert_eq!(initial.refresh_token.as_deref(), Some("r1"));
+            let refreshed = client.access_token(initial).await.unwrap();
+            assert_eq!(refreshed.access_token, "second");
+            assert_eq!(refreshed.refresh_token.as_deref(), Some("r1"));
+        }
+
+        #[tokio::test]
+        async fn transient_refresh_failures_do_not_require_reauthorization() {
+            // Transport faults, timeouts, 5xx, 429 and an unparsable body are all
+            // recoverable: the stored grant must survive so the next attempt can
+            // retry instead of forcing the user back through consent.
+            let body = |status: u16, raw: &str| {
+                Ok(TokenResponse {
+                    status,
+                    body: raw.as_bytes().to_vec(),
+                })
+            };
+            for failure in [
+                Err(TransportError::Failed),
+                Err(TransportError::Timeout),
+                body(500, ""),
+                body(502, "<html>bad gateway</html>"),
+                body(429, r#"{"error":"too_many_requests"}"#),
+                body(400, "not json at all"),
+            ] {
+                let fake = Arc::new(Fake {
+                    responses: Mutex::new(vec![failure]),
+                });
+                let client =
+                    Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+                let error = match client.refresh("still-valid").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected a refresh failure"),
+                };
+                assert!(
+                    !error.requires_reauthorization(),
+                    "{error} must be treated as transient, not reauth-required"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn rejected_grant_requires_reauthorization() {
+            let fake = Arc::new(Fake {
+                responses: Mutex::new(vec![Ok(TokenResponse {
+                    status: 400,
+                    body:
+                        br#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#
+                            .to_vec(),
+                })]),
+            });
+            let client =
+                Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+            let error = match client.refresh("revoked").await {
+                Err(error) => error,
+                Ok(_) => panic!("expected a refresh failure"),
+            };
+            assert_eq!(error, Error::InvalidGrant);
+            assert!(error.requires_reauthorization());
+            // The message must stay redacted: no token or body leaks to the caller.
+            assert!(!error.to_string().contains("revoked"));
+        }
+
+        #[test]
+        fn missing_refresh_token_requires_reauthorization() {
+            assert!(Error::MissingRefreshToken.requires_reauthorization());
+            assert!(!Error::Http(500).requires_reauthorization());
+            assert!(!Error::Timeout.requires_reauthorization());
+            assert!(!Error::Transport.requires_reauthorization());
+            assert!(!Error::InvalidResponse.requires_reauthorization());
+        }
+
+        #[test]
+        fn invalid_grant_detection_ignores_unrelated_statuses() {
+            let revoked = br#"{"error":"invalid_grant"}"#;
+            assert!(rejected_grant(400, revoked));
+            assert!(rejected_grant(401, revoked));
+            // A 5xx or 429 is never a definitive rejection, even with a spoofed body.
+            assert!(!rejected_grant(500, revoked));
+            assert!(!rejected_grant(429, revoked));
+            assert!(!rejected_grant(200, revoked));
+            assert!(!rejected_grant(
+                400,
+                br#"{"error":"temporarily_unavailable"}"#
+            ));
+            assert!(!rejected_grant(400, b""));
         }
 
         #[tokio::test]
@@ -1527,6 +1688,8 @@ pub mod playlist {
     }
     /// Sends a protected request and, on exactly one 401, refreshes the
     /// access token through the native token client before retrying once.
+    /// A failed refresh is classified so callers can tell a transient outage
+    /// apart from a grant the provider has permanently rejected.
     pub async fn authorized_get<H: Http>(
         http: &mut H,
         tokens: &mut super::token::TokenSet,
@@ -1543,7 +1706,7 @@ pub mod playlist {
                 let updated = token_client
                     .refresh(refresh)
                     .await
-                    .map_err(|_| Error::RefreshRequired)?;
+                    .map_err(refresh_failure)?;
                 *tokens = updated;
                 // The refreshed token is used for one retry only; a second 401
                 // is returned as RefreshRequired and never refreshes recursively.
@@ -1552,12 +1715,25 @@ pub mod playlist {
             result => result,
         }
     }
+    /// Maps a refresh failure onto the caller-visible classification. Only a
+    /// definitively rejected grant becomes `ReauthorizationRequired`.
+    fn refresh_failure(error: super::token::Error) -> Error {
+        if error.requires_reauthorization() {
+            Error::ReauthorizationRequired
+        } else {
+            Error::RefreshTransient
+        }
+    }
     #[derive(Debug, Error, Clone, PartialEq, Eq)]
     pub enum Error {
         #[error("HTTPS required")]
         InsecureUrl,
         #[error("authentication expired; refresh token and retry")]
         RefreshRequired,
+        #[error("token refresh failed; the provider may be temporarily unavailable")]
+        RefreshTransient,
+        #[error("provider rejected the stored grant; reauthorization required")]
+        ReauthorizationRequired,
         #[error("HTTP {status}")]
         Http {
             status: u16,
@@ -1575,6 +1751,11 @@ pub mod playlist {
             .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
             .and_then(|(_, v)| v.parse::<u64>().ok())
             .and_then(|s| s.checked_mul(1000))
+    }
+    impl Http for Box<dyn Http + Send> {
+        fn send(&mut self, request: Request) -> Result<Response, Error> {
+            self.as_mut().send(request)
+        }
     }
     pub fn get<H: Http>(
         h: &mut H,
@@ -1760,6 +1941,27 @@ pub mod playlist {
                 );
                 assert_eq!(request.url, self.expected_url);
                 Ok(self.response.clone())
+            }
+        }
+
+        #[test]
+        fn refresh_failure_classification_keeps_transient_errors_retryable() {
+            assert_eq!(
+                refresh_failure(super::super::token::Error::InvalidGrant),
+                Error::ReauthorizationRequired
+            );
+            assert_eq!(
+                refresh_failure(super::super::token::Error::MissingRefreshToken),
+                Error::ReauthorizationRequired
+            );
+            for transient in [
+                super::super::token::Error::Http(500),
+                super::super::token::Error::Http(429),
+                super::super::token::Error::Timeout,
+                super::super::token::Error::Transport,
+                super::super::token::Error::InvalidResponse,
+            ] {
+                assert_eq!(refresh_failure(transient), Error::RefreshTransient);
             }
         }
 

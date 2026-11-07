@@ -58,6 +58,8 @@ jobs:
             test -f "target/debug/$name$EXT" || { echo "Missing helper binary: $name$EXT"; exit 1; }
             cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
           done
+          test -f "bin/yt-dlp$EXT" || { echo "Missing yt-dlp binary: bin/yt-dlp$EXT"; exit 1; }
+          cp "bin/yt-dlp$EXT" "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
           ls -la apps/desktop/binaries/
 
       - name: Typecheck frontend

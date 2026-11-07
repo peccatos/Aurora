@@ -51,3 +51,6 @@ apps/desktop/binaries/
 
 # Agent instructions (local, not project source)
 CLAUDE.md
+
+# Local working plan (weak/unfinished areas tracker)
+plan.md

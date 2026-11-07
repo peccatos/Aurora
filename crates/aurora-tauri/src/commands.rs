@@ -3,7 +3,13 @@
 //! One command = one kernel call + DTO translation. No business logic
 //! lives here: the music player IS `aurora-kernel`.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::Mutex;
 
 use aurora_kernel::{
@@ -1056,6 +1062,145 @@ pub async fn track_bpm(path: String, state: K<'_>) -> Result<Option<f64>, Comman
     state.kernel.track_bpm(&path).await.map_err(map_err)
 }
 
+const YTDLP_MAX_OUTPUT: usize = 2 * 1024 * 1024;
+const YTDLP_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn allowed_ytdlp_url(raw: &str) -> Result<url::Url, CommandError> {
+    let url = url::Url::parse(raw).map_err(|_| CommandError::Provider {
+        message: "invalid media URL".into(),
+    })?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = matches!(
+        host.as_str(),
+        "archive.org" | "www.archive.org" | "youtube.com" | "www.youtube.com" | "youtu.be"
+    );
+    if url.scheme() != "https" || !allowed || url.username() != "" || url.password().is_some() {
+        return Err(CommandError::Provider {
+            message: "media URL is not an allowed HTTPS source".into(),
+        });
+    }
+    Ok(url)
+}
+
+fn ytdlp_path() -> Result<PathBuf, CommandError> {
+    let name = format!("yt-dlp{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates: Vec<PathBuf> = vec![
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(&name))),
+        Some(Path::new("apps/desktop/binaries").join(&name)),
+        Some(Path::new("bin").join(&name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for directory in [Path::new("apps/desktop/binaries"), Path::new("bin")] {
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter_map(|path| {
+                        let allowed = path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| {
+                                value.starts_with("yt-dlp-")
+                                    && value.ends_with(std::env::consts::EXE_SUFFIX)
+                            });
+                        allowed.then_some(path)
+                    }),
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| CommandError::Provider {
+            message: "yt-dlp sidecar is not installed".into(),
+        })
+}
+
+async fn run_ytdlp(args: Vec<String>) -> Result<String, CommandError> {
+    let path = ytdlp_path()?;
+    let result = tokio::time::timeout(
+        YTDLP_TIMEOUT,
+        tokio::process::Command::new(path).args(args).output(),
+    )
+    .await
+    .map_err(|_| CommandError::Provider {
+        message: "yt-dlp timed out".into(),
+    })?
+    .map_err(|_| CommandError::Provider {
+        message: "yt-dlp could not be started".into(),
+    })?;
+    if result.stdout.len() > YTDLP_MAX_OUTPUT || result.stderr.len() > YTDLP_MAX_OUTPUT {
+        return Err(CommandError::Provider {
+            message: "yt-dlp output exceeded the safety limit".into(),
+        });
+    }
+    if !result.status.success() {
+        return Err(CommandError::Provider {
+            message: String::from_utf8_lossy(&result.stderr)
+                .chars()
+                .take(512)
+                .collect(),
+        });
+    }
+    String::from_utf8(result.stdout).map_err(|_| CommandError::Provider {
+        message: "yt-dlp returned invalid UTF-8".into(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YtdlpMetadata {
+    pub json: String,
+}
+
+#[tauri::command]
+pub async fn yt_dlp_metadata(url: String) -> Result<YtdlpMetadata, CommandError> {
+    let url = allowed_ytdlp_url(&url)?;
+    let json = run_ytdlp(vec![
+        "--no-playlist".into(),
+        "--dump-single-json".into(),
+        "--no-warnings".into(),
+        url.to_string(),
+    ])
+    .await?;
+    Ok(YtdlpMetadata { json })
+}
+
+#[tauri::command]
+pub async fn yt_dlp_download(url: String, output_dir: String) -> Result<String, CommandError> {
+    let url = allowed_ytdlp_url(&url)?;
+    let dir = PathBuf::from(output_dir);
+    if !dir.is_absolute() {
+        return Err(CommandError::Provider {
+            message: "download directory must be absolute".into(),
+        });
+    }
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|_| CommandError::Provider {
+            message: "download directory is not available".into(),
+        })?;
+    let template = dir.join("%(title).80s [%(id)s].%(ext)s");
+    let path = run_ytdlp(vec![
+        "--no-playlist".into(),
+        "--no-warnings".into(),
+        "--restrict-filenames".into(),
+        "--no-part".into(),
+        "--print".into(),
+        "after_move:filepath".into(),
+        "-o".into(),
+        template.to_string_lossy().into_owned(),
+        url.to_string(),
+    ])
+    .await?;
+    Ok(path.trim().to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
@@ -1203,6 +1348,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             deck_tempo,
             deck_status,
             track_bpm,
+            yt_dlp_metadata,
+            yt_dlp_download,
             get_track_artwork,
             pause_playback,
             resume_playback,

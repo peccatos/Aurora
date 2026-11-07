@@ -7,14 +7,17 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+aes-gcm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 aurora-core.workspace = true
+aurora-providers.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 [lints]

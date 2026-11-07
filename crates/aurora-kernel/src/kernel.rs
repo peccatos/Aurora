@@ -323,23 +323,21 @@ impl PlayerKernel {
         if let Some(raw) = aurora_storage::get_setting(service.pool(), "dsp.global.v1")
             .await
             .map_err(KernelError::from)?
+            && let Ok(config) = serde_json::from_str(&raw)
         {
-            if let Ok(config) = serde_json::from_str(&raw) {
-                *self.dsp.lock().map_err(|_| KernelError::Poisoned)? = config;
-                loaded_any = true;
-            }
+            *self.dsp.lock().map_err(|_| KernelError::Poisoned)? = config;
+            loaded_any = true;
         }
         if let Some(raw) = aurora_storage::get_setting(service.pool(), "dsp.track.v1")
             .await
             .map_err(KernelError::from)?
+            && let Ok(profiles) = serde_json::from_str(&raw)
         {
-            if let Ok(profiles) = serde_json::from_str(&raw) {
-                self.track_dsp
-                    .lock()
-                    .map_err(|_| KernelError::Poisoned)?
-                    .replace(profiles);
-                loaded_any = true;
-            }
+            self.track_dsp
+                .lock()
+                .map_err(|_| KernelError::Poisoned)?
+                .replace(profiles);
+            loaded_any = true;
         }
         drop(library);
         if !loaded_any {

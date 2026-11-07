@@ -9,6 +9,7 @@
 //! UPDATE` so a rescan updates paths/metadata in place and never
 //! duplicates a track.
 
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use std::path::Path;
 
 use aurora_core::{Album, Artist, AudioFormat, Playlist, Track, TrackId};
@@ -23,6 +24,12 @@ pub enum StorageError {
     Sql(#[from] sqlx::Error),
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("invalid encryption key")]
+    EncryptionKey,
+    #[error("encrypted data could not be processed")]
+    Encryption,
+    #[error("value could not be serialized: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 /// Content hash of a file (blake3, 32-byte digest).
@@ -70,6 +77,273 @@ pub async fn open_in_memory() -> Result<SqlitePool, StorageError> {
         .await?;
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
+}
+
+/// Grace period before a *consumed* OAuth transaction row is deleted.
+///
+/// The row is what keeps a replayed `state` answerable as "already used"
+/// rather than "unknown"; deleting it immediately on the first callback would
+/// erase the difference. It also bounds how long the verifier, which is a
+/// credential stored in the clear, survives at rest.
+pub const CONSUMED_GRACE_SECS: i64 = 600;
+
+#[derive(Debug, Clone)]
+pub struct OAuthSession {
+    pub csrf_hash: String,
+    pub expires_at: String,
+}
+#[derive(Debug, Clone)]
+pub struct OAuthTransaction {
+    pub provider: String,
+    pub session_id_hash: String,
+    pub verifier: String,
+    pub redirect_uri: String,
+    pub expires_at: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthAccount {
+    pub subject: String,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+    pub capabilities: Vec<String>,
+    pub connected_at: chrono::DateTime<chrono::Utc>,
+    pub auth_state: String,
+    pub last_auth_error: Option<String>,
+}
+
+pub fn encrypt_oauth_tokens(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| StorageError::EncryptionKey)?;
+    let nonce_bytes = uuid::Uuid::new_v4();
+    let nonce = Nonce::from_slice(&nonce_bytes.as_bytes()[..12]);
+    let encrypted = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| StorageError::Encryption)?;
+    let mut result = nonce.to_vec();
+    result.extend(encrypted);
+    Ok(result)
+}
+pub fn decrypt_oauth_tokens(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, StorageError> {
+    if ciphertext.len() < 12 {
+        return Err(StorageError::Encryption);
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| StorageError::EncryptionKey)?;
+    cipher
+        .decrypt(Nonce::from_slice(&ciphertext[..12]), &ciphertext[12..])
+        .map_err(|_| StorageError::Encryption)
+}
+pub async fn health_check(pool: &SqlitePool) -> Result<(), StorageError> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
+/// Opportunistic cleanup of expired OAuth state.
+///
+/// Consumed transactions are retained for `CONSUMED_GRACE_SECS` so a replay
+/// still distinguishes "already used" from "never existed"; both tables are
+/// pruned in one transaction so the admin path never sees half-cleaned state.
+///
+/// Returns `(sessions_deleted, transactions_deleted)`.
+pub async fn cleanup_expired_oauth(
+    pool: &SqlitePool,
+    now: &str,
+) -> Result<(u64, u64), StorageError> {
+    let mut tx = pool.begin().await?;
+    let sessions = sqlx::query("DELETE FROM oauth_sessions WHERE expires_at <= ?")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let cutoff = consumed_cutoff(now);
+    let transactions = sqlx::query(
+        "DELETE FROM oauth_transactions \
+         WHERE expires_at <= ? OR (consumed_at IS NOT NULL AND consumed_at <= ?)",
+    )
+    .bind(now)
+    .bind(&cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok((sessions, transactions))
+}
+
+/// Timestamp before which consumed transactions may be deleted.
+///
+/// Falls back to `now` (delete everything consumed) when `now` cannot be
+/// parsed — the safe direction for a cleanup, never for an authorization check.
+fn consumed_cutoff(now: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(now)
+        .map(|t| {
+            (t - chrono::Duration::seconds(CONSUMED_GRACE_SECS))
+                .to_utc()
+                .to_rfc3339()
+        })
+        .unwrap_or_else(|_| now.to_owned())
+}
+
+pub async fn validate_oauth_csrf(
+    pool: &SqlitePool,
+    id_hash: &str,
+    csrf_hash: &str,
+    now: &str,
+) -> Result<bool, StorageError> {
+    let row = sqlx::query(
+        "SELECT 1 FROM oauth_sessions WHERE id_hash=? AND csrf_hash=? AND expires_at>?",
+    )
+    .bind(id_hash)
+    .bind(csrf_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+pub async fn save_oauth_session(
+    pool: &SqlitePool,
+    id_hash: &str,
+    csrf_hash: &str,
+    expires_at: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("INSERT INTO oauth_sessions (id_hash, csrf_hash, expires_at, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(id_hash) DO UPDATE SET csrf_hash=excluded.csrf_hash, expires_at=excluded.expires_at").bind(id_hash).bind(csrf_hash).bind(expires_at).bind(chrono::Utc::now().to_rfc3339()).execute(pool).await?;
+    Ok(())
+}
+pub async fn get_oauth_session(
+    pool: &SqlitePool,
+    id_hash: &str,
+    now: &str,
+) -> Result<Option<OAuthSession>, StorageError> {
+    let r = sqlx::query(
+        "SELECT csrf_hash, expires_at FROM oauth_sessions WHERE id_hash=? AND expires_at>?",
+    )
+    .bind(id_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(r.map(|x| OAuthSession {
+        csrf_hash: x.try_get("csrf_hash").unwrap_or_default(),
+        expires_at: x.try_get("expires_at").unwrap_or_default(),
+    }))
+}
+pub async fn save_oauth_transaction(
+    pool: &SqlitePool,
+    state_hash: &str,
+    tx: &OAuthTransaction,
+) -> Result<(), StorageError> {
+    sqlx::query("INSERT INTO oauth_transactions (state_hash, provider, session_id_hash, verifier, redirect_uri, expires_at) VALUES (?, ?, ?, ?, ?, ?)").bind(state_hash).bind(&tx.provider).bind(&tx.session_id_hash).bind(&tx.verifier).bind(&tx.redirect_uri).bind(&tx.expires_at).execute(pool).await?;
+    Ok(())
+}
+pub async fn claim_oauth_transaction(
+    pool: &SqlitePool,
+    state_hash: &str,
+    provider: &str,
+    session_hash: &str,
+    now: &str,
+) -> Result<Option<OAuthTransaction>, StorageError> {
+    let r=sqlx::query("UPDATE oauth_transactions SET consumed_at=? WHERE state_hash=? AND provider=? AND session_id_hash=? AND consumed_at IS NULL AND expires_at>? RETURNING provider, session_id_hash, verifier, redirect_uri, expires_at").bind(now).bind(state_hash).bind(provider).bind(session_hash).bind(now).fetch_optional(pool).await?;
+    Ok(r.map(|x| OAuthTransaction {
+        provider: x.try_get("provider").unwrap_or_default(),
+        session_id_hash: x.try_get("session_id_hash").unwrap_or_default(),
+        verifier: x.try_get("verifier").unwrap_or_default(),
+        redirect_uri: x.try_get("redirect_uri").unwrap_or_default(),
+        expires_at: x.try_get("expires_at").unwrap_or_default(),
+    }))
+}
+pub async fn save_oauth_account(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+    account: &OAuthAccount,
+    keyring_account_id: &str,
+    token_ciphertext: &[u8],
+) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    // Serialization failure aborts the transaction: persisting an empty
+    // capability list would silently downgrade the account's granted scopes,
+    // and the UI reads capabilities as the truth about what the grant covers.
+    let capabilities_json = serde_json::to_string(&account.capabilities)?;
+    sqlx::query("INSERT INTO oauth_accounts (session_id_hash, provider, subject, display_name, avatar_url, capabilities_json, connected_at, keyring_account_id, token_ciphertext, auth_state, last_auth_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id_hash, provider) DO UPDATE SET subject=excluded.subject, display_name=excluded.display_name, avatar_url=excluded.avatar_url, capabilities_json=excluded.capabilities_json, connected_at=excluded.connected_at, keyring_account_id=excluded.keyring_account_id, token_ciphertext=excluded.token_ciphertext, auth_state='connected', last_auth_error=NULL").bind(session_hash).bind(provider).bind(&account.subject).bind(&account.display_name).bind(&account.avatar_url).bind(capabilities_json).bind(account.connected_at.to_rfc3339()).bind(keyring_account_id).bind(token_ciphertext).bind("connected").bind(Option::<String>::None).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+pub async fn get_oauth_account(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+) -> Result<Option<OAuthAccount>, StorageError> {
+    let r=sqlx::query("SELECT subject, display_name, avatar_url, capabilities_json, connected_at, auth_state, last_auth_error FROM oauth_accounts WHERE session_id_hash=? AND provider=?").bind(session_hash).bind(provider).fetch_optional(pool).await?;
+    Ok(r.and_then(|x| {
+        Some(OAuthAccount {
+            subject: x.try_get("subject").ok()?,
+            display_name: x.try_get("display_name").ok()?,
+            avatar_url: x.try_get("avatar_url").ok()?,
+            capabilities: serde_json::from_str(&x.try_get::<String, _>("capabilities_json").ok()?)
+                .ok()?,
+            connected_at: x.try_get::<String, _>("connected_at").ok()?.parse().ok()?,
+            auth_state: x
+                .try_get::<String, _>("auth_state")
+                .unwrap_or_else(|_| "connected".into()),
+            last_auth_error: x.try_get("last_auth_error").ok(),
+        })
+    }))
+}
+/// Read the stored (encrypted) token blob for one account.
+///
+/// `Ok(None)` means exactly one thing: no row for `(session_hash, provider)`.
+/// A row that exists but whose column cannot be read is a hard error — the
+/// caller must not be told the account is absent, because "absent" maps to a
+/// 404 for the user and would present a corrupt account as a disconnected one.
+pub async fn get_oauth_token_ciphertext(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let row = sqlx::query(
+        "SELECT token_ciphertext FROM oauth_accounts WHERE session_id_hash=? AND provider=?",
+    )
+    .bind(session_hash)
+    .bind(provider)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(x) => Ok(Some(x.try_get::<Vec<u8>, _>("token_ciphertext")?)),
+        None => Ok(None),
+    }
+}
+
+pub async fn update_oauth_tokens(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+    token_ciphertext: &[u8],
+) -> Result<bool, StorageError> {
+    let result = sqlx::query("UPDATE oauth_accounts SET token_ciphertext=?, auth_state='connected', last_auth_error=NULL WHERE session_id_hash=? AND provider=?")
+        .bind(token_ciphertext).bind(session_hash).bind(provider).execute(pool).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn mark_oauth_reauth_required(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+    error: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("UPDATE oauth_accounts SET auth_state='reauthorization_required', last_auth_error=? WHERE session_id_hash=? AND provider=?")
+        .bind(error.chars().take(200).collect::<String>()).bind(session_hash).bind(provider).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn delete_oauth_account(
+    pool: &SqlitePool,
+    session_hash: &str,
+    provider: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("DELETE FROM oauth_accounts WHERE session_id_hash=? AND provider=?")
+        .bind(session_hash)
+        .bind(provider)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
