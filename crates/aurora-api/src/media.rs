@@ -184,6 +184,7 @@ async fn run_ytdlp(args: Vec<String>) -> Result<String, StatusCode> {
 /// The shared request gate for both media endpoints: allowed origin,
 /// session cookie + CSRF token bound to that session, and a charge against
 /// the `media` rate-limit bucket. Returns `Ok(sid)` on success.
+#[allow(clippy::result_large_err)] // axum's Response is a fixed-size, cache-friendly error here
 async fn authorize_media(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
     if !origin_ok(headers, &state.config) {
         return Err(fail(StatusCode::FORBIDDEN));

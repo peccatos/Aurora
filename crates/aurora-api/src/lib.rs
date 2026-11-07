@@ -48,6 +48,11 @@ pub struct AppState {
     pub encryption_key: [u8; 32],
     oauth: Arc<dyn OAuthService>,
     pub(crate) playlist_http: Arc<Mutex<Box<dyn aurora_providers::playlist::Http + Send>>>,
+    /// Serializes concurrent token refreshes per account (session hash +
+    /// provider) so two simultaneous requests with the same expired access
+    /// token share one refresh instead of the second replaying an
+    /// already-rotated refresh token into a spurious `invalid_grant`.
+    pub(crate) refresh_gate: aurora_providers::token::RefreshGate,
     limits: Arc<RateLimiter>,
     /// When the last opportunistic expiry sweep started; see
     /// [`AppState::cleanup_expired`].
@@ -1072,6 +1077,9 @@ async fn playlists(
         Ok(value) => value,
         Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
     };
+    // Refresh serialization key: opaque, derived from the same hashes the
+    // credential rows are keyed by. No token material crosses here.
+    let refresh_key = format!("{session_hash}:{provider}");
     let mut http = state.playlist_http.lock().await;
     let result = if provider == "spotify" {
         let mut url = Url::parse("https://api.spotify.com/v1/me/playlists").expect("constant URL");
@@ -1082,6 +1090,8 @@ async fn playlists(
             &mut *http,
             &mut tokens,
             &client,
+            &state.refresh_gate,
+            &refresh_key,
             url.to_string(),
             4,
         )
@@ -1126,6 +1136,8 @@ async fn playlists(
             &mut *http,
             &mut tokens,
             &client,
+            &state.refresh_gate,
+            &refresh_key,
             url.to_string(),
             4,
         )
@@ -1219,6 +1231,7 @@ pub fn storage_state(config: Config, pool: SqlitePool, encryption_key: [u8; 32])
                 .expect("static playlist HTTP client configuration"),
         })
             as Box<dyn aurora_providers::playlist::Http + Send>)),
+        refresh_gate: aurora_providers::token::RefreshGate::default(),
         limits: Arc::new(RateLimiter::standard()),
         last_cleanup: Arc::new(Mutex::new(None)),
     }
@@ -1264,6 +1277,7 @@ pub fn test_state(
         encryption_key,
         oauth,
         playlist_http: Arc::new(Mutex::new(playlist_http)),
+        refresh_gate: aurora_providers::token::RefreshGate::default(),
         limits: Arc::new(RateLimiter::standard()),
         last_cleanup: Arc::new(Mutex::new(None)),
     }

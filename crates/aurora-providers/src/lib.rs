@@ -705,13 +705,14 @@ pub mod token {
     use super::ProviderConfig;
     use serde::Deserialize;
     use std::{
+        collections::HashMap,
         future::Future,
         pin::Pin,
         sync::Arc,
         time::{Duration, Instant},
     };
     use thiserror::Error;
-    use tokio::time;
+    use tokio::{sync::Mutex, time};
     use url::Url;
 
     pub struct TokenRequest {
@@ -782,6 +783,9 @@ pub mod token {
         scope: Option<String>,
     }
     /// Credentials are intentionally not Debug/Serialize: callers must keep them native-only.
+    /// Clone stays available for in-process use (sharing a rotated set inside one host),
+    /// but a clone never leaves the process.
+    #[derive(Clone)]
     pub struct TokenSet {
         pub access_token: String,
         pub token_type: String,
@@ -1040,6 +1044,90 @@ pub mod token {
                 scope: parsed.scope,
                 expires_at: Instant::now() + lifetime,
             })
+        }
+    }
+
+    /// Serializes concurrent refresh attempts for one account.
+    ///
+    /// Providers such as Spotify rotate refresh tokens on every use. Two
+    /// concurrent requests that both hold the same expired access token would
+    /// otherwise both send the same refresh token: the first rotates it, the
+    /// second is answered `invalid_grant` and the caller misreads that as a
+    /// dead grant, forcing a spurious reauthorization. The gate keys on an
+    /// opaque caller-chosen account identifier (e.g. hashed session plus
+    /// provider) so exactly one refresh runs per account at a time; a waiter
+    /// holding the refresh token that was just consumed reuses the rotated
+    /// token set instead of replaying it.
+    ///
+    /// Only successful refreshes are remembered, and only until the next
+    /// refresh with a different token, so sequential (non-concurrent)
+    /// behavior is unchanged and transient failures stay retryable.
+    #[derive(Clone, Default)]
+    pub struct RefreshGate {
+        states: Arc<Mutex<HashMap<String, Arc<RefreshState>>>>,
+    }
+    struct RefreshState {
+        lock: Mutex<()>,
+        last: Mutex<Option<Refreshed>>,
+    }
+    struct Refreshed {
+        /// The refresh token whose refresh produced `tokens`.
+        consumed: String,
+        tokens: TokenSet,
+    }
+    impl RefreshGate {
+        /// Refreshes `current` for `account` at most once at a time. The
+        /// refresh itself is unconditional: callers gate on their own
+        /// expiry or 401 signals before arriving here.
+        pub async fn refresh(
+            &self,
+            account: &str,
+            client: &Client,
+            current: &TokenSet,
+        ) -> Result<TokenSet, Error> {
+            let state = self
+                .states
+                .lock()
+                .await
+                .entry(account.to_owned())
+                .or_insert_with(|| {
+                    Arc::new(RefreshState {
+                        lock: Mutex::new(()),
+                        last: Mutex::new(None),
+                    })
+                })
+                .clone();
+            let _serialized = state.lock.lock().await;
+            let refresh = current
+                .refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .ok_or(Error::MissingRefreshToken)?
+                .to_owned();
+            // Double-checked reuse: a concurrent caller may already have
+            // rotated the very refresh token we are holding.
+            if let Some(previous) = state.last.lock().await.as_ref()
+                && previous.consumed == refresh
+            {
+                return Ok(previous.tokens.clone());
+            }
+            match client.refresh(&refresh).await {
+                Ok(tokens) => {
+                    *state.last.lock().await = Some(Refreshed {
+                        consumed: refresh,
+                        tokens: tokens.clone(),
+                    });
+                    Ok(tokens)
+                }
+                Err(error) => {
+                    // A failed refresh leaves the stored grant unchanged (or
+                    // definitively dead); nothing is cached so a later
+                    // attempt is free to retry instead of replaying a stale
+                    // outcome.
+                    *state.last.lock().await = None;
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -1690,21 +1778,25 @@ pub mod playlist {
     /// access token through the native token client before retrying once.
     /// A failed refresh is classified so callers can tell a transient outage
     /// apart from a grant the provider has permanently rejected.
+    ///
+    /// Refreshes are serialized per `account` (an opaque key the caller
+    /// derives from its persisted credentials, e.g. session plus provider)
+    /// through the gate, so two concurrent expired-token requests share one
+    /// refresh instead of the second replaying an already-rotated refresh
+    /// token and receiving a spurious `invalid_grant`.
     pub async fn authorized_get<H: Http>(
         http: &mut H,
         tokens: &mut super::token::TokenSet,
         token_client: &super::token::Client,
+        refresh_gate: &super::token::RefreshGate,
+        account: &str,
         url: String,
         max_attempts: u32,
     ) -> Result<Response, Error> {
         match get(http, url.clone(), &tokens.access_token, max_attempts) {
             Err(Error::RefreshRequired) => {
-                let refresh = tokens
-                    .refresh_token
-                    .as_deref()
-                    .ok_or(Error::RefreshRequired)?;
-                let updated = token_client
-                    .refresh(refresh)
+                let updated = refresh_gate
+                    .refresh(account, token_client, tokens)
                     .await
                     .map_err(refresh_failure)?;
                 *tokens = updated;
@@ -1963,6 +2055,157 @@ pub mod playlist {
             ] {
                 assert_eq!(refresh_failure(transient), Error::RefreshTransient);
             }
+        }
+
+        /// Token transport whose refresh endpoint rotates the grant once and
+        /// counts calls, with a small delay so concurrent callers genuinely
+        /// overlap inside the refresh.
+        struct RefreshCountingTransport {
+            refresh_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl super::super::token::Transport for RefreshCountingTransport {
+            fn send<'a>(
+                &'a self,
+                request: super::super::token::TokenRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                super::super::token::TokenResponse,
+                                super::super::token::TransportError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                let calls = self
+                    .refresh_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let grant_is_rotated = request
+                        .form
+                        .iter()
+                        .any(|(key, value)| key == "refresh_token" && value == "rotated");
+                    let body: Vec<u8> = if calls == 0 && grant_is_rotated {
+                        br#"{"access_token":"fresh","refresh_token":"rotated-next","expires_in":3600}"#.to_vec()
+                    } else {
+                        // The rotated grant is already spent: replaying it is
+                        // exactly the spurious invalid_grant this gate prevents.
+                        br#"{"error":"invalid_grant"}"#.to_vec()
+                    };
+                    let status = if calls == 0 && grant_is_rotated {
+                        200
+                    } else {
+                        400
+                    };
+                    Ok(super::super::token::TokenResponse { status, body })
+                })
+            }
+        }
+        /// Playlist transport that answers 401 for the stale access token and
+        /// 200 for the refreshed one.
+        struct ExpiredFake {
+            served_fresh: std::sync::atomic::AtomicUsize,
+        }
+        impl Http for ExpiredFake {
+            fn send(&mut self, request: Request) -> Result<Response, Error> {
+                let fresh = request
+                    .headers
+                    .iter()
+                    .any(|(key, value)| key == "Authorization" && value == "Bearer fresh");
+                if fresh {
+                    self.served_fresh
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Response {
+                        status: 200,
+                        headers: vec![],
+                        body: br#"{"items":[]}"#.to_vec(),
+                    })
+                } else {
+                    Ok(Response {
+                        status: 401,
+                        headers: vec![],
+                        body: vec![],
+                    })
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn concurrent_expired_requests_refresh_exactly_once() {
+            use std::sync::Arc;
+            use std::time::Duration;
+            // Two simultaneous calls share one expired access token and one
+            // (rotating) refresh token. Without serialization the second
+            // refresh replays the already-rotated grant and receives
+            // invalid_grant, forcing a spurious reauthorization.
+            let transport = Arc::new(RefreshCountingTransport {
+                refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let config = crate::ProviderConfig {
+                id: "spotify".into(),
+                client_id: "id".into(),
+                authorization_endpoint: "https://accounts.spotify.com/authorize".into(),
+                token_endpoint: "https://accounts.spotify.com/api/token".into(),
+                scopes: vec!["user-read-email".into()],
+                enabled: true,
+            };
+            let client = super::super::token::Client::new(
+                config,
+                String::new(),
+                transport.clone(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            // A decoded token set whose lifetime has already elapsed.
+            let tokens = || {
+                super::super::token::TokenSet::decode_native(
+                    br#"{"access_token":"stale","token_type":"Bearer","refresh_token":"rotated","expires_at_unix":0}"#,
+                )
+                .unwrap()
+            };
+            let gate = super::super::token::RefreshGate::default();
+            let url = "https://api.spotify.com/v1/me/playlists".to_owned();
+            let (first, second) = {
+                let mut http_a = ExpiredFake {
+                    served_fresh: std::sync::atomic::AtomicUsize::new(0),
+                };
+                let mut http_b = ExpiredFake {
+                    served_fresh: std::sync::atomic::AtomicUsize::new(0),
+                };
+                let mut tokens_a = tokens();
+                let mut tokens_b = tokens();
+                tokio::join!(
+                    authorized_get(
+                        &mut http_a,
+                        &mut tokens_a,
+                        &client,
+                        &gate,
+                        "account",
+                        url.clone(),
+                        4
+                    ),
+                    authorized_get(
+                        &mut http_b,
+                        &mut tokens_b,
+                        &client,
+                        &gate,
+                        "account",
+                        url.clone(),
+                        4
+                    ),
+                )
+            };
+            assert!(first.is_ok(), "first call failed: {:?}", first.err());
+            assert!(second.is_ok(), "second call failed: {:?}", second.err());
+            assert_eq!(
+                transport
+                    .refresh_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the refresh endpoint must be hit exactly once"
+            );
         }
 
         #[test]
