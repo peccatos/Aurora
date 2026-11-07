@@ -9,7 +9,7 @@ import type { OAuthAccount, OAuthCallbackResult } from "./oauth.ts";
 import { normalizeOAuthAccount } from "./oauth.ts";
 import { canonicalProviderId } from "./provider-registry.ts";
 
-export type AccountConnectionState = "connected" | "disconnected" | "error";
+export type AccountConnectionState = "connected" | "disconnected" | "error" | "pending" | "timeout";
 
 export interface AccountRecord extends OAuthAccount {
   state: AccountConnectionState;
@@ -46,10 +46,10 @@ function load(): void {
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return;
     for (const item of parsed) {
-      if (!isRecord(item) || (item.state !== "connected" && item.state !== "disconnected" && item.state !== "error")) continue;
+      if (!isRecord(item) || !["connected", "disconnected", "error", "pending", "timeout"].includes(String(item.state))) continue;
       try {
         const account = normalizeOAuthAccount(item as Parameters<typeof normalizeOAuthAccount>[0]);
-        accounts.set(account.provider, { ...account, state: item.state, lastError: typeof item.lastError === "string" ? item.lastError : null });
+        accounts.set(account.provider, { ...account, state: item.state as AccountConnectionState, lastError: typeof item.lastError === "string" ? item.lastError : null });
       } catch { /* discard malformed metadata */ }
     }
   } catch { /* discard malformed storage */ }
@@ -124,6 +124,21 @@ export async function refreshAccountStatus(provider: string): Promise<AccountRec
   return record;
 }
 
+/** Marks a native authorization attempt while the system browser is open. */
+export function markAuthorizationPending(provider: string): void {
+  const key = providerKey(provider);
+  const existing = accounts.get(key);
+  if (existing) accounts.set(key, { ...existing, state: "pending", lastError: null });
+  save();
+}
+
+export function markAuthorizationTimeout(provider: string): void {
+  const key = providerKey(provider);
+  const existing = accounts.get(key);
+  if (existing) accounts.set(key, { ...existing, state: "timeout", lastError: "Authorization timed out" });
+  save();
+}
+
 /** Records a native callback failure using sanitized text only. */
 export function recordAuthorizationError(provider: string, message: string): void {
   const key = providerKey(provider);
@@ -134,7 +149,7 @@ export function recordAuthorizationError(provider: string, message: string): voi
 
 /** Test/backend bridge: persist sanitized identity metadata after secure exchange. */
 export function recordConnectedAccount(input: Parameters<typeof normalizeOAuthAccount>[0]): AccountRecord {
-  const account = normalizeOAuthAccount(input);
+  const account = normalizeOAuthAccount({ ...input, provider: providerKey(input.provider) });
   const record: AccountRecord = { ...account, state: "connected", lastError: null };
   accounts.set(account.provider, record);
   save();

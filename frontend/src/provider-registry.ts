@@ -1,6 +1,7 @@
 /** Provider capability boundary. This registry describes integrations only; it
  * never authenticates users or fetches protected media. A provider marked
- * `oauth-required` remains unavailable until an explicit auth adapter exists.
+ * `oauth-required` describes protected operations; native OAuth may still be
+ * available through the desktop adapter.
  */
 
 export type ProviderId =
@@ -59,8 +60,8 @@ const descriptors: readonly ProviderDescriptor[] = [
   { id: "deezer", name: "Deezer", availability: "available", capabilities: ["metadata-search", "preview-playback"], limitation: "Preview clips only; browser CORS may block requests" },
   { id: "musicbrainz", name: "MusicBrainz", availability: "available", capabilities: ["metadata-search"], limitation: "Metadata only; no audio playback" },
   { id: "archive-org", name: "Internet Archive", availability: "available", capabilities: ["metadata-search", "licensed-full-track"], limitation: "Only legally shared/public-domain items" },
-  { id: "spotify", name: "Spotify", availability: "oauth-required", capabilities: ["metadata-search", "playlist-import"], limitation: "OAuth and account integration are not implemented; protected playback is not supported" },
-  { id: "youtube-music", name: "YouTube Music", availability: "oauth-required", capabilities: ["metadata-search", "playlist-import"], limitation: "OAuth and account integration are not implemented; protected playback is not supported" },
+  { id: "spotify", name: "Spotify", availability: "oauth-required", capabilities: ["metadata-search", "playlist-import"], limitation: "Native OAuth identity is available in desktop; protected playback and playlist transport are not implemented" },
+  { id: "youtube-music", name: "YouTube Music", availability: "oauth-required", capabilities: ["metadata-search", "playlist-import"], limitation: "Native OAuth identity is available in desktop; protected playback and playlist transport are not implemented" },
   { id: "soundcloud", name: "SoundCloud", availability: "unsupported", capabilities: [], limitation: "No provider adapter is implemented" },
 ];
 

@@ -4,7 +4,7 @@
  *  only references ids (small, honest, survives reloads).
  */
 
-import { kvGet, kvPut } from "./library-db";
+import { kvGet, kvPut } from "./library-db.ts";
 
 export interface Playlist {
   id: string;
@@ -12,6 +12,13 @@ export interface Playlist {
   /** Track ids (library-db tracks store keys), play order. */
   trackIds: string[];
   createdAt: number;
+  source?: {
+    provider: "spotify" | "youtube-music";
+    playlistId: string;
+    revision: string | null;
+    importedAt: number;
+    lastSyncedAt: number | null;
+  };
 }
 
 const KEY = "aw:playlists";
@@ -44,13 +51,10 @@ async function load(): Promise<Playlist[]> {
 }
 
 async function save(list: Playlist[]): Promise<void> {
-  cache = list;
+  const snapshot = list.map((playlist) => ({ ...playlist, trackIds: [...playlist.trackIds], source: playlist.source ? { ...playlist.source } : undefined }));
+  await kvPut(KEY, snapshot);
+  cache = snapshot;
   notifyChanged();
-  try {
-    await kvPut(KEY, list);
-  } catch {
-    /* best-effort; a failed save must not lose the in-session list */
-  }
 }
 
 export async function listPlaylists(): Promise<Playlist[]> {
@@ -77,8 +81,7 @@ export async function renamePlaylist(id: string, name: string): Promise<void> {
   const list = await load();
   const p = list.find((x) => x.id === id);
   if (p && name.trim()) {
-    p.name = name.trim();
-    await save(list);
+    await save(list.map((item) => item.id === id ? { ...item, name: name.trim() } : item));
   }
 }
 
@@ -91,18 +94,15 @@ export async function addToPlaylist(id: string, trackIds: string[]): Promise<voi
   const list = await load();
   const p = list.find((x) => x.id === id);
   if (!p) return;
-  for (const t of trackIds) {
-    if (!p.trackIds.includes(t)) p.trackIds.push(t);
-  }
-  await save(list);
+  const additions = trackIds.filter((trackId) => !p.trackIds.includes(trackId));
+  await save(list.map((item) => item.id === id ? { ...item, trackIds: [...item.trackIds, ...additions] } : item));
 }
 
 export async function removeFromPlaylist(id: string, trackId: string): Promise<void> {
   const list = await load();
   const p = list.find((x) => x.id === id);
   if (!p) return;
-  p.trackIds = p.trackIds.filter((t) => t !== trackId);
-  await save(list);
+  await save(list.map((item) => item.id === id ? { ...item, trackIds: item.trackIds.filter((t) => t !== trackId) } : item));
 }
 
 /** Drag-reorder: move a track entry to a new index. */
@@ -115,8 +115,10 @@ export async function reorderPlaylist(
   const p = list.find((x) => x.id === id);
   if (!p) return;
   const from = p.trackIds.indexOf(trackId);
-  if (from < 0 || toIndex < 0 || toIndex >= p.trackIds.length) return;
-  p.trackIds.splice(from, 1);
-  p.trackIds.splice(toIndex, 0, trackId);
-  await save(list);
+  if (from < 0 || toIndex < 0 || toIndex > p.trackIds.length) return;
+  const next = [...p.trackIds];
+  next.splice(from, 1);
+  const target = Math.min(toIndex, next.length);
+  next.splice(target, 0, trackId);
+  await save(list.map((item) => item.id === id ? { ...item, trackIds: next } : item));
 }

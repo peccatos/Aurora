@@ -3,7 +3,13 @@
 //! One command = one kernel call + DTO translation. No business logic
 //! lives here: the music player IS `aurora-kernel`.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::Mutex;
 
 use aurora_kernel::{
@@ -91,12 +97,35 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let mut oauth_metadata = HashMap::new();
+        let mut oauth_accounts = HashMap::new();
+        for provider in ["spotify", "youtube-music"] {
+            if let Ok(Some(metadata)) = crate::credentials::load_metadata(provider) {
+                if matches!(crate::credentials::status(provider, &metadata.subject), Ok(status) if status.present)
+                {
+                    oauth_accounts.insert(provider.to_owned(), metadata.subject.clone());
+                    oauth_metadata.insert(
+                        provider.to_owned(),
+                        ProviderAccountMetadata {
+                            provider: metadata.provider,
+                            subject: metadata.subject,
+                            display_name: metadata.display_name,
+                            avatar_url: metadata.avatar_url,
+                            capabilities: metadata.capabilities,
+                            connected_at: metadata.connected_at,
+                        },
+                    );
+                } else {
+                    let _ = crate::credentials::remove_metadata(provider);
+                }
+            }
+        }
         Self {
             kernel: Arc::new(PlayerKernel::new()),
             providers: aurora_providers::ProviderRegistry::from_environment(),
             oauth: aurora_providers::Coordinator::default(),
-            oauth_accounts: Mutex::new(HashMap::new()),
-            oauth_metadata: Mutex::new(HashMap::new()),
+            oauth_accounts: Mutex::new(oauth_accounts),
+            oauth_metadata: Mutex::new(oauth_metadata),
         }
     }
 }
@@ -120,6 +149,14 @@ fn map_err(e: KernelError) -> CommandError {
 
 type K<'a> = State<'a, AppState>;
 
+fn canonical_provider(provider: &str) -> Result<String, CommandError> {
+    aurora_providers::canonical_provider_id(provider)
+        .map(str::to_owned)
+        .ok_or_else(|| CommandError::Provider {
+            message: "provider is not configured".into(),
+        })
+}
+
 #[tauri::command]
 pub fn provider_config_status(
     state: K<'_>,
@@ -132,6 +169,7 @@ pub async fn oauth_begin(
     provider: String,
     state: K<'_>,
 ) -> Result<aurora_providers::AuthorizationStart, CommandError> {
+    let provider = canonical_provider(&provider)?;
     state
         .providers
         .begin(&provider, &state.oauth)
@@ -158,11 +196,7 @@ pub async fn provider_account_status(
     provider: String,
     state: K<'_>,
 ) -> Result<Option<ProviderAccountMetadata>, CommandError> {
-    if provider.trim().is_empty() {
-        return Err(CommandError::Provider {
-            message: "provider is empty".into(),
-        });
-    }
+    let provider = canonical_provider(&provider)?;
     Ok(state.oauth_metadata.lock().await.get(&provider).cloned())
 }
 
@@ -171,12 +205,15 @@ pub async fn oauth_poll(
     provider: String,
     state: K<'_>,
 ) -> Result<Option<ProviderAccountMetadata>, CommandError> {
-    let Some((redirect_uri, callback)) = state.oauth.peek_completed(&provider).await else {
+    let provider = canonical_provider(&provider)?;
+    let Some((callback_state, redirect_uri, callback)) =
+        state.oauth.peek_completed(&provider).await
+    else {
         return Ok(state.oauth_metadata.lock().await.get(&provider).cloned());
     };
-    // The callback is single-use; consume it before exchanging the code.
-    state.oauth.clear_completed(&provider).await;
     let aurora_providers::CallbackResult::Code { code, verifier } = callback else {
+        // A denial is terminal, unlike exchange/profile/storage failures.
+        state.oauth.clear_completed(&callback_state).await;
         return Err(CommandError::Provider {
             message: "authorization denied".into(),
         });
@@ -233,6 +270,17 @@ pub async fn oauth_poll(
         capabilities: vec!["identity".into()],
         connected_at: chrono::Utc::now().to_rfc3339(),
     };
+    crate::credentials::store_metadata(&crate::credentials::StoredAccountMetadata {
+        provider: metadata.provider.clone(),
+        subject: metadata.subject.clone(),
+        display_name: metadata.display_name.clone(),
+        avatar_url: metadata.avatar_url.clone(),
+        capabilities: metadata.capabilities.clone(),
+        connected_at: metadata.connected_at.clone(),
+    })
+    .map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })?;
     state
         .oauth_accounts
         .lock()
@@ -243,7 +291,7 @@ pub async fn oauth_poll(
         .lock()
         .await
         .insert(provider, metadata.clone());
-    state.oauth.clear_completed(&metadata.provider).await;
+    state.oauth.clear_completed(&callback_state).await;
     Ok(Some(metadata))
 }
 
@@ -253,13 +301,9 @@ pub async fn provider_disconnect(
     account_id: Option<String>,
     state: K<'_>,
 ) -> Result<(), CommandError> {
-    if provider.trim().is_empty() {
-        return Err(CommandError::Provider {
-            message: "provider is empty".into(),
-        });
-    }
+    let provider = canonical_provider(&provider)?;
     state.oauth.disconnect(&provider).await;
-    state.oauth.clear_completed(&provider).await;
+    state.oauth.clear_completed_provider(&provider).await;
     let stored_account_id = state.oauth_accounts.lock().await.remove(&provider);
     let account_id = stored_account_id.or(account_id);
     if let Some(account_id) = account_id {
@@ -269,6 +313,9 @@ pub async fn provider_disconnect(
             }
         })?;
     }
+    crate::credentials::remove_metadata(&provider).map_err(|e| CommandError::Credential {
+        message: e.to_string(),
+    })?;
     state.oauth_metadata.lock().await.remove(&provider);
     Ok(())
 }
@@ -278,6 +325,7 @@ pub fn provider_capabilities(
     provider: String,
     state: K<'_>,
 ) -> Result<aurora_providers::ProviderStatus, CommandError> {
+    let provider = canonical_provider(&provider)?;
     state
         .providers
         .status(&provider)
@@ -1014,6 +1062,145 @@ pub async fn track_bpm(path: String, state: K<'_>) -> Result<Option<f64>, Comman
     state.kernel.track_bpm(&path).await.map_err(map_err)
 }
 
+const YTDLP_MAX_OUTPUT: usize = 2 * 1024 * 1024;
+const YTDLP_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn allowed_ytdlp_url(raw: &str) -> Result<url::Url, CommandError> {
+    let url = url::Url::parse(raw).map_err(|_| CommandError::Provider {
+        message: "invalid media URL".into(),
+    })?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = matches!(
+        host.as_str(),
+        "archive.org" | "www.archive.org" | "youtube.com" | "www.youtube.com" | "youtu.be"
+    );
+    if url.scheme() != "https" || !allowed || url.username() != "" || url.password().is_some() {
+        return Err(CommandError::Provider {
+            message: "media URL is not an allowed HTTPS source".into(),
+        });
+    }
+    Ok(url)
+}
+
+fn ytdlp_path() -> Result<PathBuf, CommandError> {
+    let name = format!("yt-dlp{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates: Vec<PathBuf> = vec![
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(&name))),
+        Some(Path::new("apps/desktop/binaries").join(&name)),
+        Some(Path::new("bin").join(&name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for directory in [Path::new("apps/desktop/binaries"), Path::new("bin")] {
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            candidates.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter_map(|path| {
+                        let allowed = path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| {
+                                value.starts_with("yt-dlp-")
+                                    && value.ends_with(std::env::consts::EXE_SUFFIX)
+                            });
+                        allowed.then_some(path)
+                    }),
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| CommandError::Provider {
+            message: "yt-dlp sidecar is not installed".into(),
+        })
+}
+
+async fn run_ytdlp(args: Vec<String>) -> Result<String, CommandError> {
+    let path = ytdlp_path()?;
+    let result = tokio::time::timeout(
+        YTDLP_TIMEOUT,
+        tokio::process::Command::new(path).args(args).output(),
+    )
+    .await
+    .map_err(|_| CommandError::Provider {
+        message: "yt-dlp timed out".into(),
+    })?
+    .map_err(|_| CommandError::Provider {
+        message: "yt-dlp could not be started".into(),
+    })?;
+    if result.stdout.len() > YTDLP_MAX_OUTPUT || result.stderr.len() > YTDLP_MAX_OUTPUT {
+        return Err(CommandError::Provider {
+            message: "yt-dlp output exceeded the safety limit".into(),
+        });
+    }
+    if !result.status.success() {
+        return Err(CommandError::Provider {
+            message: String::from_utf8_lossy(&result.stderr)
+                .chars()
+                .take(512)
+                .collect(),
+        });
+    }
+    String::from_utf8(result.stdout).map_err(|_| CommandError::Provider {
+        message: "yt-dlp returned invalid UTF-8".into(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YtdlpMetadata {
+    pub json: String,
+}
+
+#[tauri::command]
+pub async fn yt_dlp_metadata(url: String) -> Result<YtdlpMetadata, CommandError> {
+    let url = allowed_ytdlp_url(&url)?;
+    let json = run_ytdlp(vec![
+        "--no-playlist".into(),
+        "--dump-single-json".into(),
+        "--no-warnings".into(),
+        url.to_string(),
+    ])
+    .await?;
+    Ok(YtdlpMetadata { json })
+}
+
+#[tauri::command]
+pub async fn yt_dlp_download(url: String, output_dir: String) -> Result<String, CommandError> {
+    let url = allowed_ytdlp_url(&url)?;
+    let dir = PathBuf::from(output_dir);
+    if !dir.is_absolute() {
+        return Err(CommandError::Provider {
+            message: "download directory must be absolute".into(),
+        });
+    }
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|_| CommandError::Provider {
+            message: "download directory is not available".into(),
+        })?;
+    let template = dir.join("%(title).80s [%(id)s].%(ext)s");
+    let path = run_ytdlp(vec![
+        "--no-playlist".into(),
+        "--no-warnings".into(),
+        "--restrict-filenames".into(),
+        "--no-part".into(),
+        "--print".into(),
+        "after_move:filepath".into(),
+        "-o".into(),
+        template.to_string_lossy().into_owned(),
+        url.to_string(),
+    ])
+    .await?;
+    Ok(path.trim().to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
@@ -1161,6 +1348,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             deck_tempo,
             deck_status,
             track_bpm,
+            yt_dlp_metadata,
+            yt_dlp_download,
             get_track_artwork,
             pause_playback,
             resume_playback,

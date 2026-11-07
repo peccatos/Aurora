@@ -170,7 +170,7 @@ export function normalizeOAuthAccount(input: {
   if (avatarUrl) {
     try {
       const parsed = new URL(avatarUrl);
-      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error();
+      if (parsed.protocol !== "https:") throw new Error();
     } catch {
       throw new Error("Invalid OAuth avatar URL");
     }

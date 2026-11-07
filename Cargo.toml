@@ -13,6 +13,7 @@ members = [
     "crates/aurora-kernel",
     "crates/aurora-web",
     "crates/aurora-tauri",
+    "crates/aurora-api",
     "crates/aurora-app",
     "apps/desktop",
 ]
@@ -37,6 +38,7 @@ aurora-library = { path = "crates/aurora-library" }
 aurora-kernel = { path = "crates/aurora-kernel" }
 aurora-web = { path = "crates/aurora-web" }
 aurora-tauri = { path = "crates/aurora-tauri" }
+aurora-api = { path = "crates/aurora-api" }
 aurora-app = { path = "crates/aurora-app" }
 
 # Audio stack
@@ -48,9 +50,10 @@ rubato = "5.0.1"
 ringbuf = "0.6.0"
 lofty = "0.25.5"
 blake3 = "1"
+aes-gcm = "0.10"
 
 # Runtime / persistence
-tokio = { version = "1", default-features = false, features = ["macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["macros", "sync", "time", "net", "io-util", "process"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros", "chrono", "uuid"] }
 
 # Desktop
@@ -66,6 +69,7 @@ ctrlc = "3.5"
 
 # Shared infrastructure
 serde = { version = "1", features = ["derive"] }
+url = "2.5"
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "form"] }
 uuid = { version = "1", features = ["v4", "serde", "js"] }
@@ -78,6 +82,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 notify = "8"
+
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Tests
 tempfile = "3"

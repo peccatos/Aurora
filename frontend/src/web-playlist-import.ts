@@ -11,6 +11,9 @@ export interface WebPlaylistImportReport {
   playlist: Playlist;
   matched: number;
   unmatched: string[];
+  /** Number of parsed entries in the file (matched + unmatched + skipped
+   *  duplicate entries). */
+  totalEntries: number;
 }
 
 function clean(value: string): string {
@@ -198,5 +201,5 @@ export async function importWebPlaylist(file: File, requestedName?: string): Pro
   const fallbackName = file.name.replace(/\.[^.]+$/, "").trim() || "Imported playlist";
   const playlist = await createPlaylist(requestedName?.trim() || fallbackName);
   await addToPlaylist(playlist.id, ids);
-  return { playlist: { ...playlist, trackIds: ids }, matched: ids.length, unmatched };
+  return { playlist: { ...playlist, trackIds: ids }, matched: ids.length, unmatched, totalEntries: entries.length };
 }

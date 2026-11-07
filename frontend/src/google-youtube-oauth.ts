@@ -1,4 +1,4 @@
-import type { OAuthCapability, PendingOAuthSession } from "./oauth";
+import type { OAuthCapability, PendingOAuthSession } from "./oauth.ts";
 
 export const GOOGLE_YOUTUBE_PROVIDER = "google-youtube";
 export const GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";

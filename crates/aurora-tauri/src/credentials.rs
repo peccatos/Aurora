@@ -8,6 +8,17 @@ use serde::Serialize;
 use thiserror::Error;
 
 const SERVICE: &str = "dev.aurora.player.oauth";
+const METADATA_ACCOUNT: &str = "__account_metadata__";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredAccountMetadata {
+    pub provider: String,
+    pub subject: String,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+    pub capabilities: Vec<String>,
+    pub connected_at: String,
+}
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -48,6 +59,52 @@ pub(crate) fn store_token_set(
     entry(provider, account_id)?
         .set_password(&value)
         .map_err(|e| CredentialError::Store(e.to_string()))
+}
+
+/// Load a token set for native provider API calls. The decoded value never
+/// leaves the native process.
+#[allow(dead_code)]
+pub(crate) fn load_token_set(
+    provider: &str,
+    account_id: &str,
+) -> Result<Option<TokenSet>, CredentialError> {
+    let value = match entry(provider, account_id)?.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => return Err(CredentialError::Store(e.to_string())),
+    };
+    TokenSet::decode_native(value.as_bytes())
+        .map(Some)
+        .map_err(|_| CredentialError::InvalidCredential)
+}
+
+/// Persist sanitized account metadata beside (but separately from) token
+/// material so native state can be restored after restart.
+pub(crate) fn store_metadata(metadata: &StoredAccountMetadata) -> Result<(), CredentialError> {
+    let value = serde_json::to_string(metadata).map_err(|_| CredentialError::InvalidCredential)?;
+    entry(&metadata.provider, METADATA_ACCOUNT)?
+        .set_password(&value)
+        .map_err(|e| CredentialError::Store(e.to_string()))
+}
+
+pub(crate) fn load_metadata(
+    provider: &str,
+) -> Result<Option<StoredAccountMetadata>, CredentialError> {
+    let value = match entry(provider, METADATA_ACCOUNT)?.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => return Err(CredentialError::Store(e.to_string())),
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .map_err(|_| CredentialError::InvalidCredential)
+}
+
+pub(crate) fn remove_metadata(provider: &str) -> Result<(), CredentialError> {
+    match entry(provider, METADATA_ACCOUNT)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CredentialError::Store(e.to_string())),
+    }
 }
 
 pub fn remove(provider: &str, account_id: &str) -> Result<(), CredentialError> {

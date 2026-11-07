@@ -17,9 +17,11 @@ http://127.0.0.1:<ephemeral-port>/oauth/callback/youtube-music
 
 The provider dashboard must allow the exact URI, including path and trailing slash semantics. The coordinator must reject non-loopback hosts, `0.0.0.0`, arbitrary paths, and HTTP redirects outside development. The callback listener is not the frontend development server.
 
-## Future web deployment
+## Web OAuth deployment
 
-Web OAuth is intentionally not enabled by this desktop-only stage. A future web deployment needs a separately hosted HTTPS callback, registered per environment, with server-side code exchange and secret storage. Do not reuse the desktop loopback URI or put a client secret in a Vite bundle.
+Web OAuth is supported only through a separately hosted HTTPS backend. The backend owns the provider callback, state and PKCE verifier, code exchange, token refresh, and credential storage. The browser receives only an authorization URL and sanitized account metadata through a secure session-cookie API; it never receives client secrets, authorization codes, PKCE verifiers, access tokens, or refresh tokens.
+
+Set `VITE_OAUTH_API_BASE_URL` to the backend’s HTTPS origin (or HTTPS path prefix) at build time; leaving it empty disables the browser adapters and keeps sign-in unavailable. Register an exact HTTPS callback independently for each web environment. Do not reuse the desktop loopback URI or put a client secret in a Vite bundle. The backend must bind authorization attempts to the user session, protect begin/revoke endpoints against CSRF, consume callbacks once, and fail closed when provider configuration is absent. Desktop continues using the native ephemeral loopback/Tauri adapter.
 
 ## Configuration
 

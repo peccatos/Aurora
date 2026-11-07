@@ -18,6 +18,96 @@ import {
 } from "../playlist-service";
 import { getAllTracks, type StoredTrack } from "../library-db";
 import { importWebPlaylist } from "../web-playlist-import";
+import {
+  importRemotePlaylist,
+  type PlaylistImportReport,
+  type RemotePlaylistSummary,
+  type RemoteProvider,
+} from "../remote-playlist-import";
+
+/** Renders one import report (shared by the file and provider paths). */
+function showImportReport(root: HTMLElement, report: PlaylistImportReport): void {
+  const box = root.querySelector<HTMLElement>("#pl-import-report");
+  if (!box) return;
+  box.hidden = false;
+  box.innerHTML = "";
+  const heading = document.createElement("h2");
+  heading.textContent =
+    `Import report: ${report.matched} matched, ${report.unmatched} not found` +
+    (report.ambiguous ? `, ${report.ambiguous} ambiguous` : "") +
+    (report.duplicateMatches ? `, ${report.duplicateMatches} duplicate` : "") +
+    ` of ${report.totalRemoteTracks} source position${report.totalRemoteTracks === 1 ? "" : "s"}` +
+    (report.uniqueLocalTracks !== report.matched
+      ? ` (${report.uniqueLocalTracks} unique local track${report.uniqueLocalTracks === 1 ? "" : "s"})`
+      : "");
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "btn";
+  close.textContent = "Dismiss";
+  close.addEventListener("click", () => box.remove());
+  box.append(heading, close);
+
+  const section = (title: string, items: string[]) => {
+    if (!items.length) return;
+    const sub = document.createElement("h3");
+    sub.textContent = title;
+    const list = document.createElement("ul");
+    for (const item of items) {
+      const row = document.createElement("li");
+      row.textContent = item;
+      list.appendChild(row);
+    }
+    box.append(sub, list);
+  };
+  section("Not in your library", report.unmatchedLabels);
+  section(
+    "Ambiguous (skipped, needs a manual pick)",
+    report.ambiguousEntries.map((entry) =>
+      `${entry.sourcePosition + 1}. ${entry.remote.title} — ${entry.candidates.length} candidates`,
+    ),
+  );
+  section(
+    "Repeated in the source playlist",
+    report.matchedEntries
+      .filter((entry) => entry.duplicate)
+      .map((entry) => `${entry.sourcePosition + 1}. ${entry.remote.title} (already added)`),
+  );
+}
+
+/** Provider song-list import: pick a provider, list its playlists, fetch
+ *  one snapshot and match it against the local library. */
+async function importFromProvider(root: HTMLElement, provider: RemoteProvider): Promise<void> {
+  const { listRemotePlaylists, getRemotePlaylist } = await import("../web-provider-adapter");
+  const page = await listRemotePlaylists(provider);
+  if (!page.items.length) {
+    setToast(`No ${provider} playlists found for the connected account`);
+    return;
+  }
+  const chosen = pickRemotePlaylist(page.items);
+  if (!chosen) return;
+  const requestedName = window.prompt("Playlist name", chosen.name);
+  if (requestedName === null) return;
+  const snapshot = await getRemotePlaylist(provider, chosen.id);
+  const localTracks = await getAllTracks();
+  const report = await importRemotePlaylist(snapshot, { name: requestedName, localTracks });
+  setToast(
+    `Imported "${report.playlist.name}": ${report.matched} matched` +
+      (report.unmatched ? `, ${report.unmatched} not found` : ""),
+  );
+  renderList(root);
+  showImportReport(root, report);
+}
+
+/** Minimal provider picker (no in-app modal component exists yet). */
+function pickRemotePlaylist(items: RemotePlaylistSummary[]): RemotePlaylistSummary | null {
+  const labels = items.map(
+    (item, i) => `${i + 1}. ${item.name}${item.trackCount === null ? "" : ` (${item.trackCount})`}`,
+  );
+  const answer = window.prompt(`Import which playlist?\n${labels.join("\n")}`, "1");
+  if (answer === null) return null;
+  const index = Number(answer.trim()) - 1;
+  return Number.isInteger(index) && index >= 0 && index < items.length ? items[index] : null;
+}
 
 /** Play a playlist: resolve track ids -> entries, queue them. The play
  *  pipeline (register bytes, LUFS) lives with the Home module — reimport
@@ -66,9 +156,7 @@ function trackRows(
     }
     row.addEventListener("click", () => opts.onPlay(i));
     // Drag reorder (pointer-based; simple HTML5 DnD within the list).
-    row.addEventListener("dragstart", () => {
-      row.dataset.dragId = t.id;
-    });
+    row.dataset.dragId = t.id;
     container.appendChild(row);
   });
 }
@@ -79,6 +167,8 @@ function renderList(root: HTMLElement) {
       <h1 class="page-title">Playlists</h1>
       <button class="btn" id="pl-new" type="button">＋ New playlist</button>
       <button class="btn" id="pl-import-button" type="button">⇩ Import playlist</button>
+      <button class="btn" id="pl-remote-spotify" type="button">⇩ Spotify</button>
+      <button class="btn" id="pl-remote-ytm" type="button">⇩ YouTube Music</button>
       <input id="pl-import" class="visually-hidden-file" type="file" accept=".m3u,.m3u8,.pls,.json,.csv,.txt" aria-label="Choose a playlist file" />
       <button class="btn" id="pl-back-home" type="button">⌂ Home</button>
     </div>
@@ -94,6 +184,14 @@ function renderList(root: HTMLElement) {
   root.querySelector<HTMLButtonElement>("#pl-import-button")?.addEventListener("click", () => {
     root.querySelector<HTMLInputElement>("#pl-import")?.click();
   });
+
+  for (const [buttonId, provider] of [["#pl-remote-spotify", "spotify"], ["#pl-remote-ytm", "youtube-music"]] as const) {
+    root.querySelector<HTMLButtonElement>(buttonId)?.addEventListener("click", () => {
+      void importFromProvider(root, provider).catch((error: unknown) => {
+        setToast(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    });
+  }
 
   root.querySelector<HTMLButtonElement>("#pl-new")?.addEventListener("click", async () => {
     const name = window.prompt("Playlist name");
@@ -114,17 +212,18 @@ function renderList(root: HTMLElement) {
       const report = await importWebPlaylist(file, requestedName);
       setToast(`Imported "${report.playlist.name}": ${report.matched} matched` + (report.unmatched.length ? `, ${report.unmatched.length} not found` : ""));
       renderList(root);
-      const reportBox = root.querySelector<HTMLElement>("#pl-import-report");
-      if (reportBox) {
-        reportBox.hidden = false;
+      const box = root.querySelector<HTMLElement>("#pl-import-report");
+      if (box) {
+        box.hidden = false;
+        box.innerHTML = "";
         const heading = document.createElement("h2");
-        heading.textContent = `Import report: ${report.matched} matched, ${report.unmatched.length} not found`;
+        heading.textContent = `Import report: ${report.matched} matched, ${report.unmatched.length} not found of ${report.totalEntries} entries`;
         const close = document.createElement("button");
         close.type = "button";
         close.className = "btn";
         close.textContent = "Dismiss";
-        close.addEventListener("click", () => reportBox.remove());
-        reportBox.append(heading, close);
+        close.addEventListener("click", () => box.remove());
+        box.append(heading, close);
         if (report.unmatched.length) {
           const list = document.createElement("ul");
           for (const item of report.unmatched) {
@@ -132,7 +231,7 @@ function renderList(root: HTMLElement) {
             row.textContent = item;
             list.appendChild(row);
           }
-          reportBox.appendChild(list);
+          box.appendChild(list);
         }
       }
     } catch (error) {

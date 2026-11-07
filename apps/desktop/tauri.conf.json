@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -47,7 +47,8 @@
     "externalBin": [
       "binaries/vst3-host-helper",
       "binaries/vst3-host-probe",
-      "binaries/vst-gui-helper"
+      "binaries/vst-gui-helper",
+      "binaries/yt-dlp"
     ]
   }
 }

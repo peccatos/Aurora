@@ -43,6 +43,18 @@ them, never fake them.
   Spotify JSON exports and CSV (Last.fm, Apple Music, generic) — service
   lists match the local library by title/artist, with an honest
   matched/unmatched report.
+- **Remote playlists via OAuth (Spotify / YouTube Music)**: a server-side
+  backend-for-frontend (`aurora-api`) performs the authorization-code + PKCE
+  exchange, so client secrets and tokens never reach the browser. Tokens are
+  AES-256-GCM encrypted at rest, refresh/rotate automatically, and a
+  per-session CSRF token plus rate limiting guard every state-changing call.
+  Remote playlists import into the local library through the same
+  matched/unmatched report as file imports.
+- **yt-dlp media sidecar (metadata + authorized downloads)**: shipped as a
+  Tauri external binary. Metadata lookups and downloads are restricted to
+  HTTPS sources on an allowlist (archive.org, youtube.com, youtu.be); anything
+  else is refused before the process is spawned. No DRM/protected-stream
+  extraction — refused by design.
 - **Player page**: waveform seek bar, real-time 16-band spectrum (true FFT of
   what the wire carries), A/B loop, full signal-path diagnostics.
 - **System media keys** work globally (keyboard, Bluetooth headphones, remotes).
@@ -63,9 +75,14 @@ aurora-storage   SQLite WAL, idempotent rescans, settings, measured BPM
 aurora-library   scanner/search/playlists
 aurora-kernel    THE MUSIC PLAYER: engine, decks, queue, DSP, VST chain,
                  library, watcher, playlist import/export, events — no UI deps
+aurora-providers OAuth token + playlist clients (Spotify, YouTube Music);
+                 fixed HTTPS endpoints, allowlisted transports
+aurora-api       browser BFF: axum server — OAuth begin/callback/status,
+                 disconnect, remote playlists; sessions, CSRF, rate limits
 aurora-tauri     thin Tauri shell: command = one kernel call + DTO translation
+                 (plus the sandboxed yt-dlp media sidecar commands)
 aurora-app       composition root; crash-safe file logging
-apps/desktop     Tauri binary (Wry)
+apps/desktop     Tauri binary (Wry); yt-dlp staged as an external binary
 frontend/        modular TS: router + pages (player/queue/library/decks/eq/
                  plugins/settings), central state, styles as tokens
 ```
@@ -119,6 +136,12 @@ Or the long form:
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 cd frontend && npx tsc --noEmit && npm run build
 ```
+
+## Project status & known gaps
+
+`plan.md` (git-ignored, local) tracks every weak or unfinished area of the
+codebase with a severity and a next step. The validation gate below is what
+"done" means for a commit; the plan is what is honestly *not* done yet.
 
 ## Audio integrity policy
 

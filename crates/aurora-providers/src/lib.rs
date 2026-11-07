@@ -12,6 +12,14 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
+pub fn canonical_provider_id(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "spotify" => Some("spotify"),
+        "youtube" | "google-youtube" | "youtube-music" => Some("youtube-music"),
+        _ => None,
+    }
+}
+
 fn allowed_scope(provider: &str, scope: &str) -> bool {
     match provider {
         "spotify" => matches!(
@@ -92,6 +100,8 @@ pub enum ProviderError {
     Profile,
     #[error("credential storage failed")]
     Storage,
+    #[error("authorization already in progress")]
+    AuthorizationInProgress,
     #[error("authorization denied: {0}")]
     Denied(String),
 }
@@ -114,10 +124,14 @@ struct Pending {
     verifier: String,
     expires_at: std::time::Instant,
 }
+type CompletedCallback = (String, String, CallbackResult);
+
 #[derive(Clone)]
 pub struct Coordinator {
     sessions: Arc<Mutex<HashMap<String, Pending>>>,
-    completed: Arc<Mutex<HashMap<String, (String, CallbackResult)>>>,
+    // Completed callbacks are keyed by OAuth state, not provider, so parallel
+    // attempts cannot overwrite one another.
+    completed: Arc<Mutex<HashMap<String, CompletedCallback>>>,
 }
 impl Default for Coordinator {
     fn default() -> Self {
@@ -134,6 +148,15 @@ impl Coordinator {
         timeout: Duration,
     ) -> Result<AuthorizationStart, ProviderError> {
         config.validate()?;
+        if self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .any(|pending| pending.provider == config.id)
+        {
+            return Err(ProviderError::AuthorizationInProgress);
+        }
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|_| ProviderError::Listener)?;
@@ -266,12 +289,34 @@ impl Coordinator {
         Ok(metadata)
     }
 
-    pub async fn peek_completed(&self, provider: &str) -> Option<(String, CallbackResult)> {
-        self.completed.lock().await.get(provider).cloned()
+    /// Returns one completed callback for this provider, including its state.
+    /// The state is required to clear exactly the callback that was exchanged.
+    pub async fn peek_completed(&self, provider: &str) -> Option<(String, String, CallbackResult)> {
+        self.completed.lock().await.iter().find_map(
+            |(state, (callback_provider, redirect, result))| {
+                (callback_provider == provider)
+                    .then(|| (state.clone(), redirect.clone(), result.clone()))
+            },
+        )
     }
 
-    pub async fn clear_completed(&self, provider: &str) {
-        self.completed.lock().await.remove(provider);
+    pub async fn clear_completed(&self, state: &str) {
+        self.completed.lock().await.remove(state);
+    }
+
+    pub async fn clear_completed_provider(&self, provider: &str) {
+        self.completed
+            .lock()
+            .await
+            .retain(|_, (callback_provider, _, _)| callback_provider != provider);
+    }
+
+    async fn cleanup_expired(&self) {
+        let now = std::time::Instant::now();
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, pending| pending.expires_at > now);
     }
 
     pub async fn disconnect(&self, provider: &str) {
@@ -286,67 +331,133 @@ async fn receive_callback(
     coordinator: Coordinator,
     timeout: Duration,
 ) -> Result<(), ProviderError> {
-    let (mut stream, _) = time::timeout(timeout, listener.accept())
-        .await
-        .map_err(|_| ProviderError::CallbackExpired)?
-        .map_err(|_| ProviderError::Listener)?;
-    let mut buf = [0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|_| ProviderError::Listener)?;
-    let request = std::str::from_utf8(&buf[..n]).map_err(|_| ProviderError::InvalidCallback)?;
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("GET "))
-        .and_then(|line| line.split_once(" HTTP/").map(|parts| parts.0))
-        .ok_or(ProviderError::InvalidCallback)?;
-    let url = Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|_| ProviderError::InvalidCallback)?;
-    let parts: Vec<_> = url.path().split('/').collect();
-    if parts.len() != 4 || parts[1] != "oauth" || parts[2] != "callback" {
-        return Err(ProviderError::InvalidCallback);
-    }
-    let query = |key: &str| {
-        url.query_pairs()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.into_owned())
-    };
-    let state = query("state").ok_or(ProviderError::InvalidCallback)?;
-    let provider = parts[3].to_owned();
-    let redirect_uri = format!("http://127.0.0.1{}", url.path());
-    let result = coordinator
-        .complete_callback(
-            &provider,
-            &state,
-            query("code").as_deref(),
-            query("error").as_deref(),
-            &redirect_uri,
-        )
-        .await;
-    if let Ok(ref completed) = result {
-        coordinator
-            .completed
-            .lock()
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        coordinator.cleanup_expired().await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderError::CallbackExpired);
+        }
+        let (mut stream, _) = time::timeout(remaining, listener.accept())
             .await
-            .insert(provider, (redirect_uri, completed.clone()));
+            .map_err(|_| ProviderError::CallbackExpired)?
+            .map_err(|_| ProviderError::Listener)?;
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        let request = loop {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|_| ProviderError::Listener)?;
+            if n == 0 {
+                break None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 8192 {
+                write_http_response(&mut stream, 413, "Request too large").await?;
+                break None;
+            }
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break match std::str::from_utf8(&buf) {
+                    Ok(request) => Some(request),
+                    Err(_) => {
+                        write_http_response(&mut stream, 400, "Malformed request").await?;
+                        None
+                    }
+                };
+            }
+        };
+        let Some(request) = request else {
+            write_http_response(&mut stream, 400, "Malformed request").await?;
+            continue;
+        };
+        let Some(line) = request.lines().next() else {
+            write_http_response(&mut stream, 400, "Malformed request").await?;
+            continue;
+        };
+        let mut fields = line.split_whitespace();
+        let method = fields.next().unwrap_or_default();
+        let target = fields.next().unwrap_or_default();
+        let version = fields.next().unwrap_or_default();
+        if version != "HTTP/1.1" && version != "HTTP/1.0" {
+            write_http_response(&mut stream, 400, "Malformed request").await?;
+            continue;
+        }
+        if method != "GET" {
+            write_http_response(&mut stream, 405, "Method not allowed").await?;
+            continue;
+        }
+        let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+            write_http_response(&mut stream, 400, "Malformed request").await?;
+            continue;
+        };
+        let parts: Vec<_> = url.path().split('/').collect();
+        if parts.len() != 4 || parts[1] != "oauth" || parts[2] != "callback" {
+            write_http_response(&mut stream, 404, "Not found").await?;
+            continue;
+        }
+        let query = |key: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        };
+        let Some(state) = query("state") else {
+            write_http_response(&mut stream, 400, "Missing state").await?;
+            continue;
+        };
+        let provider = parts[3].to_owned();
+        let redirect_uri = format!("http://127.0.0.1{}", url.path());
+        let result = coordinator
+            .complete_callback(
+                &provider,
+                &state,
+                query("code").as_deref(),
+                query("error").as_deref(),
+                &redirect_uri,
+            )
+            .await;
+        match result {
+            Ok(completed) => {
+                coordinator
+                    .completed
+                    .lock()
+                    .await
+                    .insert(state.clone(), (provider, redirect_uri, completed));
+                let body = "Authorization received. You may close this window.";
+                write_http_response(&mut stream, 200, body).await?;
+                return Ok(());
+            }
+            Err(ProviderError::InvalidState) | Err(ProviderError::InvalidCallback) => {
+                write_http_response(&mut stream, 400, "Invalid callback").await?;
+            }
+            Err(ProviderError::CallbackExpired) => {
+                write_http_response(&mut stream, 400, "Callback expired").await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let ok = result.is_ok();
-    let body = if ok {
-        "Authorization received. You may close this window."
-    } else {
-        "Authorization failed. You may close this window."
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> Result<(), ProviderError> {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        _ => "Bad Request",
     };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
         .write_all(response.as_bytes())
         .await
-        .map_err(|_| ProviderError::Listener)?;
-    result.map(|_| ())
+        .map_err(|_| ProviderError::Listener)
 }
 
 #[cfg(test)]
@@ -543,6 +654,7 @@ impl ProviderRegistry {
         }
     }
     pub fn config(&self, provider: &str) -> Option<ProviderConfig> {
+        let provider = canonical_provider_id(provider)?;
         self.configs.get(provider).cloned()
     }
 
@@ -558,6 +670,7 @@ impl ProviderRegistry {
             .collect()
     }
     pub fn status(&self, provider: &str) -> Result<ProviderStatus, ProviderError> {
+        let provider = canonical_provider_id(provider).ok_or(ProviderError::NotConfigured)?;
         let c = self
             .configs
             .get(provider)
@@ -574,6 +687,7 @@ impl ProviderRegistry {
         provider: &str,
         coordinator: &Coordinator,
     ) -> Result<AuthorizationStart, ProviderError> {
+        let provider = canonical_provider_id(provider).ok_or(ProviderError::NotConfigured)?;
         let config = self
             .configs
             .get(provider)
@@ -637,7 +751,20 @@ pub mod token {
         InvalidResponse,
         #[error("missing refresh token")]
         MissingRefreshToken,
+        #[error("provider rejected the grant; reauthorization required")]
+        InvalidGrant,
     }
+    impl Error {
+        /// Classifies a refresh failure as definitively requiring the user to
+        /// reauthorize. Only the provider telling us the grant itself is dead
+        /// counts: an HTTP 400/403 carrying `invalid_grant`, or a refresh token
+        /// we no longer hold. Transport faults, timeouts, 5xx, 429, and
+        /// unparsable responses are transient and must not disconnect the user.
+        pub fn requires_reauthorization(&self) -> bool {
+            matches!(self, Error::MissingRefreshToken | Error::InvalidGrant)
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     struct WireProfile {
         id: Option<String>,
@@ -708,7 +835,26 @@ pub mod token {
                 scope: Option<String>,
                 expires_at_unix: u64,
             }
+            if bytes.len() > 16 * 1024 {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "token payload too large",
+                )));
+            }
             let stored: Stored = serde_json::from_slice(bytes)?;
+            if stored.access_token.trim().is_empty()
+                || stored.access_token.len() > 8192
+                || stored.token_type != "Bearer"
+                || stored
+                    .refresh_token
+                    .as_ref()
+                    .is_some_and(|v| v.is_empty() || v.len() > 8192)
+            {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid token payload",
+                )));
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -872,7 +1018,14 @@ pub mod token {
                     TransportError::Failed => Error::Transport,
                 })?;
             if !(200..300).contains(&response.status) {
-                return Err(Error::Http(response.status));
+                // A rejected grant is definitive: retrying cannot help and the
+                // user must reauthorize. Anything else (5xx, 429, an unexpected
+                // 400) is transient and keeps the stored credentials intact.
+                return Err(if rejected_grant(response.status, &response.body) {
+                    Error::InvalidGrant
+                } else {
+                    Error::Http(response.status)
+                });
             }
             let parsed: WireTokenSet =
                 serde_json::from_slice(&response.body).map_err(|_| Error::InvalidResponse)?;
@@ -888,6 +1041,24 @@ pub mod token {
                 expires_at: Instant::now() + lifetime,
             })
         }
+    }
+
+    /// Detects an OAuth error response that means the refresh token itself is
+    /// no longer usable. Both Spotify and Google answer a dead refresh token
+    /// with HTTP 400 and `"error": "invalid_grant"`; a 5xx or 429 never does,
+    /// so it stays a transient failure even if the body cannot be parsed.
+    fn rejected_grant(status: u16, body: &[u8]) -> bool {
+        if !matches!(status, 400 | 401 | 403) || body.len() > 16 * 1024 {
+            return false;
+        }
+        #[derive(serde::Deserialize)]
+        struct WireError {
+            error: Option<String>,
+        }
+        serde_json::from_slice::<WireError>(body)
+            .ok()
+            .and_then(|wire| wire.error)
+            .is_some_and(|error| error.eq_ignore_ascii_case("invalid_grant"))
     }
 
     fn allowlisted_endpoint(provider: &str, endpoint: &str) -> bool {
@@ -993,6 +1164,110 @@ pub mod token {
                 Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
             let refreshed = client.refresh("old").await.unwrap();
             assert_eq!(refreshed.refresh_token.as_deref(), Some("old"));
+        }
+
+        #[tokio::test]
+        async fn refresh_omitting_rotation_keeps_previous_refresh_token() {
+            // A provider that answers without a refresh_token must not erase the
+            // stored secret, otherwise the next 401 is unrecoverable.
+            let fake = Arc::new(Fake {
+                responses: Mutex::new(vec![
+                    response(r#"{"access_token":"first","refresh_token":"r1","expires_in":0}"#),
+                    response(r#"{"access_token":"second","expires_in":3600}"#),
+                ]),
+            });
+            let client =
+                Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+            let initial = client
+                .exchange_code("code", "redirect", "verifier")
+                .await
+                .unwrap();
+            assert_eq!(initial.refresh_token.as_deref(), Some("r1"));
+            let refreshed = client.access_token(initial).await.unwrap();
+            assert_eq!(refreshed.access_token, "second");
+            assert_eq!(refreshed.refresh_token.as_deref(), Some("r1"));
+        }
+
+        #[tokio::test]
+        async fn transient_refresh_failures_do_not_require_reauthorization() {
+            // Transport faults, timeouts, 5xx, 429 and an unparsable body are all
+            // recoverable: the stored grant must survive so the next attempt can
+            // retry instead of forcing the user back through consent.
+            let body = |status: u16, raw: &str| {
+                Ok(TokenResponse {
+                    status,
+                    body: raw.as_bytes().to_vec(),
+                })
+            };
+            for failure in [
+                Err(TransportError::Failed),
+                Err(TransportError::Timeout),
+                body(500, ""),
+                body(502, "<html>bad gateway</html>"),
+                body(429, r#"{"error":"too_many_requests"}"#),
+                body(400, "not json at all"),
+            ] {
+                let fake = Arc::new(Fake {
+                    responses: Mutex::new(vec![failure]),
+                });
+                let client =
+                    Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+                let error = match client.refresh("still-valid").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected a refresh failure"),
+                };
+                assert!(
+                    !error.requires_reauthorization(),
+                    "{error} must be treated as transient, not reauth-required"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn rejected_grant_requires_reauthorization() {
+            let fake = Arc::new(Fake {
+                responses: Mutex::new(vec![Ok(TokenResponse {
+                    status: 400,
+                    body:
+                        br#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#
+                            .to_vec(),
+                })]),
+            });
+            let client =
+                Client::new(config(), String::new(), fake, Duration::from_secs(1)).unwrap();
+            let error = match client.refresh("revoked").await {
+                Err(error) => error,
+                Ok(_) => panic!("expected a refresh failure"),
+            };
+            assert_eq!(error, Error::InvalidGrant);
+            assert!(error.requires_reauthorization());
+            // The message must stay redacted: no token or body leaks to the caller.
+            assert!(!error.to_string().contains("revoked"));
+        }
+
+        #[test]
+        fn missing_refresh_token_requires_reauthorization() {
+            assert!(Error::MissingRefreshToken.requires_reauthorization());
+            assert!(!Error::Http(500).requires_reauthorization());
+            assert!(!Error::Timeout.requires_reauthorization());
+            assert!(!Error::Transport.requires_reauthorization());
+            assert!(!Error::InvalidResponse.requires_reauthorization());
+        }
+
+        #[test]
+        fn invalid_grant_detection_ignores_unrelated_statuses() {
+            let revoked = br#"{"error":"invalid_grant"}"#;
+            assert!(rejected_grant(400, revoked));
+            assert!(rejected_grant(401, revoked));
+            // A 5xx or 429 is never a definitive rejection, even with a spoofed body.
+            assert!(!rejected_grant(500, revoked));
+            assert!(!rejected_grant(429, revoked));
+            assert!(!rejected_grant(200, revoked));
+            assert!(!rejected_grant(
+                400,
+                br#"{"error":"temporarily_unavailable"}"#
+            ));
+            assert!(!rejected_grant(400, b""));
         }
 
         #[tokio::test]
@@ -1413,6 +1688,8 @@ pub mod playlist {
     }
     /// Sends a protected request and, on exactly one 401, refreshes the
     /// access token through the native token client before retrying once.
+    /// A failed refresh is classified so callers can tell a transient outage
+    /// apart from a grant the provider has permanently rejected.
     pub async fn authorized_get<H: Http>(
         http: &mut H,
         tokens: &mut super::token::TokenSet,
@@ -1429,7 +1706,7 @@ pub mod playlist {
                 let updated = token_client
                     .refresh(refresh)
                     .await
-                    .map_err(|_| Error::RefreshRequired)?;
+                    .map_err(refresh_failure)?;
                 *tokens = updated;
                 // The refreshed token is used for one retry only; a second 401
                 // is returned as RefreshRequired and never refreshes recursively.
@@ -1438,12 +1715,25 @@ pub mod playlist {
             result => result,
         }
     }
+    /// Maps a refresh failure onto the caller-visible classification. Only a
+    /// definitively rejected grant becomes `ReauthorizationRequired`.
+    fn refresh_failure(error: super::token::Error) -> Error {
+        if error.requires_reauthorization() {
+            Error::ReauthorizationRequired
+        } else {
+            Error::RefreshTransient
+        }
+    }
     #[derive(Debug, Error, Clone, PartialEq, Eq)]
     pub enum Error {
         #[error("HTTPS required")]
         InsecureUrl,
         #[error("authentication expired; refresh token and retry")]
         RefreshRequired,
+        #[error("token refresh failed; the provider may be temporarily unavailable")]
+        RefreshTransient,
+        #[error("provider rejected the stored grant; reauthorization required")]
+        ReauthorizationRequired,
         #[error("HTTP {status}")]
         Http {
             status: u16,
@@ -1451,12 +1741,21 @@ pub mod playlist {
         },
         #[error("invalid response")]
         InvalidResponse,
+        #[error("provider capability is not available")]
+        Capability,
+        #[error("invalid pagination cursor")]
+        InvalidCursor,
     }
     fn retry_after(h: &[(String, String)]) -> Option<u64> {
         h.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
             .and_then(|(_, v)| v.parse::<u64>().ok())
             .and_then(|s| s.checked_mul(1000))
+    }
+    impl Http for Box<dyn Http + Send> {
+        fn send(&mut self, request: Request) -> Result<Response, Error> {
+            self.as_mut().send(request)
+        }
     }
     pub fn get<H: Http>(
         h: &mut H,
@@ -1465,7 +1764,12 @@ pub mod playlist {
         max_attempts: u32,
     ) -> Result<Response, Error> {
         let parsed = url::Url::parse(&url).map_err(|_| Error::InsecureUrl)?;
-        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        if parsed.scheme() != "https"
+            || !matches!(
+                parsed.host_str(),
+                Some("api.spotify.com") | Some("www.googleapis.com")
+            )
+        {
             return Err(Error::InsecureUrl);
         }
         for n in 0..max_attempts.max(1) {
@@ -1507,11 +1811,18 @@ pub mod playlist {
         token: &str,
         cursor: Option<&str>,
     ) -> Result<RemotePage<RemotePlaylist>, Error> {
-        let url = format!(
-            "{}/me/playlists{}",
-            base,
-            cursor.map(|c| format!("?offset={c}")).unwrap_or_default()
-        );
+        let mut url = url::Url::parse(&format!("{}/me/playlists", base.trim_end_matches('/')))
+            .map_err(|_| Error::InsecureUrl)?;
+        if url.scheme() != "https" || url.host_str() != Some("api.spotify.com") {
+            return Err(Error::InsecureUrl);
+        }
+        if let Some(cursor) = cursor {
+            if cursor.parse::<u32>().is_err() {
+                return Err(Error::InvalidCursor);
+            }
+            url.query_pairs_mut().append_pair("offset", cursor);
+        }
+        let url = url.to_string();
         let p: SpotifyPage = serde_json::from_slice(&get(h, url, token, 4)?.body)
             .map_err(|_| Error::InvalidResponse)?;
         Ok(RemotePage {
@@ -1560,6 +1871,9 @@ pub mod playlist {
     ) -> Result<RemotePage<RemotePlaylist>, Error> {
         let mut url = url::Url::parse(&format!("{}/playlists", base.trim_end_matches('/')))
             .map_err(|_| Error::InsecureUrl)?;
+        if url.scheme() != "https" || url.host_str() != Some("www.googleapis.com") {
+            return Err(Error::InsecureUrl);
+        }
         url.query_pairs_mut()
             .append_pair("part", "snippet")
             .append_pair("mine", "true")
@@ -1598,5 +1912,126 @@ pub mod playlist {
 
     pub fn capabilities() -> SyncCapabilities {
         SyncCapabilities::READ_ONLY
+    }
+
+    pub fn require_read(capabilities: SyncCapabilities) -> Result<(), Error> {
+        if capabilities.can_read {
+            Ok(())
+        } else {
+            Err(Error::Capability)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct Fake {
+            expected_url: String,
+            response: Response,
+        }
+        impl Http for Fake {
+            fn send(&mut self, request: Request) -> Result<Response, Error> {
+                assert_eq!(request.method, "GET");
+                assert!(
+                    request
+                        .headers
+                        .iter()
+                        .any(|(key, value)| key == "Authorization" && value == "Bearer secret")
+                );
+                assert_eq!(request.url, self.expected_url);
+                Ok(self.response.clone())
+            }
+        }
+
+        #[test]
+        fn refresh_failure_classification_keeps_transient_errors_retryable() {
+            assert_eq!(
+                refresh_failure(super::super::token::Error::InvalidGrant),
+                Error::ReauthorizationRequired
+            );
+            assert_eq!(
+                refresh_failure(super::super::token::Error::MissingRefreshToken),
+                Error::ReauthorizationRequired
+            );
+            for transient in [
+                super::super::token::Error::Http(500),
+                super::super::token::Error::Http(429),
+                super::super::token::Error::Timeout,
+                super::super::token::Error::Transport,
+                super::super::token::Error::InvalidResponse,
+            ] {
+                assert_eq!(refresh_failure(transient), Error::RefreshTransient);
+            }
+        }
+
+        #[test]
+        fn spotify_cursor_is_encoded_and_page_maps_ids() {
+            let expected_url = "https://api.spotify.com/v1/me/playlists?offset=25".to_owned();
+            let mut fake = Fake {
+                expected_url,
+                response: Response {
+                    status: 200,
+                    headers: vec![],
+                    body: br#"{"items":[{"id":"p1","name":"Mix","snapshot_id":"rev"}],"next":"https://api.spotify.com/v1/me/playlists?offset=25&limit=50"}"#.to_vec(),
+                },
+            };
+            let page = spotify_playlists(
+                &mut fake,
+                "https://api.spotify.com/v1",
+                "secret",
+                Some("25"),
+            )
+            .unwrap();
+            assert_eq!(page.items[0].id, "p1");
+            assert_eq!(page.next_cursor.as_deref(), Some("25"));
+            assert_eq!(page.items[0].revision.as_deref(), Some("rev"));
+        }
+
+        #[test]
+        fn rejects_cursor_injection_and_untrusted_hosts() {
+            let mut fake = Fake {
+                expected_url: String::new(),
+                response: Response {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![],
+                },
+            };
+            assert_eq!(
+                spotify_playlists(
+                    &mut fake,
+                    "https://api.spotify.com/v1",
+                    "secret",
+                    Some("1&x=y")
+                ),
+                Err(Error::InvalidCursor)
+            );
+            assert_eq!(
+                spotify_playlists(&mut fake, "https://attacker.test/v1", "secret", None),
+                Err(Error::InsecureUrl)
+            );
+            assert_eq!(
+                youtube_playlists(
+                    &mut fake,
+                    "https://attacker.test/youtube/v3",
+                    "secret",
+                    None
+                ),
+                Err(Error::InsecureUrl)
+            );
+        }
+
+        #[test]
+        fn rejects_writes_for_read_only_capabilities() {
+            assert_eq!(require_read(SyncCapabilities::READ_ONLY), Ok(()));
+            assert_eq!(
+                require_read(SyncCapabilities {
+                    can_read: false,
+                    ..SyncCapabilities::READ_ONLY
+                }),
+                Err(Error::Capability)
+            );
+        }
     }
 }

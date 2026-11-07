@@ -59,6 +59,10 @@ jobs:
               cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
             fi
           done
+          if [ -f "bin/yt-dlp$EXT" ]; then
+            cp "bin/yt-dlp$EXT" "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
+          fi
+          test -f "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
           ls -la apps/desktop/binaries/ || true
       - name: Check workspace
         run: cargo check --workspace
@@ -111,6 +115,10 @@ jobs:
               cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
             fi
           done
+          if [ -f "bin/yt-dlp$EXT" ]; then
+            cp "bin/yt-dlp$EXT" "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
+          fi
+          test -f "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
           ls -la apps/desktop/binaries/ || true
       - name: Check workspace at MSRV
         run: cargo check --workspace
@@ -135,7 +143,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
@@ -176,7 +184,7 @@ jobs:
         with:
           node-version: 22
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
         working-directory: frontend
       - name: Stage VST helper binaries (externalBin)
         # externalBin files are gitignored build artifacts; tauri-build
@@ -194,6 +202,10 @@ jobs:
               cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
             fi
           done
+          if [ -f "bin/yt-dlp$EXT" ]; then
+            cp "bin/yt-dlp$EXT" "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
+          fi
+          test -f "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
           ls -la apps/desktop/binaries/ || true
       - name: Bundle desktop application
         # Run tauri CLI from apps/desktop (its config dir): tauri-cli
