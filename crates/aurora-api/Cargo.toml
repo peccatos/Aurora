@@ -19,6 +19,7 @@ tracing.workspace = true
 tower-http.workspace = true
 url = "2"
 uuid.workspace = true
+reqwest.workspace = true
 
 [lints]
 workspace = true

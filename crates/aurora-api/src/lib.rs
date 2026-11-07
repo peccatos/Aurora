@@ -9,7 +9,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
+};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use url::Url;
@@ -22,6 +24,7 @@ const TX_TTL: Duration = Duration::from_secs(600);
 pub struct AppState {
     pub config: Arc<Config>,
     inner: Arc<Mutex<MemoryStore>>,
+    oauth: Arc<dyn OAuthService>,
 }
 #[derive(Clone)]
 pub struct Config {
@@ -40,6 +43,7 @@ struct MemoryStore {
     sessions: HashMap<String, Session>,
     transactions: HashMap<String, Transaction>,
     accounts: HashMap<(String, String), Account>,
+    credentials: HashMap<(String, String), aurora_providers::token::TokenSet>,
 }
 struct Session {
     _csrf: String,
@@ -62,6 +66,203 @@ pub struct Account {
     pub capabilities: Vec<String>,
     pub connected_at: DateTime<Utc>,
 }
+
+pub trait OAuthService: Send + Sync {
+    fn complete<'a>(
+        &'a self,
+        provider: &'a str,
+        settings: &'a ProviderSettings,
+        code: &'a str,
+        verifier: &'a str,
+        redirect_uri: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(Account, aurora_providers::token::TokenSet), ()>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+struct HttpsOAuthService {
+    http: reqwest::Client,
+}
+struct ReqwestTokenTransport {
+    http: reqwest::Client,
+}
+impl aurora_providers::token::Transport for ReqwestTokenTransport {
+    fn send<'a>(
+        &'a self,
+        request: aurora_providers::token::TokenRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        aurora_providers::token::TokenResponse,
+                        aurora_providers::token::TransportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if !matches!(
+                request.endpoint.as_str(),
+                "https://accounts.spotify.com/api/token" | "https://oauth2.googleapis.com/token"
+            ) {
+                return Err(aurora_providers::token::TransportError::Failed);
+            }
+            let r = self
+                .http
+                .post(request.endpoint)
+                .form(&request.form)
+                .send()
+                .await
+                .map_err(|_| aurora_providers::token::TransportError::Failed)?;
+            let status = r.status().as_u16();
+            let body = r
+                .bytes()
+                .await
+                .map_err(|_| aurora_providers::token::TransportError::Failed)?;
+            Ok(aurora_providers::token::TokenResponse {
+                status,
+                body: body.to_vec(),
+            })
+        })
+    }
+}
+impl OAuthService for HttpsOAuthService {
+    fn complete<'a>(
+        &'a self,
+        provider: &'a str,
+        settings: &'a ProviderSettings,
+        code: &'a str,
+        verifier: &'a str,
+        redirect_uri: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(Account, aurora_providers::token::TokenSet), ()>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let (_, auth, token, scopes) = provider_descriptor(provider).ok_or(())?;
+            let config = aurora_providers::ProviderConfig {
+                id: provider.into(),
+                client_id: settings.client_id.clone(),
+                authorization_endpoint: auth.into(),
+                token_endpoint: token.into(),
+                scopes: scopes.split_whitespace().map(str::to_owned).collect(),
+                enabled: true,
+            };
+            let client = aurora_providers::token::Client::new(
+                config,
+                settings.client_secret.clone(),
+                Arc::new(ReqwestTokenTransport {
+                    http: self.http.clone(),
+                }),
+                Duration::from_secs(15),
+            )
+            .map_err(|_| ())?;
+            let tokens = client
+                .exchange_code(code, redirect_uri, verifier)
+                .await
+                .map_err(|_| ())?;
+            let endpoint = if provider == "spotify" {
+                "https://api.spotify.com/v1/me"
+            } else {
+                "https://openidconnect.googleapis.com/v1/userinfo"
+            };
+            let r = self
+                .http
+                .get(endpoint)
+                .bearer_auth(&tokens.access_token)
+                .send()
+                .await
+                .map_err(|_| ())?;
+            if !r.status().is_success() {
+                return Err(());
+            }
+            let body = r.bytes().await.map_err(|_| ())?;
+            let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+            let subject = v
+                .get(if provider == "spotify" { "id" } else { "sub" })
+                .and_then(|x| x.as_str())
+                .filter(|x| !x.trim().is_empty())
+                .ok_or(())?
+                .chars()
+                .take(200)
+                .collect();
+            let display_name = v
+                .get(if provider == "spotify" {
+                    "display_name"
+                } else {
+                    "name"
+                })
+                .and_then(|x| x.as_str())
+                .or_else(|| v.get("email").and_then(|x| x.as_str()))
+                .unwrap_or(if provider == "spotify" {
+                    "Spotify user"
+                } else {
+                    "Google user"
+                })
+                .chars()
+                .take(200)
+                .collect();
+            Ok((
+                Account {
+                    subject,
+                    display_name,
+                    avatar_url: None,
+                    capabilities: vec!["identity".into()],
+                    connected_at: Utc::now(),
+                },
+                tokens,
+            ))
+        })
+    }
+}
+fn provider_descriptor(
+    p: &str,
+) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    match p {
+        "spotify" => Some((
+            "spotify",
+            "https://accounts.spotify.com/authorize",
+            "https://accounts.spotify.com/api/token",
+            "user-read-email playlist-read-private",
+        )),
+        "youtube-music" => Some((
+            "youtube-music",
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "openid profile https://www.googleapis.com/auth/youtube.readonly",
+        )),
+        _ => None,
+    }
+}
+
+fn valid_redirect_uri(provider: &str, redirect_uri: &str) -> bool {
+    let Ok(url) = Url::parse(redirect_uri) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path() == format!("/api/oauth/{provider}/callback")
+}
+
+fn secure_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("static OAuth HTTP client configuration")
+}
+
 #[derive(Serialize)]
 struct Begin {
     authorization_url: String,
@@ -185,7 +386,8 @@ async fn begin(
         return fail(StatusCode::UNAUTHORIZED);
     }
     let (settings, endpoint, _, scopes) = match provider_settings(&state.config, &provider) {
-        Some(x) => x,
+        Some(x) if valid_redirect_uri(&provider, &x.0.redirect_uri) => x,
+        Some(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
         None => return fail(StatusCode::SERVICE_UNAVAILABLE),
     };
     let state_value = random();
@@ -251,6 +453,14 @@ async fn callback(
         return fail(StatusCode::BAD_REQUEST);
     }
     tx.consumed = true;
+    let verifier = tx.verifier.clone();
+    let redirect_uri = tx.redirect_uri.clone();
+    let settings = match provider_settings(&state.config, &provider) {
+        Some((s, _, _, _)) if valid_redirect_uri(&provider, &s.redirect_uri) => s.clone(),
+        Some(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
+        None => return fail(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    drop(store);
     if query.error.is_some() {
         return Redirect::to(&state.config.frontend_url).into_response();
     }
@@ -258,8 +468,19 @@ async fn callback(
         Some(x) => x,
         None => return fail(StatusCode::BAD_REQUEST),
     };
-    // Token exchange is deliberately behind the native provider boundary. No token material is returned here.
-    let _ = (code, tx.verifier.as_str(), tx.redirect_uri.as_str());
+    let (account, tokens) = match state
+        .oauth
+        .complete(&provider, &settings, &code, &verifier, &redirect_uri)
+        .await
+    {
+        Ok(x) => x,
+        Err(()) => return fail(StatusCode::BAD_GATEWAY),
+    };
+    let mut store = state.inner.lock().await;
+    store
+        .accounts
+        .insert((sid.clone(), provider.clone()), account);
+    store.credentials.insert((sid, provider), tokens);
     Redirect::to(&state.config.frontend_url).into_response()
 }
 async fn status(
@@ -303,6 +524,7 @@ async fn disconnect(
     };
     let mut store = state.inner.lock().await;
     store.accounts.remove(&(sid.clone(), provider.clone()));
+    store.credentials.remove(&(sid.clone(), provider.clone()));
     store
         .transactions
         .retain(|_, t| t.session != sid || t.provider != provider || t.consumed);
@@ -316,7 +538,11 @@ pub fn memory_state(config: Config) -> AppState {
             sessions: HashMap::new(),
             transactions: HashMap::new(),
             accounts: HashMap::new(),
+            credentials: HashMap::new(),
         })),
+        oauth: Arc::new(HttpsOAuthService {
+            http: secure_http_client(),
+        }),
     }
 }
 
@@ -349,6 +575,39 @@ mod tests {
         let r = begin(Path("google-youtube".into()), State(app), h).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN)
     }
+    #[test]
+    fn redirect_uri_must_be_https_and_provider_specific() {
+        assert!(valid_redirect_uri(
+            "spotify",
+            "https://api.example/api/oauth/spotify/callback"
+        ));
+        assert!(!valid_redirect_uri(
+            "spotify",
+            "http://api.example/api/oauth/spotify/callback"
+        ));
+        assert!(!valid_redirect_uri(
+            "youtube-music",
+            "https://api.example/api/oauth/spotify/callback"
+        ));
+        assert!(!valid_redirect_uri(
+            "spotify",
+            "https://api.example/api/oauth/spotify/callback?next=https://evil.example"
+        ));
+    }
+
+    #[test]
+    fn token_endpoints_are_fixed_https_endpoints() {
+        assert_eq!(
+            provider_descriptor("spotify").unwrap().2,
+            "https://accounts.spotify.com/api/token"
+        );
+        assert_eq!(
+            provider_descriptor("youtube-music").unwrap().2,
+            "https://oauth2.googleapis.com/token"
+        );
+        assert!(provider_descriptor("unknown").is_none());
+    }
+
     #[test]
     fn hash_is_not_plaintext() {
         assert_ne!(hash("state"), "state")
