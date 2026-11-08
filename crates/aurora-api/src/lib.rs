@@ -1,5 +1,6 @@
 mod guard;
 mod limits;
+mod media;
 mod playlists;
 
 use aurora_core::domain::sync::{RemotePage, RemotePlaylist, RemoteProvider};
@@ -32,7 +33,7 @@ use guard::RateLimiter;
 
 const SESSION_COOKIE: &str = "__Host-aurora_session";
 const CSRF_COOKIE: &str = "__Host-aurora_csrf";
-const CSRF_HEADER: &str = "x-csrf-token";
+pub(crate) const CSRF_HEADER: &str = "x-csrf-token";
 const TX_TTL: Duration = Duration::from_secs(600);
 
 /// How often, at most, opportunistic OAuth expiry cleanup runs. Cleanup is
@@ -47,6 +48,11 @@ pub struct AppState {
     pub encryption_key: [u8; 32],
     oauth: Arc<dyn OAuthService>,
     pub(crate) playlist_http: Arc<Mutex<Box<dyn aurora_providers::playlist::Http + Send>>>,
+    /// Serializes concurrent token refreshes per account (session hash +
+    /// provider) so two simultaneous requests with the same expired access
+    /// token share one refresh instead of the second replaying an
+    /// already-rotated refresh token into a spurious `invalid_grant`.
+    pub(crate) refresh_gate: aurora_providers::token::RefreshGate,
     limits: Arc<RateLimiter>,
     /// When the last opportunistic expiry sweep started; see
     /// [`AppState::cleanup_expired`].
@@ -412,6 +418,8 @@ pub fn router(state: AppState) -> Router {
             get(playlists::playlist_detail),
         )
         .route("/api/oauth/{provider}", delete(disconnect))
+        .route("/api/media/metadata", post(media::metadata))
+        .route("/api/media/ping", get(media::ping))
         .layer(middleware::from_fn(guard::bounded_body))
         .layer(
             CorsLayer::new()
@@ -530,28 +538,6 @@ fn csrf_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok())
 }
 
-/// Checks that the CSRF header echoes the readable CSRF cookie.
-///
-/// The cookie and the header are both attacker-supplied, so this is a
-/// well-formedness and consistency check, not an authorization decision: it
-/// stops a cross-site request that can set the header but cannot read the
-/// cookie from proceeding to the storage lookup, and it stops a malformed pair
-/// from being hashed at all. The authoritative check is
-/// [`authorize_csrf`], which compares the header against the *stored* hash
-/// bound to the session.
-#[allow(dead_code)] // kept as documented reference; authorization uses authorize_csrf
-pub(crate) fn csrf_matches_session(headers: &HeaderMap, csrf: &str) -> bool {
-    cookie_value(headers, CSRF_COOKIE).is_some_and(|cookie| {
-        limits::is_csrf_token(&cookie)
-            && cookie.len() == csrf.len()
-            && cookie
-                .bytes()
-                .zip(csrf.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
-    })
-}
-
 /// The TCP peer address of the request, when the connect-info service supplies
 /// one.
 ///
@@ -561,7 +547,7 @@ pub(crate) fn csrf_matches_session(headers: &HeaderMap, csrf: &str) -> bool {
 /// extractor is optional by construction; the absence of an address is handled
 /// by the rate limiter, not by failing the request.
 #[derive(Clone, Copy)]
-struct PeerAddr(Option<SocketAddr>);
+pub(crate) struct PeerAddr(Option<SocketAddr>);
 
 impl<S: Send + Sync> axum::extract::OptionalFromRequestParts<S> for PeerAddr {
     type Rejection = std::convert::Infallible;
@@ -1069,6 +1055,9 @@ async fn playlists(
         Ok(value) => value,
         Err(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
     };
+    // Refresh serialization key: opaque, derived from the same hashes the
+    // credential rows are keyed by. No token material crosses here.
+    let refresh_key = format!("{session_hash}:{provider}");
     let mut http = state.playlist_http.lock().await;
     let result = if provider == "spotify" {
         let mut url = Url::parse("https://api.spotify.com/v1/me/playlists").expect("constant URL");
@@ -1079,6 +1068,8 @@ async fn playlists(
             &mut *http,
             &mut tokens,
             &client,
+            &state.refresh_gate,
+            &refresh_key,
             url.to_string(),
             4,
         )
@@ -1123,6 +1114,8 @@ async fn playlists(
             &mut *http,
             &mut tokens,
             &client,
+            &state.refresh_gate,
+            &refresh_key,
             url.to_string(),
             4,
         )
@@ -1216,6 +1209,7 @@ pub fn storage_state(config: Config, pool: SqlitePool, encryption_key: [u8; 32])
                 .expect("static playlist HTTP client configuration"),
         })
             as Box<dyn aurora_providers::playlist::Http + Send>)),
+        refresh_gate: aurora_providers::token::RefreshGate::default(),
         limits: Arc::new(RateLimiter::standard()),
         last_cleanup: Arc::new(Mutex::new(None)),
     }
@@ -1261,6 +1255,7 @@ pub fn test_state(
         encryption_key,
         oauth,
         playlist_http: Arc::new(Mutex::new(playlist_http)),
+        refresh_gate: aurora_providers::token::RefreshGate::default(),
         limits: Arc::new(RateLimiter::standard()),
         last_cleanup: Arc::new(Mutex::new(None)),
     }
@@ -1283,12 +1278,9 @@ mod tests {
             youtube: None,
         }
     }
-    /// Expected to fail: tracking the CSRF idle-eviction limitation. The in-memory
-    /// `sqlite::memory:` pool opens one connection per checkout, so each request runs
-    /// against its own empty database and the session written by `handshake` is invisible
-    /// to the next handler call. Re-enable once the pool is capped to a single connection
-    /// (`max_connections(1)`) or migrated to a shared-cache file.
-    #[ignore = "needs a shared connection pool for in-memory SQLite"]
+    /// The no-cookie/no-origin path rejects before any storage access, so a
+    /// file-backed pool is not even required here — but it gets one anyway
+    /// (see `state_with_store`) so the test cannot silently depend on that.
     #[tokio::test]
     async fn rejects_foreign_origin() {
         let (app, _store) = state_with_store(config()).await;

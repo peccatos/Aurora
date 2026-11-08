@@ -236,6 +236,8 @@ async fn spotify_detail(
     tokens: &mut aurora_providers::token::TokenSet,
     client: &aurora_providers::token::Client,
     http: &mut Box<dyn aurora_providers::playlist::Http + Send>,
+    refresh_gate: &aurora_providers::token::RefreshGate,
+    refresh_key: &str,
     playlist_id: &str,
 ) -> Result<PlaylistDetail, aurora_providers::playlist::Error> {
     let mut next: Option<String> = None;
@@ -258,6 +260,8 @@ async fn spotify_detail(
             &mut *http,
             tokens,
             client,
+            refresh_gate,
+            refresh_key,
             url.to_string(),
             4,
         )
@@ -295,6 +299,8 @@ async fn youtube_detail(
     tokens: &mut aurora_providers::token::TokenSet,
     client: &aurora_providers::token::Client,
     http: &mut Box<dyn aurora_providers::playlist::Http + Send>,
+    refresh_gate: &aurora_providers::token::RefreshGate,
+    refresh_key: &str,
     playlist_id: &str,
 ) -> Result<PlaylistDetail, aurora_providers::playlist::Error> {
     let mut page_token: Option<String> = None;
@@ -316,6 +322,8 @@ async fn youtube_detail(
             &mut *http,
             tokens,
             client,
+            refresh_gate,
+            refresh_key,
             url.to_string(),
             4,
         )
@@ -411,10 +419,29 @@ pub(crate) async fn playlist_detail(
         http: detail_http_client(),
     };
     let mut detail_http: Box<dyn aurora_providers::playlist::Http + Send> = Box::new(detail_http);
+    // Refresh serialization key: opaque, derived from the same hashes the
+    // credential rows are keyed by. No token material crosses here.
+    let refresh_key = format!("{session_hash}:{}", path.provider);
     let result = if path.provider == "spotify" {
-        spotify_detail(&mut tokens, &client, &mut detail_http, &path.playlist_id).await
+        spotify_detail(
+            &mut tokens,
+            &client,
+            &mut detail_http,
+            &state.refresh_gate,
+            &refresh_key,
+            &path.playlist_id,
+        )
+        .await
     } else {
-        youtube_detail(&mut tokens, &client, &mut detail_http, &path.playlist_id).await
+        youtube_detail(
+            &mut tokens,
+            &client,
+            &mut detail_http,
+            &state.refresh_gate,
+            &refresh_key,
+            &path.playlist_id,
+        )
+        .await
     };
     // Rotated credentials are persisted before the follow-up result is
     // interpreted, so a failed detail request cannot discard them.

@@ -62,6 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         encryption_key,
     );
-    serve(state, "127.0.0.1:8080".parse::<SocketAddr>()?).await?;
+    // PaaS convention (Render, Fly, Heroku): listen on 0.0.0.0 at $PORT so
+    // the platform's router can reach the process. Loopback would work for
+    // a local run but is unreachable from outside the container.
+    let port = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    serve(state, SocketAddr::from(([0, 0, 0, 0], port))).await?;
     Ok(())
 }
