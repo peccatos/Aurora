@@ -1,0 +1,55 @@
+# Render Blueprint for the Aurora API (OAuth BFF).
+#
+# Before deploying:
+#  1. Create the two OAuth apps (Spotify dev console, Google Cloud Console)
+#     and set the redirect URIs to:
+#       https://<service-name>.onrender.com/api/oauth/spotify/callback
+#       https://<service-name>.onrender.com/api/oauth/youtube-music/callback
+#  2. Generate the encryption key:  openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+#     and set it as the AURORA_OAUTH_ENCRYPTION_KEY secret below.
+#  3. The frontend (Vite static site) must be deployed with
+#     VITE_OAUTH_API_BASE_URL=https://<service-name>.onrender.com and its
+#     origin added to AURORA_API_ALLOWED_ORIGINS.
+#
+# The SQLite database lives on the attached disk (/data) so OAuth grants
+# survive restarts. Render free instances reboot daily but keep disks.
+# Note: free instances spin down after inactivity; the first request after
+# a cold start takes ~30s.
+
+services:
+  - type: web
+    name: aurora-api
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: AURORA_API_ALLOWED_ORIGINS
+        sync: false # https://<your-frontend-origin> (comma-separated)
+      - key: AURORA_API_FRONTEND_URL
+        sync: false # https://<your-frontend-origin>/settings/accounts
+      - key: AURORA_OAUTH_ENCRYPTION_KEY
+        sync: false # base64url of 32 random bytes
+      - key: AURORA_DATABASE_PATH
+        value: /data/aurora.db
+      - key: AURORA_SPOTIFY_ENABLED
+        value: true
+      - key: AURORA_SPOTIFY_CLIENT_ID
+        sync: false
+      - key: AURORA_SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: AURORA_SPOTIFY_REDIRECT_URI
+        sync: false # https://<service-name>.onrender.com/api/oauth/spotify/callback
+      - key: AURORA_YOUTUBE_MUSIC_ENABLED
+        value: true
+      - key: AURORA_YOUTUBE_MUSIC_CLIENT_ID
+        sync: false
+      - key: AURORA_YOUTUBE_MUSIC_CLIENT_SECRET
+        sync: false
+      - key: AURORA_YOUTUBE_MUSIC_REDIRECT_URI
+        sync: false # https://<service-name>.onrender.com/api/oauth/youtube-music/callback
+    disk:
+      name: aurora-data
+      mountPath: /data
+      sizeGB: 1
