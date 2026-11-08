@@ -10,7 +10,7 @@
 # the UI hides the feature. Bundling it is a deliberate per-deployment
 # decision (license/size/upgrade cadence), not a default.
 
-FROM rust:1.90 AS builder
+FROM rust:1.94 AS builder
 WORKDIR /app
 
 # The workspace manifest lists all members, so the whole crates/ tree has to
