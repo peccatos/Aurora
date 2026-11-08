@@ -25,7 +25,7 @@ RUN mkdir -p apps/desktop/src && printf '[package]\nname = "aurora-desktop"\nver
 
 RUN cargo build --release -p aurora-api --bin aurora-api
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 # SQLite writes to a volume; run as an unprivileged user.
 RUN useradd --system --home /data aurora
