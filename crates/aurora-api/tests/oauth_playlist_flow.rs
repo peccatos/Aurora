@@ -478,7 +478,7 @@ async fn begin_issues_a_session_csrf_pair_and_a_hardened_authorization_url() {
         .iter()
         .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
         .expect("session cookie is present");
-    for attribute in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
+    for attribute in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
         assert!(
             session_cookie.contains(attribute),
             "session cookie {session_cookie:?} is missing {attribute}"

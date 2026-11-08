@@ -521,13 +521,19 @@ fn fail(status: StatusCode) -> Response {
         .into_response()
 }
 fn cookie(id: &str) -> String {
-    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Strict")
+    // Lax (not Strict): the OAuth callback is a top-level cross-site GET
+    // redirect from accounts.google.com, and Strict cookies are not sent on
+    // such navigations — the callback would see no session and fail with 401.
+    // Lax is still withheld on cross-site subresource/fetch requests, so the
+    // session cookie never leaks to third-party sites; state-changing API
+    // calls additionally require the session-bound X-CSRF-Token header.
+    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax")
 }
 /// The CSRF cookie is intentionally readable by scripts on the allowed origins so the
 /// frontend can echo it in the `X-CSRF-Token` header; it is scoped exactly like the
 /// session cookie. A cross-site attacker can read neither it nor the session cookie.
 fn csrf_cookie(token: &str) -> String {
-    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Strict")
+    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax")
 }
 fn cookie_header(value: &str) -> HeaderValue {
     value
@@ -1436,7 +1442,7 @@ mod tests {
             .iter()
             .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
             .expect("session cookie is set");
-        for attribute in ["Path=/", "Secure", "SameSite=Strict"] {
+        for attribute in ["Path=/", "Secure", "SameSite=Lax"] {
             assert!(csrf_cookie_value.contains(attribute));
             assert!(session_cookie_value.contains(attribute));
         }
