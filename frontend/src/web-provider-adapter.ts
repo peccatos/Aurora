@@ -28,8 +28,8 @@ export function setApiBaseForTests(value: string | null): void {
 }
 
 function configuredApiBase(): URL | null {
-  const raw = (apiBaseOverride ?? import.meta.env?.VITE_OAUTH_API_BASE_URL)?.trim()
-    ?? "https://aurora-api-3.onrender.com";
+  const raw = apiBaseOverride
+    ?? (import.meta.env?.VITE_OAUTH_API_BASE_URL || "https://aurora-api-3.onrender.com");
   if (!raw) return null;
   try {
     const url = new URL(raw);
