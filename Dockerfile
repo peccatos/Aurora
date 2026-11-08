@@ -28,7 +28,8 @@ RUN cargo build --release -p aurora-api --bin aurora-api
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 # SQLite writes to a volume; run as an unprivileged user.
-RUN useradd --system --home /data aurora
+RUN useradd --system --home-dir /data --create-home aurora \
+    && mkdir -p /data && chown aurora:aurora /data
 WORKDIR /app
 COPY --from=builder /app/target/release/aurora-api /usr/local/bin/aurora-api
 ENV AURORA_DATABASE_PATH=/data/aurora.db
