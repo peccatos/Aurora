@@ -17,6 +17,11 @@ WORKDIR /app
 # be present even though only the aurora-api closure is compiled.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The workspace manifest lists apps/desktop as a member, but the Tauri shell
+# is out of scope here. An empty stub manifest (just [package]) satisfies the
+# workspace loader; cargo only compiles the aurora-api closure anyway.
+RUN mkdir -p apps/desktop/src && printf '[package]\nname = "aurora-desktop"\nversion = "0.2.0"\nedition = "2021"\n' > apps/desktop/Cargo.toml \
+    && touch apps/desktop/src/main.rs
 
 RUN cargo build --release -p aurora-api --bin aurora-api
 
