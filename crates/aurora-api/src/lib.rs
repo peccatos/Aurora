@@ -795,15 +795,20 @@ async fn callback(
 ) -> Response {
     let sid = match session(&headers) {
         Some(x) => x,
-        None => return fail(StatusCode::UNAUTHORIZED),
+        None => {
+            tracing::warn!(provider, "oauth callback: no session cookie");
+            return fail(StatusCode::UNAUTHORIZED);
+        }
     };
     if query.error.is_some() {
+        tracing::warn!(provider, "oauth callback: provider returned an error");
         return fail(StatusCode::BAD_REQUEST);
     }
     // Bounds before any storage or provider call: an oversized or non-base64url
     // `state` and an oversized `code` are rejected here, so neither reaches a
     // hash, a SQL binding, or the outbound token request.
     if !limits::is_oauth_state(&query.state) {
+        tracing::warn!(provider, "oauth callback: malformed state");
         return fail(StatusCode::BAD_REQUEST);
     }
     let code = match query
@@ -812,17 +817,27 @@ async fn callback(
         .filter(|x| limits::is_authorization_code(x))
     {
         Some(x) => x.to_owned(),
-        None => return fail(StatusCode::BAD_REQUEST),
+        None => {
+            tracing::warn!(provider, "oauth callback: missing or malformed code");
+            return fail(StatusCode::BAD_REQUEST);
+        }
     };
     if let Some(rejection) = rate_limit(&state, guard::client_ip(peer.0), &provider) {
+        tracing::warn!(provider, "oauth callback: rate limited");
         return rejection;
     }
     match aurora_storage::get_oauth_session(&state.pool, &hash(&sid), &Utc::now().to_rfc3339())
         .await
     {
         Ok(Some(_)) => {}
-        Ok(None) => return fail(StatusCode::UNAUTHORIZED),
-        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => {
+            tracing::warn!(provider, "oauth callback: session cookie not recognized");
+            return fail(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: session lookup failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
     let tx = match aurora_storage::claim_oauth_transaction(
         &state.pool,
@@ -834,14 +849,30 @@ async fn callback(
     .await
     {
         Ok(Some(tx)) => tx,
-        _ => return fail(StatusCode::BAD_REQUEST),
+        Ok(None) => {
+            tracing::warn!(
+                provider,
+                "oauth callback: transaction not found/claimed (state mismatch, expired, or different session)"
+            );
+            return fail(StatusCode::BAD_REQUEST);
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: transaction claim failed");
+            return fail(StatusCode::BAD_REQUEST);
+        }
     };
     let verifier = tx.verifier;
     let redirect_uri = tx.redirect_uri;
     let settings = match provider_settings(&state.config, &provider) {
         Some((s, _, _, _)) if valid_redirect_uri(&provider, &s.redirect_uri) => s.clone(),
-        Some(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
-        None => return fail(StatusCode::SERVICE_UNAVAILABLE),
+        Some(_) => {
+            tracing::error!(provider, "oauth callback: redirect URI misconfigured");
+            return fail(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        None => {
+            tracing::error!(provider, "oauth callback: provider not configured");
+            return fail(StatusCode::SERVICE_UNAVAILABLE);
+        }
     };
     let (account, tokens) = match state
         .oauth
@@ -849,16 +880,25 @@ async fn callback(
         .await
     {
         Ok(x) => x,
-        Err(()) => return fail(StatusCode::BAD_GATEWAY),
+        Err(()) => {
+            tracing::error!(provider, "oauth callback: token exchange failed");
+            return fail(StatusCode::BAD_GATEWAY);
+        }
     };
     let token_bytes = match tokens.encode_native() {
         Ok(x) => x,
-        Err(_) => return fail(StatusCode::BAD_GATEWAY),
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: token encode failed");
+            return fail(StatusCode::BAD_GATEWAY);
+        }
     };
     let encrypted = match aurora_storage::encrypt_oauth_tokens(&state.encryption_key, &token_bytes)
     {
         Ok(x) => x,
-        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: token encryption failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
     let persisted = OAuthAccount {
         subject: account.subject.clone(),
@@ -869,7 +909,7 @@ async fn callback(
         auth_state: "connected".into(),
         last_auth_error: None,
     };
-    if aurora_storage::save_oauth_account(
+    match aurora_storage::save_oauth_account(
         &state.pool,
         &hash(&sid),
         &provider,
@@ -878,9 +918,14 @@ async fn callback(
         &encrypted,
     )
     .await
-    .is_err()
     {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(()) => {
+            tracing::info!(provider, subject = %account.subject, "oauth account connected");
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: account save failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
     Redirect::to(&state.config.frontend_url).into_response()
 }
