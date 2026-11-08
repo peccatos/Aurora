@@ -8,8 +8,8 @@ import type { RemotePlaylistSnapshot, RemotePlaylistSummary, RemoteProvider, Rem
 declare global {
   interface ImportMeta {
     readonly env?: {
-      readonly VITE_OAUTH_API_BASE_URL?: string;
-      readonly VITE_MEDIA_API_BASE_URL?: string;
+      readonly VITE_AURORA_OAUTH_BASE_URL?: string;
+      readonly VITE_AURORA_MEDIA_BASE_URL?: string;
     };
   }
 }
@@ -22,14 +22,14 @@ type WebProvider = (typeof WEB_PROVIDERS)[number];
 let apiBaseOverride: string | null = null;
 
 /** Overrides the configured OAuth service base URL. Pass `null` to fall
- *  back to `VITE_OAUTH_API_BASE_URL`. Intended for tests. */
+ *  back to `VITE_AURORA_OAUTH_BASE_URL`. Intended for tests. */
 export function setApiBaseForTests(value: string | null): void {
   apiBaseOverride = value;
 }
 
 function configuredApiBase(): URL | null {
   const raw = apiBaseOverride
-    ?? (import.meta.env?.VITE_OAUTH_API_BASE_URL || "https://aurora-api-3.onrender.com");
+    ?? (import.meta.env?.VITE_AURORA_OAUTH_BASE_URL || "https://aurora-api-3.onrender.com");
   if (!raw) return null;
   try {
     const url = new URL(raw);
