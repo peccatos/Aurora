@@ -28,7 +28,10 @@ notify.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "time"] }
+# Declared directly (not workspace = true): dependency features are additive,
+# so inheriting the workspace entry would drag `net`/`process` (and mio,
+# which hard-errors on wasm) into the browser build.
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "time"] }
 aurora-audio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
