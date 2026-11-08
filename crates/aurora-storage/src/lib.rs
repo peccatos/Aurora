@@ -48,17 +48,33 @@ pub fn content_digest(path: &Path) -> std::io::Result<[u8; 32]> {
 /// on a power cut (a rescan fixes that) in exchange for much faster
 /// writes during scanning.
 pub async fn open(path: &Path) -> Result<SqlitePool, StorageError> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .foreign_keys(true);
+    let options = |journal: SqliteJournalMode| {
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(journal)
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
+    };
 
-    let pool = SqlitePoolOptions::new()
+    // WAL is the preferred mode, but some PaaS container filesystems
+    // (Render's native runtime overlay on /tmp) reject the wal/shm
+    // sidecar files with SQLITE_CANTOPEN. Fall back to the rollback
+    // journal: slower writes, same durability guarantees, works
+    // everywhere.
+    let pool = match SqlitePoolOptions::new()
         .max_connections(4)
-        .connect_with(options)
-        .await?;
+        .connect_with(options(SqliteJournalMode::Wal))
+        .await
+    {
+        Ok(pool) => pool,
+        Err(_) => {
+            SqlitePoolOptions::new()
+                .max_connections(4)
+                .connect_with(options(SqliteJournalMode::Delete))
+                .await?
+        }
+    };
 
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
