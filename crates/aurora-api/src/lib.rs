@@ -521,19 +521,21 @@ fn fail(status: StatusCode) -> Response {
         .into_response()
 }
 fn cookie(id: &str) -> String {
-    // Lax (not Strict): the OAuth callback is a top-level cross-site GET
-    // redirect from accounts.google.com, and Strict cookies are not sent on
-    // such navigations — the callback would see no session and fail with 401.
-    // Lax is still withheld on cross-site subresource/fetch requests, so the
-    // session cookie never leaks to third-party sites; state-changing API
-    // calls additionally require the session-bound X-CSRF-Token header.
-    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax")
+    // None (not Lax/Strict): the API and the frontend are hosted on different
+    // sites (PaaS subdomains like *.onrender.com are in the Public Suffix
+    // List, so they are never same-site), so the session cookie must be
+    // storable from a cross-site fetch response and attachable to the
+    // top-level OAuth callback redirect from accounts.google.com. Secure is
+    // mandatory for SameSite=None. Cross-site attackers still cannot read it
+    // (HttpOnly) or send it meaningfully: state-changing API calls require the
+    // session-bound X-CSRF-Token header.
+    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=None")
 }
 /// The CSRF cookie is intentionally readable by scripts on the allowed origins so the
 /// frontend can echo it in the `X-CSRF-Token` header; it is scoped exactly like the
 /// session cookie. A cross-site attacker can read neither it nor the session cookie.
 fn csrf_cookie(token: &str) -> String {
-    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax")
+    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=None")
 }
 fn cookie_header(value: &str) -> HeaderValue {
     value
@@ -1487,7 +1489,7 @@ mod tests {
             .iter()
             .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
             .expect("session cookie is set");
-        for attribute in ["Path=/", "Secure", "SameSite=Lax"] {
+        for attribute in ["Path=/", "Secure", "SameSite=None"] {
             assert!(csrf_cookie_value.contains(attribute));
             assert!(session_cookie_value.contains(attribute));
         }
