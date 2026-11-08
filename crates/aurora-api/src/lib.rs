@@ -652,8 +652,14 @@ async fn authorize_csrf(state: &AppState, headers: &HeaderMap) -> Result<String,
     .await
     {
         Ok(true) => Ok(sid),
-        Ok(false) => Err(fail(StatusCode::FORBIDDEN)),
-        Err(_) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR)),
+        Ok(false) => {
+            tracing::warn!("csrf rejected: token not bound to the presented session");
+            Err(fail(StatusCode::FORBIDDEN))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "csrf validation storage failure");
+            Err(fail(StatusCode::INTERNAL_SERVER_ERROR))
+        }
     }
 }
 
@@ -963,6 +969,7 @@ async fn provider_error(
 ) -> Response {
     match error {
         aurora_providers::playlist::Error::ReauthorizationRequired => {
+            tracing::warn!(provider, "provider rejected the stored grant: reauthorization required");
             let _ = aurora_storage::mark_oauth_reauth_required(
                 &state.pool,
                 session_hash,
@@ -972,7 +979,10 @@ async fn provider_error(
             .await;
             fail(StatusCode::UNAUTHORIZED)
         }
-        _ => fail(StatusCode::BAD_GATEWAY),
+        other => {
+            tracing::error!(provider, error = %other, "provider playlist request failed");
+            fail(StatusCode::BAD_GATEWAY)
+        }
     }
 }
 

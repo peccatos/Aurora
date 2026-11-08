@@ -366,7 +366,10 @@ pub(crate) async fn playlist_detail(
     // another origin cannot drive this read with the visitor's cookie.
     let sid = match crate::authorize_csrf(&state, &headers).await {
         Ok(sid) => sid,
-        Err(rejection) => return rejection,
+        Err(rejection) => {
+            tracing::warn!(provider = %path.provider, "playlist detail rejected at origin/session/csrf gate");
+            return rejection;
+        }
     };
     let session_hash = hash(&sid);
     let ciphertext = match aurora_storage::get_oauth_token_ciphertext(
@@ -377,7 +380,10 @@ pub(crate) async fn playlist_detail(
     .await
     {
         Ok(Some(value)) => value,
-        Ok(None) => return fail(StatusCode::NOT_FOUND),
+        Ok(None) => {
+            tracing::warn!(provider = %path.provider, "playlist detail: no stored tokens for this session");
+            return fail(StatusCode::NOT_FOUND);
+        }
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
     };
     let plaintext = match aurora_storage::decrypt_oauth_tokens(&state.encryption_key, &ciphertext) {
