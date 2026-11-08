@@ -136,8 +136,11 @@ async function requestJson(
     if (value !== null && value !== undefined && value !== "") url.searchParams.set(key, value);
   }
   const method = (init?.method ?? "GET").toUpperCase();
-  // State-changing requests must echo the session-bound token from the readable cookie.
-  const token = method === "GET" || method === "HEAD" ? null : csrfToken();
+  // Echo the session-bound token from the readable cookie whenever present.
+  // Non-GET calls must carry it (server rejects otherwise); the playlist
+  // detail endpoint additionally requires it on GET as a read-driving
+  // defense, so it is attached uniformly rather than method-gated.
+  const token = csrfToken();
   const response = await fetch(url, {
     ...init,
     credentials: "include",
