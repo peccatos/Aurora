@@ -52,6 +52,10 @@ pub(crate) fn is_session_token(raw: &str) -> bool {
 
 /// Same shape as a session token; kept separate so the two can be tightened
 /// independently without one silently inheriting the other's bound.
+pub(crate) fn is_user_token(raw: &str) -> bool {
+    is_base64url_token(raw, SESSION_TOKEN_LEN)
+}
+
 pub(crate) fn is_csrf_token(raw: &str) -> bool {
     is_base64url_token(raw, CSRF_TOKEN_LEN)
 }

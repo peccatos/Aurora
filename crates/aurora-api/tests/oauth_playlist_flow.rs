@@ -30,6 +30,7 @@ const SPOTIFY_TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_PROFILE_ENDPOINT: &str = "https://api.spotify.com/v1/me";
 const ENCRYPTION_KEY: [u8; 32] = [7u8; 32];
 
+const USER_COOKIE: &str = "__Host-aurora_user";
 const SESSION_COOKIE: &str = "__Host-aurora_session";
 const CSRF_COOKIE: &str = "__Host-aurora_csrf";
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -267,10 +268,16 @@ fn request(method: Method, uri: &str) -> axum::http::request::Builder {
 }
 
 /// A same-origin request carrying the session cookie and CSRF header.
+/// `sid` is either a bare session id or a full cookie header.
 fn authed(method: Method, uri: &str, sid: &str, csrf: &str) -> Request<Body> {
+    let cookie = if sid.contains('=') {
+        sid.to_owned()
+    } else {
+        format!("{SESSION_COOKIE}={sid}")
+    };
     request(method, uri)
         .header(header::ORIGIN, ORIGIN)
-        .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+        .header(header::COOKIE, cookie)
         .header(CSRF_HEADER, csrf)
         .body(Body::empty())
         .unwrap()
@@ -278,9 +285,14 @@ fn authed(method: Method, uri: &str, sid: &str, csrf: &str) -> Request<Body> {
 
 /// A same-origin request carrying the session cookie but no CSRF header.
 fn session_only(method: Method, uri: &str, sid: &str) -> Request<Body> {
+    let cookie = if sid.contains('=') {
+        sid.to_owned()
+    } else {
+        format!("{SESSION_COOKIE}={sid}")
+    };
     request(method, uri)
         .header(header::ORIGIN, ORIGIN)
-        .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+        .header(header::COOKIE, cookie)
         .body(Body::empty())
         .unwrap()
 }
@@ -326,7 +338,10 @@ fn query_params(url: &str) -> HashMap<String, String> {
 
 /// Drives `POST begin` for a provider from a clean (session-less) client and
 /// returns the session id, the CSRF token, the `Set-Cookie` headers and body.
-async fn begin(app: &axum::Router, provider: &str) -> (String, String, Vec<String>, Value) {
+async fn begin(
+    app: &axum::Router,
+    provider: &str,
+) -> (String, String, String, Vec<String>, Value) {
     let response = send(
         app,
         request(Method::POST, &format!("/api/oauth/{provider}/begin"))
@@ -339,6 +354,7 @@ async fn begin(app: &axum::Router, provider: &str) -> (String, String, Vec<Strin
     let cookies = set_cookies(&response);
     let body = body_json(response).await;
     let sid = cookie_value(&cookies, SESSION_COOKIE).expect("begin issues a session cookie");
+    let uid = cookie_value(&cookies, USER_COOKIE).expect("begin issues a user cookie");
     let csrf = body["csrf_token"]
         .as_str()
         .expect("begin returns a CSRF token")
@@ -348,7 +364,7 @@ async fn begin(app: &axum::Router, provider: &str) -> (String, String, Vec<Strin
         Some(csrf.as_str()),
         "the readable CSRF cookie must match the issued token"
     );
-    (sid, csrf, cookies, body)
+    (sid, uid, csrf, cookies, body)
 }
 
 /// Extracts the `state` the authorization URL will echo back.
@@ -362,8 +378,10 @@ fn authorization_state(body: &Value) -> String {
 }
 
 /// Runs `begin` followed by a successful callback and returns the live session.
-async fn connected_session(h: &Harness) -> (String, String) {
-    let (sid, csrf, _, body) = begin(&h.app, "spotify").await;
+async fn connected_session(h: &Harness) -> (String, String, String) {
+    let (sid, uid, csrf, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
+    let uid_hash = raw_hash(&uid);
     let state = authorization_state(&body);
     let response = send(
         &h.app,
@@ -371,7 +389,7 @@ async fn connected_session(h: &Harness) -> (String, String) {
             Method::GET,
             &format!("/api/oauth/spotify/callback?state={state}&code=auth-code"),
         )
-        .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+        .header(header::COOKIE, cookies_hdr.clone())
         .body(Body::empty())
         .unwrap(),
     )
@@ -381,7 +399,7 @@ async fn connected_session(h: &Harness) -> (String, String) {
         StatusCode::SEE_OTHER,
         "callback succeeds"
     );
-    (sid, csrf)
+    (cookies_hdr, uid_hash, csrf)
 }
 
 /// Inserts a session row that is already past its expiry.
@@ -414,8 +432,8 @@ async fn insert_expired_transaction(pool: &SqlitePool, sid: &str, state: &str) {
 }
 
 /// The account row a successful callback must leave behind.
-async fn stored_account(pool: &SqlitePool, sid: &str) -> OAuthAccount {
-    aurora_storage::get_oauth_account(pool, &raw_hash(sid), "spotify")
+async fn stored_account(pool: &SqlitePool, user_hash: &str) -> OAuthAccount {
+    aurora_storage::get_oauth_account(pool, user_hash, "spotify")
         .await
         .expect("account lookup succeeds")
         .expect("the account is stored")
@@ -433,16 +451,17 @@ fn random_token() -> String {
 }
 
 /// Issues a `GET /api/oauth/spotify/callback` for the given session.
+/// `sid` here is the full cookie header (session + user cookies).
 async fn callback(app: &axum::Router, sid: Option<&str>, query: &str) -> Response {
     let mut builder = request(Method::GET, &format!("/api/oauth/spotify/callback?{query}"));
     if let Some(sid) = sid {
-        builder = builder.header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"));
+        builder = builder.header(header::COOKIE, sid.to_owned());
     }
     send(app, builder.body(Body::empty()).unwrap()).await
 }
 
-async fn token_ciphertext(h: &Harness, sid: &str) -> Option<Vec<u8>> {
-    aurora_storage::get_oauth_token_ciphertext(&h.pool, &raw_hash(sid), "spotify")
+async fn token_ciphertext(h: &Harness, user_hash: &str) -> Option<Vec<u8>> {
+    aurora_storage::get_oauth_token_ciphertext(&h.pool, user_hash, "spotify")
         .await
         .unwrap()
 }
@@ -463,7 +482,8 @@ async fn assert_tokens(expected: Option<&[u8]>, h: &Harness, sid: &str) {
 #[tokio::test]
 async fn begin_issues_a_session_csrf_pair_and_a_hardened_authorization_url() {
     let h = Harness::new(vec![]).await;
-    let (sid, csrf, cookies, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, cookies, body) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
 
     // Independent, unguessable secrets: neither is the other, nor its hash.
     assert_ne!(sid, csrf);
@@ -615,7 +635,7 @@ async fn begin_rejects_an_unconfigured_provider_and_accepts_youtube_when_configu
     assert_eq!(unconfigured.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(set_cookies(&unconfigured).is_empty());
 
-    let (_, _, _, body) = begin(&app, "youtube-music").await;
+    let (_, _uid, _, _, body) = begin(&app, "youtube-music").await;
     let params = query_params(body["authorization_url"].as_str().unwrap());
     assert_eq!(params["access_type"], "offline");
     assert_eq!(params["prompt"], "consent");
@@ -631,7 +651,8 @@ async fn begin_rejects_an_unconfigured_provider_and_accepts_youtube_when_configu
 #[tokio::test]
 async fn begin_rotates_the_csrf_token_for_an_existing_session() {
     let h = Harness::new(vec![]).await;
-    let (sid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
 
     let response = send(
         &h.app,
@@ -672,7 +693,8 @@ async fn begin_rotates_the_csrf_token_for_an_existing_session() {
 #[tokio::test]
 async fn begin_requires_csrf_for_an_existing_session_and_origin_for_a_new_one() {
     let h = Harness::new(vec![]).await;
-    let (sid, _, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
 
     let missing = send(
         &h.app,
@@ -741,26 +763,28 @@ async fn callback_rejects_an_expired_session() {
 #[tokio::test]
 async fn callback_rejects_an_unknown_state() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, _, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, _) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let response = callback(
         &h.app,
-        Some(&sid),
+        Some(&cookies_hdr),
         "state=not-a-state-we-issued&code=auth-code",
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(h.transport.calls(), 0);
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 #[tokio::test]
 async fn callback_rejects_the_first_request_carrying_both_code_and_error() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
     let response = callback(
         &h.app,
-        Some(&sid),
+        Some(&cookies_hdr),
         &format!("state={state}&code=auth-code&error=access_denied"),
     )
     .await;
@@ -770,20 +794,23 @@ async fn callback_rejects_the_first_request_carrying_both_code_and_error() {
         0,
         "an aborted grant is never exchanged"
     );
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 #[tokio::test]
 async fn callback_rejects_a_missing_or_empty_code() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
     for query in [
         format!("state={state}"),
         format!("state={state}&code="),
         format!("state={state}&error="),
     ] {
-        let response = callback(&h.app, Some(&sid), &query).await;
+        let response = callback(
+        &h.app,
+        Some(&cookies_hdr), &query).await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -796,13 +823,15 @@ async fn callback_rejects_a_missing_or_empty_code() {
 #[tokio::test]
 async fn callback_rejects_a_state_that_belongs_to_another_session() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (victim, _, _, victim_body) = begin(&h.app, "spotify").await;
-    let (attacker, _, _, _) = begin(&h.app, "spotify").await;
+    let (victim, victim_uid, _, _, victim_body) = begin(&h.app, "spotify").await;
+    let victim_cookies = format!("{SESSION_COOKIE}={victim}; {USER_COOKIE}={victim_uid}");
+    let (attacker, attacker_uid, _, _, _) = begin(&h.app, "spotify").await;
+    let attacker_cookies = format!("{SESSION_COOKIE}={attacker}; {USER_COOKIE}={attacker_uid}");
     let stolen_state = authorization_state(&victim_body);
 
     let response = callback(
         &h.app,
-        Some(&attacker),
+        Some(&attacker_cookies),
         &format!("state={stolen_state}&code=auth-code"),
     )
     .await;
@@ -813,7 +842,7 @@ async fn callback_rejects_a_state_that_belongs_to_another_session() {
     // consume the transaction.
     let ok = callback(
         &h.app,
-        Some(&victim),
+        Some(&victim_cookies),
         &format!("state={stolen_state}&code=auth-code"),
     )
     .await;
@@ -823,7 +852,8 @@ async fn callback_rejects_a_state_that_belongs_to_another_session() {
 #[tokio::test]
 async fn callback_rejects_a_foreign_provider_for_the_same_state() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
     let response = send(
         &h.app,
@@ -831,45 +861,53 @@ async fn callback_rejects_a_foreign_provider_for_the_same_state() {
             Method::GET,
             &format!("/api/oauth/youtube-music/callback?state={state}&code=auth-code"),
         )
-        .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+        .header(header::COOKIE, cookies_hdr.clone())
         .body(Body::empty())
         .unwrap(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(h.transport.calls(), 0);
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 #[tokio::test]
 async fn callback_rejects_an_expired_transaction() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, _, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, _) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = "expired-state-value";
     insert_expired_transaction(&h.pool, &sid, state).await;
 
-    let response = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let response = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         h.transport.calls(),
         0,
         "an expired transaction is never exchanged"
     );
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 #[tokio::test]
 async fn callback_rejects_a_replayed_state() {
     let h = Harness::new(successful_exchange("token-a")).await;
-    let (sid, csrf, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
 
-    let first = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let first = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
     assert_eq!(first.status(), StatusCode::SEE_OTHER);
     let calls_after_first = h.transport.calls();
-    let tokens_after_first = token_ciphertext(&h, &sid).await;
+    let tokens_after_first = token_ciphertext(&h, &raw_hash(&uid)).await;
 
-    let replay = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let replay = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
     assert_eq!(
         replay.status(),
         StatusCode::BAD_REQUEST,
@@ -881,14 +919,14 @@ async fn callback_rejects_a_replayed_state() {
         "the replay never reaches the provider"
     );
     assert_eq!(
-        token_ciphertext(&h, &sid).await,
+        token_ciphertext(&h, &raw_hash(&uid)).await,
         tokens_after_first,
         "the replay must not overwrite the stored credentials"
     );
     // The session itself stays usable.
     let status = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/spotify/status", &cookies_hdr, &csrf),
     )
     .await;
     assert_eq!(status.status(), StatusCode::OK);
@@ -897,21 +935,27 @@ async fn callback_rejects_a_replayed_state() {
 #[tokio::test]
 async fn callback_reports_a_provider_failure_as_bad_gateway() {
     let h = Harness::new(vec![Step::Reject]).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
-    let response = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let response = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 #[tokio::test]
 async fn callback_reports_a_malformed_token_response_as_bad_gateway() {
     let h = Harness::new(vec![Step::Token(json!({"unexpected": true}))]).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
-    let response = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let response = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_tokens(None, &h, &sid).await;
+    assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -921,9 +965,12 @@ async fn callback_reports_a_malformed_token_response_as_bad_gateway() {
 #[tokio::test]
 async fn successful_callback_persists_sanitized_account_metadata() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
-    let response = callback(&h.app, Some(&sid), &format!("state={state}&code=auth-code")).await;
+    let response = callback(
+        &h.app,
+        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
@@ -940,7 +987,7 @@ async fn successful_callback_persists_sanitized_account_metadata() {
         "one token exchange, one userinfo call"
     );
 
-    let account = stored_account(&h.pool, &sid).await;
+    let account = stored_account(&h.pool, &raw_hash(&uid)).await;
     assert_eq!(account.subject, "spotify-subject");
     assert_eq!(account.display_name, "spotify-subject");
     assert_eq!(account.avatar_url, None);
@@ -949,7 +996,7 @@ async fn successful_callback_persists_sanitized_account_metadata() {
     // `get_oauth_account` reads `last_auth_error` with a plain `try_get`, which
     // fails on SQL NULL and yields an empty string, so the stored value is
     // asserted where it is actually visible: the response the API hands out.
-    let raw = raw_account_row(&h, &sid).await;
+    let raw = raw_account_row(&h, &raw_hash(&uid)).await;
     assert_eq!(raw["last_auth_error"], "");
 
     // The account metadata is not encumbered with any provider payload.
@@ -970,7 +1017,7 @@ async fn successful_callback_persists_sanitized_account_metadata() {
             raw[column]
         );
     }
-    let ciphertext = token_ciphertext(&h, &sid).await.expect("token stored");
+    let ciphertext = token_ciphertext(&h, &raw_hash(&uid)).await.expect("token stored");
     assert!(
         !ciphertext
             .windows(b"secret-access-token".len())
@@ -988,7 +1035,7 @@ async fn successful_callback_persists_sanitized_account_metadata() {
     // The status endpoint answers with the sanitized account only.
     let status = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/spotify/status", &cookies_hdr, &csrf),
     )
     .await;
     assert_eq!(status.status(), StatusCode::OK);
@@ -1021,13 +1068,13 @@ async fn successful_callback_persists_sanitized_account_metadata() {
 }
 
 /// The raw `oauth_accounts` row, to check what was actually persisted.
-async fn raw_account_row(h: &Harness, sid: &str) -> HashMap<String, String> {
+async fn raw_account_row(h: &Harness, user_hash: &str) -> HashMap<String, String> {
     use sqlx::Row;
     let row = sqlx::query(
         "SELECT subject, display_name, capabilities_json, keyring_account_id, last_auth_error, \
-         auth_state FROM oauth_accounts WHERE session_id_hash=? AND provider=?",
+         auth_state FROM oauth_accounts WHERE user_hash=? AND provider=?",
     )
-    .bind(raw_hash(sid))
+    .bind(user_hash.to_owned())
     .bind("spotify")
     .fetch_one(&h.pool)
     .await
@@ -1057,17 +1104,18 @@ async fn callback_uses_the_server_stored_redirect_uri_and_verifier() {
     // The exchange is driven by the transaction row, never by caller-supplied
     // query parameters.
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, _, _, body) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, body) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let state = authorization_state(&body);
     let response = callback(
         &h.app,
-        Some(&sid),
+        Some(&cookies_hdr),
         &format!("state={state}&code=auth-code&redirect_uri=https://evil.example/callback"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        stored_account(&h.pool, &sid).await.subject,
+        stored_account(&h.pool, &raw_hash(&uid)).await.subject,
         "spotify-subject"
     );
     assert_eq!(
@@ -1104,7 +1152,8 @@ async fn status_requires_a_session_and_an_allowed_origin() {
     .await;
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
-    let (sid, _, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, _, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let foreign = send(
         &h.app,
         request(Method::GET, "/api/oauth/spotify/status")
@@ -1148,17 +1197,17 @@ async fn status_rejects_an_expired_session() {
 #[tokio::test]
 async fn status_reports_not_found_for_a_provider_without_an_account() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let ok = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/spotify/status", &cookies, &csrf),
     )
     .await;
     assert_eq!(ok.status(), StatusCode::OK);
 
     let missing = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/youtube-music/status", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/youtube-music/status", &cookies, &csrf),
     )
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
@@ -1172,18 +1221,18 @@ async fn status_reports_not_found_for_a_provider_without_an_account() {
 #[tokio::test]
 async fn disconnect_removes_the_account_and_is_idempotent() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
-    assert!(token_ciphertext(&h, &sid).await.is_some());
+    let (cookies, uid_hash, csrf) = connected_session(&h).await;
+    assert!(token_ciphertext(&h, &uid_hash).await.is_some());
 
     let first = send(
         &h.app,
-        authed(Method::DELETE, "/api/oauth/spotify", &sid, &csrf),
+        authed(Method::DELETE, "/api/oauth/spotify", &cookies, &csrf),
     )
     .await;
     assert_eq!(first.status(), StatusCode::NO_CONTENT);
-    assert!(token_ciphertext(&h, &sid).await.is_none());
+    assert!(token_ciphertext(&h, &uid_hash).await.is_none());
     assert!(
-        aurora_storage::get_oauth_account(&h.pool, &raw_hash(&sid), "spotify")
+        aurora_storage::get_oauth_account(&h.pool, &uid_hash, "spotify")
             .await
             .unwrap()
             .is_none()
@@ -1192,7 +1241,7 @@ async fn disconnect_removes_the_account_and_is_idempotent() {
     // Repeating the call is not an error and does not disturb the session.
     let second = send(
         &h.app,
-        authed(Method::DELETE, "/api/oauth/spotify", &sid, &csrf),
+        authed(Method::DELETE, "/api/oauth/spotify", &cookies, &csrf),
     )
     .await;
     assert_eq!(second.status(), StatusCode::NO_CONTENT);
@@ -1200,7 +1249,7 @@ async fn disconnect_removes_the_account_and_is_idempotent() {
     // The session survives; only the account is gone.
     let status = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/spotify/status", &cookies, &csrf),
     )
     .await;
     assert_eq!(status.status(), StatusCode::NOT_FOUND);
@@ -1209,18 +1258,18 @@ async fn disconnect_removes_the_account_and_is_idempotent() {
 #[tokio::test]
 async fn disconnect_requires_session_bound_csrf_and_an_allowed_origin() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, uid_hash, csrf) = connected_session(&h).await;
 
     let missing_csrf = send(
         &h.app,
-        session_only(Method::DELETE, "/api/oauth/spotify", &sid),
+        session_only(Method::DELETE, "/api/oauth/spotify", &cookies),
     )
     .await;
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
 
     let wrong_csrf = send(
         &h.app,
-        authed(Method::DELETE, "/api/oauth/spotify", &sid, "not-the-token"),
+        authed(Method::DELETE, "/api/oauth/spotify", &cookies, "not-the-token"),
     )
     .await;
     assert_eq!(wrong_csrf.status(), StatusCode::FORBIDDEN);
@@ -1229,7 +1278,7 @@ async fn disconnect_requires_session_bound_csrf_and_an_allowed_origin() {
         &h.app,
         request(Method::DELETE, "/api/oauth/spotify")
             .header(header::ORIGIN, "https://evil.example")
-            .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+            .header(header::COOKIE, cookies.clone())
             .header(CSRF_HEADER, &csrf)
             .body(Body::empty())
             .unwrap(),
@@ -1238,11 +1287,11 @@ async fn disconnect_requires_session_bound_csrf_and_an_allowed_origin() {
     assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
 
     // Nothing was deleted by the rejected attempts.
-    assert!(token_ciphertext(&h, &sid).await.is_some());
+    assert!(token_ciphertext(&h, &uid_hash).await.is_some());
 
     let ok = send(
         &h.app,
-        authed(Method::DELETE, "/api/oauth/spotify", &sid, &csrf),
+        authed(Method::DELETE, "/api/oauth/spotify", &cookies, &csrf),
     )
     .await;
     assert_eq!(ok.status(), StatusCode::NO_CONTENT);
@@ -1276,7 +1325,8 @@ async fn disconnect_rejects_an_unknown_provider_and_an_expired_session() {
         expired.status()
     );
 
-    let (live, csrf, _, _) = begin(&h.app, "spotify").await;
+    let (live, uid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={live}; {USER_COOKIE}={uid}");
     let unknown = send(
         &h.app,
         authed(Method::DELETE, "/api/oauth/apple-music", &live, &csrf),
@@ -1292,12 +1342,12 @@ async fn disconnect_rejects_an_unknown_provider_and_an_expired_session() {
 #[tokio::test]
 async fn playlists_rejects_a_malformed_cursor_before_reaching_the_provider() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let calls_before = h.playlist_attempts.load(Ordering::SeqCst);
 
     for cursor in ["abc", "-1", "1.5", "%20", "0x10", "1e3", "+1"] {
         let uri = format!("/api/oauth/spotify/playlists?cursor={cursor}");
-        let response = send(&h.app, authed(Method::GET, &uri, &sid, &csrf)).await;
+        let response = send(&h.app, authed(Method::GET, &uri, &cookies, &csrf)).await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -1317,7 +1367,7 @@ async fn playlists_rejects_a_malformed_cursor_before_reaching_the_provider() {
         authed(
             Method::GET,
             "/api/oauth/spotify/playlists?cursor=50",
-            &sid,
+            &cookies,
             &csrf,
         ),
     )
@@ -1328,7 +1378,8 @@ async fn playlists_rejects_a_malformed_cursor_before_reaching_the_provider() {
 #[tokio::test]
 async fn playlists_requires_origin_session_and_stored_tokens() {
     let h = Harness::new(vec![]).await;
-    let (sid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
 
     // Same request with no Origin header at all.
     let no_origin = send(
@@ -1353,7 +1404,7 @@ async fn playlists_requires_origin_session_and_stored_tokens() {
 
     let no_account = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/playlists", &sid, &csrf),
+        authed(Method::GET, "/api/oauth/spotify/playlists", &cookies_hdr, &csrf),
     )
     .await;
     assert_eq!(no_account.status(), StatusCode::NOT_FOUND);
@@ -1386,7 +1437,7 @@ async fn playlists_requires_origin_session_and_stored_tokens() {
 #[tokio::test]
 async fn playlist_detail_rejects_malformed_ids_before_reaching_the_provider() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let calls_before = h.playlist_attempts.load(Ordering::SeqCst);
 
     // Encoded traversal, separators, control bytes, non-ASCII and length abuse.
@@ -1404,7 +1455,7 @@ async fn playlist_detail_rejects_malformed_ids_before_reaching_the_provider() {
         oversized.as_str(),
     ] {
         let uri = format!("/api/oauth/spotify/playlists/{id}");
-        let response = send(&h.app, authed(Method::GET, &uri, &sid, &csrf)).await;
+        let response = send(&h.app, authed(Method::GET, &uri, &cookies, &csrf)).await;
         assert_ne!(
             response.status(),
             StatusCode::OK,
@@ -1432,12 +1483,12 @@ async fn playlist_detail_rejects_malformed_ids_before_reaching_the_provider() {
 #[tokio::test]
 async fn playlist_detail_rejects_hostile_ids_that_would_escape_the_endpoint() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let calls_before = h.playlist_attempts.load(Ordering::SeqCst);
 
     for id in ["..%2F..%2Fme", "%2E%2E", "abc%2F..%2F..%2Fme%2Fplaylists"] {
         let uri = format!("/api/oauth/spotify/playlists/{id}");
-        let response = send(&h.app, authed(Method::GET, &uri, &sid, &csrf)).await;
+        let response = send(&h.app, authed(Method::GET, &uri, &cookies, &csrf)).await;
         assert_ne!(response.status(), StatusCode::OK, "id {id:?}");
     }
     assert_eq!(h.playlist_attempts.load(Ordering::SeqCst), calls_before);
@@ -1446,12 +1497,13 @@ async fn playlist_detail_rejects_hostile_ids_that_would_escape_the_endpoint() {
 #[tokio::test]
 async fn playlist_detail_requires_origin_session_csrf_and_stored_tokens() {
     let h = Harness::new(vec![]).await;
-    let (sid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
 
     let no_origin = send(
         &h.app,
         request(Method::GET, "/api/oauth/spotify/playlists/abc123")
-            .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+            .header(header::COOKIE, cookies_hdr.clone())
             .header(CSRF_HEADER, &csrf)
             .body(Body::empty())
             .unwrap(),
@@ -1461,7 +1513,7 @@ async fn playlist_detail_requires_origin_session_csrf_and_stored_tokens() {
 
     let no_csrf = send(
         &h.app,
-        session_only(Method::GET, "/api/oauth/spotify/playlists/abc123", &sid),
+        session_only(Method::GET, "/api/oauth/spotify/playlists/abc123", &cookies_hdr),
     )
     .await;
     assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
@@ -1481,7 +1533,7 @@ async fn playlist_detail_requires_origin_session_csrf_and_stored_tokens() {
         authed(
             Method::GET,
             "/api/oauth/spotify/playlists/abc123",
-            &sid,
+            &cookies_hdr,
             &csrf,
         ),
     )
@@ -1493,7 +1545,7 @@ async fn playlist_detail_requires_origin_session_csrf_and_stored_tokens() {
         authed(
             Method::GET,
             "/api/oauth/apple-music/playlists/abc123",
-            &sid,
+            &cookies_hdr,
             &csrf,
         ),
     )
@@ -1539,14 +1591,14 @@ async fn playlist_detail_rejects_an_expired_session() {
 #[tokio::test]
 async fn playlist_detail_accepts_a_well_formed_id_and_fails_only_at_the_provider() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let before = h.playlist_attempts.load(Ordering::SeqCst);
     let response = send(
         &h.app,
         authed(
             Method::GET,
             "/api/oauth/spotify/playlists/37i9dQZF1DXcBWIGoYBM5M",
-            &sid,
+            &cookies,
             &csrf,
         ),
     )
@@ -1595,7 +1647,12 @@ fn media_metadata_request(url: &str, sid: Option<&str>, csrf: Option<&str>) -> R
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ORIGIN, ORIGIN);
     if let Some(sid) = sid {
-        builder = builder.header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"));
+        let cookie = if sid.contains('=') {
+            sid.to_owned()
+        } else {
+            format!("{SESSION_COOKIE}={sid}")
+        };
+        builder = builder.header(header::COOKIE, cookie);
     }
     if let Some(csrf) = csrf {
         builder = builder.header(CSRF_HEADER, csrf);
@@ -1621,7 +1678,8 @@ async fn media_metadata_rejects_a_non_allowlisted_url_before_any_auth() {
 
     // Even a fully authenticated request with a non-allowlisted URL is refused
     // at the same gate.
-    let (sid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, csrf, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let response = send(
         &h.app,
         media_metadata_request("https://evil.example/watch?v=x", Some(&sid), Some(&csrf)),
@@ -1644,7 +1702,8 @@ async fn media_metadata_rejects_a_missing_session_with_unauthorized() {
 #[tokio::test]
 async fn media_metadata_rejects_a_session_without_a_csrf_header() {
     let h = Harness::new(vec![]).await;
-    let (sid, _csrf, _, _) = begin(&h.app, "spotify").await;
+    let (sid, uid, _csrf, _, _) = begin(&h.app, "spotify").await;
+    let _cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     let response = send(
         &h.app,
         media_metadata_request("https://youtu.be/abc", Some(&sid), None),
@@ -1664,10 +1723,10 @@ async fn media_metadata_rejects_a_session_without_a_csrf_header() {
 #[tokio::test]
 async fn media_metadata_passes_the_gate_and_fails_only_at_the_sidecar() {
     let h = Harness::new(successful_exchange("secret-access-token")).await;
-    let (sid, csrf) = connected_session(&h).await;
+    let (cookies, _uid_hash, csrf) = connected_session(&h).await;
     let response = send(
         &h.app,
-        media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+        media_metadata_request("https://youtu.be/abc", Some(&cookies), Some(&csrf)),
     )
     .await;
     // The gate (origin, session, CSRF, rate limit) passed: what remains is the
@@ -1738,11 +1797,12 @@ async fn media_metadata_is_rate_limited_under_tiny_ceilings() {
     aurora_api::with_rate_limits(&mut state, std::time::Duration::from_secs(60), 100, 2);
     let app = router(state);
 
-    let (sid, csrf, _, _) = begin(&app, "spotify").await;
+    let (sid, uid, csrf, _, _) = begin(&app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid}; {USER_COOKIE}={uid}");
     for i in 0..2 {
         let response = send(
             &app,
-            media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+            media_metadata_request("https://youtu.be/abc", Some(&cookies_hdr), Some(&csrf)),
         )
         .await;
         assert!(
@@ -1752,7 +1812,7 @@ async fn media_metadata_is_rate_limited_under_tiny_ceilings() {
     }
     let limited = send(
         &app,
-        media_metadata_request("https://youtu.be/abc", Some(&sid), Some(&csrf)),
+        media_metadata_request("https://youtu.be/abc", Some(&cookies_hdr), Some(&csrf)),
     )
     .await;
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1761,10 +1821,11 @@ async fn media_metadata_is_rate_limited_under_tiny_ceilings() {
     assert!(body["retryAfterSeconds"].is_u64());
     // The charge is per provider bucket, not per session: a second session from
     // the same client is still refused.
-    let (sid2, csrf2, _, _) = begin(&app, "spotify").await;
+    let (sid2, uid, csrf2, _, _) = begin(&app, "spotify").await;
+    let cookies_hdr = format!("{SESSION_COOKIE}={sid2}; {USER_COOKIE}={uid}");
     let still_limited = send(
         &app,
-        media_metadata_request("https://youtu.be/abc", Some(&sid2), Some(&csrf2)),
+        media_metadata_request("https://youtu.be/abc", Some(&cookies_hdr), Some(&csrf2)),
     )
     .await;
     assert_eq!(still_limited.status(), StatusCode::TOO_MANY_REQUESTS);

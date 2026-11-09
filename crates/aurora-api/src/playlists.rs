@@ -364,14 +364,19 @@ pub(crate) async fn playlist_detail(
     // The same origin + CSRF + session gate the list endpoint uses: the request
     // must carry the CSRF token bound to the presented session, so a page on
     // another origin cannot drive this read with the visitor's cookie.
-    let sid = match crate::authorize_csrf(&state, &headers).await {
+    let _sid = match crate::authorize_csrf(&state, &headers).await {
         Ok(sid) => sid,
         Err(rejection) => {
             tracing::warn!(provider = %path.provider, "playlist detail rejected at origin/session/csrf gate");
             return rejection;
         }
     };
-    let session_hash = hash(&sid);
+    // Session gate above passed; tokens are keyed by the long-lived user
+    // cookie so a rotated session still reaches the stored grant.
+    let session_hash = match crate::user_token(&headers) {
+        Some(x) => hash(&x),
+        None => return fail(StatusCode::UNAUTHORIZED),
+    };
     let ciphertext = match aurora_storage::get_oauth_token_ciphertext(
         &state.pool,
         &session_hash,
@@ -383,8 +388,8 @@ pub(crate) async fn playlist_detail(
         Ok(None) => {
             tracing::warn!(
                 provider = %path.provider,
-                session = %&session_hash[..8],
-                "playlist detail: no stored tokens for this session"
+                user = %&session_hash[..8],
+                "playlist detail: no stored tokens for this user"
             );
             return fail(StatusCode::NOT_FOUND);
         }

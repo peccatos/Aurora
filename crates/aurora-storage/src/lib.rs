@@ -267,7 +267,7 @@ pub async fn claim_oauth_transaction(
 }
 pub async fn save_oauth_account(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
     account: &OAuthAccount,
     keyring_account_id: &str,
@@ -278,16 +278,16 @@ pub async fn save_oauth_account(
     // capability list would silently downgrade the account's granted scopes,
     // and the UI reads capabilities as the truth about what the grant covers.
     let capabilities_json = serde_json::to_string(&account.capabilities)?;
-    sqlx::query("INSERT INTO oauth_accounts (session_id_hash, provider, subject, display_name, avatar_url, capabilities_json, connected_at, keyring_account_id, token_ciphertext, auth_state, last_auth_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id_hash, provider) DO UPDATE SET subject=excluded.subject, display_name=excluded.display_name, avatar_url=excluded.avatar_url, capabilities_json=excluded.capabilities_json, connected_at=excluded.connected_at, keyring_account_id=excluded.keyring_account_id, token_ciphertext=excluded.token_ciphertext, auth_state='connected', last_auth_error=NULL").bind(session_hash).bind(provider).bind(&account.subject).bind(&account.display_name).bind(&account.avatar_url).bind(capabilities_json).bind(account.connected_at.to_rfc3339()).bind(keyring_account_id).bind(token_ciphertext).bind("connected").bind(Option::<String>::None).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO oauth_accounts (user_hash, provider, subject, display_name, avatar_url, capabilities_json, connected_at, keyring_account_id, token_ciphertext, auth_state, last_auth_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_hash, provider) DO UPDATE SET subject=excluded.subject, display_name=excluded.display_name, avatar_url=excluded.avatar_url, capabilities_json=excluded.capabilities_json, connected_at=excluded.connected_at, keyring_account_id=excluded.keyring_account_id, token_ciphertext=excluded.token_ciphertext, auth_state='connected', last_auth_error=NULL").bind(user_hash).bind(provider).bind(&account.subject).bind(&account.display_name).bind(&account.avatar_url).bind(capabilities_json).bind(account.connected_at.to_rfc3339()).bind(keyring_account_id).bind(token_ciphertext).bind("connected").bind(Option::<String>::None).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
 pub async fn get_oauth_account(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
 ) -> Result<Option<OAuthAccount>, StorageError> {
-    let r=sqlx::query("SELECT subject, display_name, avatar_url, capabilities_json, connected_at, auth_state, last_auth_error FROM oauth_accounts WHERE session_id_hash=? AND provider=?").bind(session_hash).bind(provider).fetch_optional(pool).await?;
+    let r=sqlx::query("SELECT subject, display_name, avatar_url, capabilities_json, connected_at, auth_state, last_auth_error FROM oauth_accounts WHERE user_hash=? AND provider=?").bind(user_hash).bind(provider).fetch_optional(pool).await?;
     Ok(r.and_then(|x| {
         Some(OAuthAccount {
             subject: x.try_get("subject").ok()?,
@@ -305,19 +305,19 @@ pub async fn get_oauth_account(
 }
 /// Read the stored (encrypted) token blob for one account.
 ///
-/// `Ok(None)` means exactly one thing: no row for `(session_hash, provider)`.
+/// `Ok(None)` means exactly one thing: no row for `(user_hash, provider)`.
 /// A row that exists but whose column cannot be read is a hard error — the
 /// caller must not be told the account is absent, because "absent" maps to a
 /// 404 for the user and would present a corrupt account as a disconnected one.
 pub async fn get_oauth_token_ciphertext(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
     let row = sqlx::query(
-        "SELECT token_ciphertext FROM oauth_accounts WHERE session_id_hash=? AND provider=?",
+        "SELECT token_ciphertext FROM oauth_accounts WHERE user_hash=? AND provider=?",
     )
-    .bind(session_hash)
+    .bind(user_hash)
     .bind(provider)
     .fetch_optional(pool)
     .await?;
@@ -329,33 +329,33 @@ pub async fn get_oauth_token_ciphertext(
 
 pub async fn update_oauth_tokens(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
     token_ciphertext: &[u8],
 ) -> Result<bool, StorageError> {
-    let result = sqlx::query("UPDATE oauth_accounts SET token_ciphertext=?, auth_state='connected', last_auth_error=NULL WHERE session_id_hash=? AND provider=?")
-        .bind(token_ciphertext).bind(session_hash).bind(provider).execute(pool).await?;
+    let result = sqlx::query("UPDATE oauth_accounts SET token_ciphertext=?, auth_state='connected', last_auth_error=NULL WHERE user_hash=? AND provider=?")
+        .bind(token_ciphertext).bind(user_hash).bind(provider).execute(pool).await?;
     Ok(result.rows_affected() == 1)
 }
 
 pub async fn mark_oauth_reauth_required(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
     error: &str,
 ) -> Result<(), StorageError> {
-    sqlx::query("UPDATE oauth_accounts SET auth_state='reauthorization_required', last_auth_error=? WHERE session_id_hash=? AND provider=?")
-        .bind(error.chars().take(200).collect::<String>()).bind(session_hash).bind(provider).execute(pool).await?;
+    sqlx::query("UPDATE oauth_accounts SET auth_state='reauthorization_required', last_auth_error=? WHERE user_hash=? AND provider=?")
+        .bind(error.chars().take(200).collect::<String>()).bind(user_hash).bind(provider).execute(pool).await?;
     Ok(())
 }
 
 pub async fn delete_oauth_account(
     pool: &SqlitePool,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
 ) -> Result<(), StorageError> {
-    sqlx::query("DELETE FROM oauth_accounts WHERE session_id_hash=? AND provider=?")
-        .bind(session_hash)
+    sqlx::query("DELETE FROM oauth_accounts WHERE user_hash=? AND provider=?")
+        .bind(user_hash)
         .bind(provider)
         .execute(pool)
         .await?;
