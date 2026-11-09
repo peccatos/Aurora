@@ -59,8 +59,20 @@ export class WebKernel {
      * consumes entries on play.
      */
     register_file(id: string, bytes: Uint8Array, extension: string): void;
+    /**
+     * Remove a user convolution IR by id.
+     */
+    remove_convolution_ir(id: number): void;
     resume(): any;
     seek(position_s: number): any;
+    /**
+     * Register a user convolution-reverb impulse response (web IR
+     * upload): f32 planar channels + source sample rate. The right
+     * channel may be an empty array (mono upmix happens in Rust).
+     * JS hands over plain `number[]` or Float32Array contents — copy
+     * into wasm memory once; the IR store is global to the wasm module.
+     */
+    set_convolution_ir(id: number, left: Float32Array | number[], right: Float32Array | number[], sample_rate: number): void;
     set_crossfader(value: number): any;
     set_dsp(config: any): any;
     set_loop(start: number, end: number): any;
@@ -136,8 +148,10 @@ export interface InitOutput {
     readonly webkernel_probe_exclusive: (a: number, b: number) => void;
     readonly webkernel_queue_dto: (a: number, b: number, c: any) => void;
     readonly webkernel_register_file: (a: number, b: number, c: number, d: any, e: number, f: number) => void;
+    readonly webkernel_remove_convolution_ir: (a: number, b: number, c: number) => void;
     readonly webkernel_resume: (a: number, b: number) => void;
     readonly webkernel_seek: (a: number, b: number, c: number) => void;
+    readonly webkernel_set_convolution_ir: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly webkernel_set_crossfader: (a: number, b: number, c: number) => void;
     readonly webkernel_set_dsp: (a: number, b: number, c: any) => void;
     readonly webkernel_set_loop: (a: number, b: number, c: number, d: number) => void;
@@ -148,8 +162,8 @@ export interface InitOutput {
     readonly webkernel_subscribe: (a: number, b: any) => number;
     readonly webkernel_track_bpm: (a: number, b: number, c: number) => any;
     readonly webkernel_web_pull: (a: number, b: number) => any;
-    readonly __wasm_bindgen_func_elem_272: (a: number, b: number, c: number, d: any) => void;
-    readonly __wasm_bindgen_func_elem_289: (a: number, b: number, c: any, d: any) => void;
+    readonly __wasm_bindgen_func_elem_283: (a: number, b: number, c: number, d: any) => void;
+    readonly __wasm_bindgen_func_elem_300: (a: number, b: number, c: any, d: any) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number, b: number, c: number) => void;

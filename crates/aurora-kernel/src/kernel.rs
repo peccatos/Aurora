@@ -382,6 +382,36 @@ impl PlayerKernel {
         Ok(())
     }
 
+    /// Register a user impulse response for convolution reverb.
+    /// Float32 planar stereo (mono: pass the right channel empty — Rust
+    /// upmixes). Errors are DspError strings (non-finite samples, the
+    /// 10 s cap). The IR is process-global; a pipeline (re)compile on
+    /// the next set_dsp / track change resolves it by id.
+    ///
+    /// Desktop/Tauri file-loading is NOT wired yet (web first); the
+    /// registry itself is platform-independent so wiring is a shell
+    /// concern later.
+    pub fn set_convolution_ir(
+        &self,
+        id: u32,
+        left: &[f32],
+        right: &[f32],
+        sample_rate: u32,
+    ) -> Result<(), KernelError> {
+        aurora_dsp::convolution::register_ir(id, left, right, sample_rate).map_err(|e| {
+            KernelError::Engine {
+                message: format!("convolution IR: {e}"),
+            }
+        })
+    }
+
+    /// Remove a user convolution IR (built-in preset ids are refused —
+    /// they regenerate on demand).
+    pub fn remove_convolution_ir(&self, id: u32) -> Result<(), KernelError> {
+        aurora_dsp::convolution::remove_ir(id);
+        Ok(())
+    }
+
     pub fn set_dsp(
         &self,
         config: aurora_dsp::DspConfig,

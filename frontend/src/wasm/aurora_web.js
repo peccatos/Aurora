@@ -526,6 +526,23 @@ export class WebKernel {
         wasm.webkernel_register_file(this.__wbg_ptr, ptr0, len0, bytes, ptr1, len1);
     }
     /**
+     * Remove a user convolution IR by id.
+     * @param {number} id
+     */
+    remove_convolution_ir(id) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
+            wasm.webkernel_remove_convolution_ir(retptr, this.__wbg_ptr, id);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeFromExternrefTable0(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * @returns {any}
      */
     resume() {
@@ -558,6 +575,43 @@ export class WebKernel {
                 throw takeFromExternrefTable0(r1);
             }
             return takeFromExternrefTable0(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Register a user convolution-reverb impulse response (web IR
+     * upload): f32 planar channels + source sample rate. The right
+     * channel may be an empty array (mono upmix happens in Rust).
+     * JS hands over plain `number[]` or Float32Array contents — copy
+     * into wasm memory once; the IR store is global to the wasm module.
+     * @param {number} id
+     * @param {Float32Array | number[]} left
+     * @param {Float32Array | number[]} right
+     * @param {number} sample_rate
+     */
+    set_convolution_ir(id, left, right, sample_rate) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
+            const val3 = +id;
+            const val4 = +sample_rate;
+            let ptr0, len0, ptr1, len1;
+            try {
+                ptr0 = passArrayF32ToWasm0(left, wasm.__wbindgen_export);
+                len0 = WASM_VECTOR_LEN;
+                ptr1 = passArrayF32ToWasm0(right, wasm.__wbindgen_export);
+                len1 = WASM_VECTOR_LEN;
+            } catch (e) {
+                if (ptr1) { wasm.__wbindgen_export3(ptr1, len1 * 4, 4); }
+                if (ptr0) { wasm.__wbindgen_export3(ptr0, len0 * 4, 4); }
+                throw e;
+            }
+            wasm.webkernel_set_convolution_ir(retptr, this.__wbg_ptr, val3, ptr0, len0, ptr1, len1, val4);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeFromExternrefTable0(r0);
+            }
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
         }
@@ -727,6 +781,10 @@ function __wbg_get_imports() {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
         },
+        __wbg_Number_ff192a72a0dcdf6d: function(arg0) {
+            const ret = Number(arg0);
+            return ret;
+        },
         __wbg_String_8564e559799eccda: function(arg0, arg1) {
             const ret = String(arg1);
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
@@ -847,6 +905,10 @@ function __wbg_get_imports() {
             const ret = Array.isArray(arg0);
             return ret;
         },
+        __wbg_isSafeInteger_1a35ba4d31e71d38: function(arg0) {
+            const ret = Number.isSafeInteger(arg0);
+            return ret;
+        },
         __wbg_iterator_e4c5e8f68ada7b58: function() {
             const ret = Symbol.iterator;
             return ret;
@@ -878,7 +940,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_289(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_300(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -942,8 +1004,8 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 54, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_272);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 56, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_283);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0) {
@@ -981,14 +1043,14 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_289(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_289(arg0, arg1, arg2, arg3);
+function __wasm_bindgen_func_elem_300(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_300(arg0, arg1, arg2, arg3);
 }
 
-function __wasm_bindgen_func_elem_272(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_283(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
-        wasm.__wasm_bindgen_func_elem_272(retptr, arg0, arg1, arg2);
+        wasm.__wasm_bindgen_func_elem_283(retptr, arg0, arg1, arg2);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -1154,6 +1216,13 @@ function makeMutClosure(arg0, arg1, f) {
 function passArray8ToWasm0(arg, malloc) {
     const ptr = malloc(arg.length * 1, 1) >>> 0;
     getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
+function passArrayF32ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 4, 4) >>> 0;
+    getFloat32ArrayMemory0().set(arg, ptr / 4);
     WASM_VECTOR_LEN = arg.length;
     return ptr;
 }

@@ -58,6 +58,13 @@ type WebKernel = {
   prev_track(): unknown;
   get_dsp(): unknown;
   set_dsp(config: unknown): unknown;
+  set_convolution_ir(
+    id: number,
+    left: Float32Array | number[],
+    right: Float32Array | number[],
+    sample_rate: number,
+  ): void;
+  remove_convolution_ir(id: number): void;
   playback_spectrum(): unknown;
   set_loop(start: number, end: number): unknown;
   deck_load(deck: number, path: string, title: string | null, artist: string | null): unknown;
@@ -157,6 +164,17 @@ async function webInvoke<T>(cmd: string, args: InvokeArgs): Promise<T> {
       return k.get_dsp() as unknown as Promise<T>;
     case "set_dsp":
       return k.set_dsp(args.config) as unknown as Promise<T>;
+    case "set_convolution_ir":
+      k.set_convolution_ir(
+        args.id as number,
+        (args.left ?? []) as Float32Array | number[],
+        (args.right ?? []) as Float32Array | number[],
+        args.sampleRate as number,
+      );
+      return undefined as T;
+    case "remove_convolution_ir":
+      k.remove_convolution_ir(args.id as number);
+      return undefined as T;
     case "playback_spectrum":
       return k.playback_spectrum() as unknown as Promise<T>;
     case "set_loop":
@@ -280,6 +298,37 @@ export async function registerWebBytes(
   const k = await loadKernel();
   k.register_file(id, bytes, extension);
   return `web://${id}`;
+}
+
+/** Register a user convolution-reverb IR (web build only; the desktop
+ *  shell's file loading is not wired yet — web first). Channels are f32
+ *  planar; a mono IR passes the right channel empty (Rust upmixes).
+ *  Returns true on success. */
+export async function setConvolutionIr(
+  id: number,
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number,
+): Promise<boolean> {
+  if (platform !== "web") return false;
+  const k = await loadKernel();
+  try {
+    k.set_convolution_ir(id, left, right, sampleRate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Remove a user convolution IR by id (web build only). */
+export async function removeConvolutionIr(id: number): Promise<void> {
+  if (platform !== "web") return;
+  const k = await loadKernel();
+  try {
+    k.remove_convolution_ir(id);
+  } catch {
+    /* already gone */
+  }
 }
 
 /** R128 loudness measurement (W8): integrated LUFS of the track's

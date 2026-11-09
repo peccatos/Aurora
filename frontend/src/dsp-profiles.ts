@@ -16,6 +16,35 @@ function clone(config: DspConfig): DspConfig {
 
 const defaultCrossfeed = () => ({ enabled: false, cutoff_hz: 700, feed_db: -6.5 });
 
+const defaultConvolution = () => ({
+  enabled: false,
+  ir_id: 0,
+  wet: 0.3,
+  dry: 0.8,
+  predelay_ms: 0,
+  ir_gain_db: 0,
+});
+
+/** Legacy profiles (pre-convolution) round-trip with disabled defaults. */
+function ensureConvolution(d: DspConfig): DspConfig {
+  d.convolution ??= defaultConvolution();
+  d.convolution.enabled = Boolean(d.convolution.enabled);
+  d.convolution.ir_id = Number.isFinite(d.convolution.ir_id)
+    ? Math.max(0, Math.trunc(d.convolution.ir_id))
+    : 0;
+  const clamp01 = (v: number, fb: number) =>
+    Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : fb;
+  d.convolution.wet = clamp01(d.convolution.wet, 0.3);
+  d.convolution.dry = clamp01(d.convolution.dry, 0.8);
+  d.convolution.predelay_ms = Number.isFinite(d.convolution.predelay_ms)
+    ? Math.max(0, Math.min(250, d.convolution.predelay_ms))
+    : 0;
+  d.convolution.ir_gain_db = Number.isFinite(d.convolution.ir_gain_db)
+    ? Math.max(-24, Math.min(12, d.convolution.ir_gain_db))
+    : 0;
+  return d;
+}
+
 /** Legacy profiles (pre-crossfeed) round-trip with disabled defaults. */
 function ensureCrossfeed(d: DspConfig): DspConfig {
   d.crossfeed ??= defaultCrossfeed();
@@ -38,7 +67,7 @@ export async function getDspProfiles(): Promise<Profiles> {
       const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
       profiles = raw ? (JSON.parse(raw) as Profiles) : {};
     }
-    Object.values(profiles).forEach(ensureCrossfeed);
+    Object.values(profiles).forEach((d) => ensureConvolution(ensureCrossfeed(d)));
     return profiles;
   } catch { return {}; }
 }

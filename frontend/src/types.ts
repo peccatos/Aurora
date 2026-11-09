@@ -38,6 +38,14 @@ export interface DspConfig {
     cutoff_hz: number;
     feed_db: number;
   };
+  convolution?: {
+    enabled: boolean;
+    ir_id: number;
+    wet: number;
+    dry: number;
+    predelay_ms: number;
+    ir_gain_db: number;
+  };
 }
 
 export interface QueueTrack {

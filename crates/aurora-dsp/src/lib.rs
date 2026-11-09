@@ -9,6 +9,7 @@
 //! verified by tests.
 
 pub mod biquad;
+pub mod convolution;
 pub mod crossfeed;
 pub mod eq;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod reverb;
 pub mod tools;
 
 pub use biquad::{Biquad, BiquadKind, BiquadParams};
+pub use convolution::{Convolution, ConvolutionParams, IrBuffer};
 pub use crossfeed::{Crossfeed, CrossfeedParams};
 pub use eq::{EqBand, EqBandKind, EqChain, Equalizer};
 pub use error::DspError;

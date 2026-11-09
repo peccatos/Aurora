@@ -106,6 +106,8 @@ pub enum AudioTransformation {
     EffectTools,
     /// bs2b-style headphone crossfeed (low-frequency inter-aural bleed).
     Crossfeed,
+    /// Partitioned time-domain convolution reverb (impulse response mixing).
+    Convolution,
 }
 
 // ---------------------------------------------------------------------------

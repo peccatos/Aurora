@@ -38,6 +38,9 @@ pub struct DspConfig {
     /// bs2b-style headphone crossfeed. Defaults to bypassed.
     #[serde(default)]
     pub crossfeed: crate::crossfeed::CrossfeedParams,
+    /// Convolution reverb. Defaults to bypassed (ir_id 0).
+    #[serde(default)]
+    pub convolution: crate::convolution::ConvolutionParams,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -64,6 +67,7 @@ impl Default for DspConfig {
             speed: 1.0,
             tools: crate::tools::ToolsParams::default(),
             crossfeed: crate::crossfeed::CrossfeedParams::default(),
+            convolution: crate::convolution::ConvolutionParams::default(),
         }
     }
 }
@@ -84,6 +88,7 @@ impl DspConfig {
             && (self.speed - 1.0).abs() < 1e-6
             && self.tools.is_bypassed()
             && self.crossfeed.is_bypassed()
+            && self.convolution.is_bypassed()
     }
 
     /// All transformations this configuration reports when active.
@@ -100,6 +105,9 @@ impl DspConfig {
         }
         if !self.crossfeed.is_bypassed() {
             out.push(AudioTransformation::Crossfeed);
+        }
+        if !self.convolution.is_bypassed() {
+            out.push(AudioTransformation::Convolution);
         }
         if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
             out.push(AudioTransformation::Gain);
@@ -121,6 +129,7 @@ pub struct DspPipeline {
     reverb: Option<crate::reverb::Reverb>,
     tools: Option<crate::tools::Tools>,
     crossfeed: Option<crate::crossfeed::Crossfeed>,
+    convolution: Option<crate::convolution::Convolution>,
     speed_active: bool,
     volume: Gain,
     /// Interleaved samples carried over between chunks: the resampler
@@ -226,6 +235,26 @@ impl DspPipeline {
             ))
         };
 
+        // Convolution reverb: stereo-only, after Freeverb/before tools in
+        // the report order; stage runs after crossfeed, before gain. An
+        // enabled-but-unknown ir_id compiles to no stage (honest miss,
+        // logged) — never a silent fake reverb.
+        let convolution = if config.convolution.is_bypassed() || source_format.channels != 2 {
+            None
+        } else {
+            let built = crate::convolution::Convolution::build(
+                config.convolution,
+                source_format.sample_rate,
+            );
+            if built.is_none() {
+                tracing::warn!(
+                    ir_id = config.convolution.ir_id,
+                    "convolution enabled but IR id unknown; stage skipped"
+                );
+            }
+            built
+        };
+
         let speed = config.speed.clamp(0.5, 2.0);
         let speed_active = (speed - 1.0).abs() > 1e-6;
 
@@ -266,6 +295,7 @@ impl DspPipeline {
             reverb,
             tools,
             crossfeed,
+            convolution,
             speed_active,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
@@ -301,6 +331,12 @@ impl DspPipeline {
         // spatial fix-up, not a loudness stage.
         if let Some(cf) = self.crossfeed.as_mut() {
             cf.process_interleaved(interleaved, self.channels);
+        }
+
+        // Convolution reverb after the algorithmic reverb and crossfeed,
+        // before gain: wet/dry mixing is spatial, not loudness.
+        if let Some(conv) = self.convolution.as_mut() {
+            conv.process_interleaved(interleaved, self.channels);
         }
 
         // ReplayGain before volume: the tag sets loudness, volume trims it.
@@ -420,6 +456,9 @@ impl DspPipeline {
         if self.crossfeed.is_some() {
             out.push(AudioTransformation::Crossfeed);
         }
+        if self.convolution.is_some() {
+            out.push(AudioTransformation::Convolution);
+        }
         out
     }
 
@@ -441,6 +480,7 @@ impl DspPipeline {
             && self.reverb.is_none()
             && self.tools.is_none()
             && self.crossfeed.is_none()
+            && self.convolution.is_none()
             && self.volume.is_unity()
             && self.replaygain_db.is_none()
             && self.resampler.is_none()
@@ -806,6 +846,100 @@ mod tests {
             r_out > 0.4,
             "expected DC crossfeed near the -6.5 dB feed level, got {r_out}"
         );
+    }
+
+    #[test]
+    fn convolution_off_keeps_bit_exact_bypass() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = false;
+        assert!(cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(
+            output, reference,
+            "disabled convolution must stay bit-exact"
+        );
+    }
+
+    #[test]
+    fn convolution_ir_id_zero_bypasses_even_when_enabled() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 0;
+        assert!(cfg.is_bypassed(), "ir_id 0 must be a bypass");
+        let pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+    }
+
+    #[test]
+    fn convolution_unknown_ir_compiles_to_no_stage() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 999_999; // never registered
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        // Honest miss: no stage, no transformation reported.
+        assert!(pl.is_passthrough());
+        assert!(pl.transformations().is_empty());
+        let mut input = music_like(1024);
+        let reference = input.clone();
+        assert_eq!(pl.process(&mut input), reference);
+    }
+
+    #[test]
+    fn convolution_unit_ir_is_reported_and_identity() {
+        crate::convolution::register_ir(101, &[1.0f32], &[], 44_100).expect("register");
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 101;
+        cfg.convolution.wet = 1.0;
+        cfg.convolution.dry = 0.0;
+        assert!(!cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert_eq!(pl.transformations(), vec![AudioTransformation::Convolution]);
+        // Unit IR with wet=1 dry=0: bit-exact identity through the stage.
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(output, reference, "unit IR must be identity");
+        crate::convolution::remove_ir(101);
+    }
+
+    #[test]
+    fn convolution_config_deserializes_without_new_field() {
+        // Backward compat: a persisted DspConfig from before convolution
+        // existed must deserialize to the disabled default.
+        let raw = serde_json::json!({
+            "eq": {
+                "bands": [{
+                    "kind": "peaking",
+                    "freq_hz": 1000.0,
+                    "q": 1.0,
+                    "gain_db": 0.0,
+                    "enabled": true
+                }],
+                "preamp_db": 0.0
+            },
+            "volume_db": 0.0,
+            "replaygain": "off",
+            "reverb": {
+                "room_size": 0.5, "damping": 0.3, "wet": 0.0,
+                "width": 1.0, "input_lowpass": 0.0
+            },
+            "speed": 1.0,
+            "tools": {
+                "balance": 0.0, "phase_invert_left": false,
+                "stereo_width": 1.0, "soft_clip": 0.0
+            }
+        })
+        .to_string();
+        let cfg: DspConfig = serde_json::from_str(&raw).expect("legacy config");
+        assert!(cfg.is_bypassed(), "legacy config must stay bypassed");
+        assert!(!cfg.convolution.enabled);
+        assert_eq!(cfg.convolution.ir_id, 0);
+        assert_eq!(cfg.convolution.predelay_ms, 0.0);
     }
 
     #[test]
