@@ -722,9 +722,12 @@ async fn begin(
     if !["spotify", "youtube-music"].contains(&provider.as_str()) {
         return fail(StatusCode::FORBIDDEN);
     }
-    // A readable CSRF cookie must only ever be handed to an allowed origin. No cookie means
-    // no session yet, which is the only case that skips the session-bound CSRF check.
-    if headers.get(header::COOKIE).is_none() && !origin_ok(&headers, &state.config) {
+    // A readable CSRF cookie must only ever be handed to an allowed origin. No
+    // session cookie yet means there is no CSRF possession to prove, so the
+    // origin check gates the minting of a brand-new session (the frontend
+    // always sends Origin on its fetches; curl probes without one are fine
+    // only when no cookies are involved).
+    if session(&headers).is_none() && !origin_ok(&headers, &state.config) {
         return fail(StatusCode::FORBIDDEN);
     }
     if let Some(rejection) = rate_limit(&state, guard::client_ip(peer.0), &provider) {
@@ -745,23 +748,28 @@ async fn begin(
                     (sid, false)
                 }
                 Ok(None) => {
-                    // A session cookie that is unknown or expired is never tolerated silently,
-                    // regardless of the presented Origin.
-                    if headers.get(header::COOKIE).is_some() {
-                        return fail(StatusCode::UNAUTHORIZED);
-                    }
+                    // An unknown or expired session cookie is the normal state
+                    // after a database reset, a migration, or 8h expiry: the
+                    // cookie value is server-minted base64url, not attacker
+                    // chosen (forged values are filtered by `session` above).
+                    // `begin` is the session bootstrap: mint a fresh session
+                    // (and Set-Cookie it) rather than 401-locking the user out
+                    // of connecting. The long-lived user cookie is untouched,
+                    // so any stored grant stays reachable after the re-mint.
+                    tracing::info!(
+                        provider,
+                        "begin: unknown or expired session cookie, minting a fresh session"
+                    );
                     (random(), true)
                 }
                 Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
             }
         }
         None => {
-            // A cookie that is present but is not a well-formed session token is
-            // a forged or corrupted value, not the absence of a session: reject
-            // it instead of minting a fresh session on top of it.
-            if headers.get(header::COOKIE).is_some() {
-                return fail(StatusCode::UNAUTHORIZED);
-            }
+            // A cookie header that is present but carries no session cookie
+            // (only, say, the user or CSRF cookie) is not a session to renew.
+            // A malformed session *value* was already filtered out by `session`
+            // above — that filter is the whole forgery check.
             (random(), true)
         }
     };
@@ -1698,7 +1706,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_session_cookie_never_grants_a_new_session() {
+    async fn unknown_session_cookie_gets_a_reminted_session() {
+        // An unknown (but well-formed, server-minted-format) session cookie is
+        // the post-expiry / post-reset state, not an attack: `begin` is the
+        // session bootstrap and must issue a fresh session instead of 401.
         let (app, _store) = state_with_store(config()).await;
         let cookie = format!("{SESSION_COOKIE}={}", random());
         let r = begin(
@@ -1708,7 +1719,13 @@ mod tests {
             peer(),
         )
         .await;
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r.status(), StatusCode::OK);
+        let set = r
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(set.contains(SESSION_COOKIE), "fresh session is issued");
     }
 
     #[tokio::test]

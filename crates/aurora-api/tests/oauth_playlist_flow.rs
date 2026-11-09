@@ -716,19 +716,47 @@ async fn begin_requires_csrf_for_an_existing_session_and_origin_for_a_new_one() 
 }
 
 #[tokio::test]
-async fn begin_rejects_an_unknown_session_cookie() {
+async fn begin_remints_a_session_for_an_unknown_or_expired_session_cookie() {
+    // The database knows nothing about this cookie (fresh DB, DB reset, or
+    // 8h expiry). The value itself is well-formed server-minted base64url.
+    // `begin` is the session bootstrap, so it must mint a fresh session and
+    // Set-Cookie it rather than 401-lock the user out of ever connecting.
     let h = Harness::new(vec![]).await;
     let response = send(
         &h.app,
         session_only(
             Method::POST,
             "/api/oauth/spotify/begin",
-            "forged-session-id",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(set_cookies(&response).is_empty());
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .any(|c| c.starts_with(SESSION_COOKIE)),
+        "a fresh session cookie is issued over the unknown one"
+    );
+}
+
+#[tokio::test]
+async fn begin_remints_a_session_after_an_expired_session() {
+    let h = Harness::new(vec![]).await;
+    let sid = "expired-session-id";
+    insert_expired_session(&h.pool, sid, "csrf").await;
+    let response = send(
+        &h.app,
+        session_only(Method::POST, "/api/oauth/spotify/begin", sid),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .any(|c| c.starts_with(SESSION_COOKIE)),
+        "an expired session is replaced, not a 401 dead end"
+    );
 }
 
 // ---------------------------------------------------------------------------
