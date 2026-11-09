@@ -35,6 +35,9 @@ pub struct DspConfig {
     /// Portable Orchard-inspired playback tools. Defaults to bypassed.
     #[serde(default)]
     pub tools: crate::tools::ToolsParams,
+    /// bs2b-style headphone crossfeed. Defaults to bypassed.
+    #[serde(default)]
+    pub crossfeed: crate::crossfeed::CrossfeedParams,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -60,6 +63,7 @@ impl Default for DspConfig {
             reverb: crate::reverb::ReverbParams::default(),
             speed: 1.0,
             tools: crate::tools::ToolsParams::default(),
+            crossfeed: crate::crossfeed::CrossfeedParams::default(),
         }
     }
 }
@@ -79,6 +83,7 @@ impl DspConfig {
             && self.reverb.is_bypassed()
             && (self.speed - 1.0).abs() < 1e-6
             && self.tools.is_bypassed()
+            && self.crossfeed.is_bypassed()
     }
 
     /// All transformations this configuration reports when active.
@@ -92,6 +97,9 @@ impl DspConfig {
         }
         if !self.tools.is_bypassed() {
             out.push(AudioTransformation::EffectTools);
+        }
+        if !self.crossfeed.is_bypassed() {
+            out.push(AudioTransformation::Crossfeed);
         }
         if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
             out.push(AudioTransformation::Gain);
@@ -112,6 +120,7 @@ pub struct DspPipeline {
     eq_chain: Option<crate::eq::EqChain>,
     reverb: Option<crate::reverb::Reverb>,
     tools: Option<crate::tools::Tools>,
+    crossfeed: Option<crate::crossfeed::Crossfeed>,
     speed_active: bool,
     volume: Gain,
     /// Interleaved samples carried over between chunks: the resampler
@@ -207,6 +216,16 @@ impl DspPipeline {
             Some(crate::tools::Tools::new(config.tools))
         };
 
+        // Crossfeed is stereo-only: mono streams pass through honestly.
+        let crossfeed = if config.crossfeed.is_bypassed() || source_format.channels != 2 {
+            None
+        } else {
+            Some(crate::crossfeed::Crossfeed::new(
+                config.crossfeed,
+                source_format.sample_rate,
+            ))
+        };
+
         let speed = config.speed.clamp(0.5, 2.0);
         let speed_active = (speed - 1.0).abs() > 1e-6;
 
@@ -246,6 +265,7 @@ impl DspPipeline {
             eq_chain,
             reverb,
             tools,
+            crossfeed,
             speed_active,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
@@ -275,6 +295,12 @@ impl DspPipeline {
 
         if let Some(tools) = self.tools.as_mut() {
             tools.process_interleaved(interleaved, self.channels);
+        }
+
+        // Crossfeed after the stereo tools, before gain: it is a
+        // spatial fix-up, not a loudness stage.
+        if let Some(cf) = self.crossfeed.as_mut() {
+            cf.process_interleaved(interleaved, self.channels);
         }
 
         // ReplayGain before volume: the tag sets loudness, volume trims it.
@@ -391,6 +417,9 @@ impl DspPipeline {
         if self.tools.is_some() {
             out.push(AudioTransformation::EffectTools);
         }
+        if self.crossfeed.is_some() {
+            out.push(AudioTransformation::Crossfeed);
+        }
         out
     }
 
@@ -411,6 +440,7 @@ impl DspPipeline {
             && !self.speed_active
             && self.reverb.is_none()
             && self.tools.is_none()
+            && self.crossfeed.is_none()
             && self.volume.is_unity()
             && self.replaygain_db.is_none()
             && self.resampler.is_none()
@@ -739,12 +769,78 @@ mod tests {
         let tail = pipeline.flush();
         out_samples += tail.len();
 
-        // 0.8x speed: ~4.71s * 44100 * 2ch ≈ 415k samples (plus resampler
+        // 0.8x speed: ~4.71s * 44100 * 2ch ~ 415k samples (plus resampler
         // transient slack). The pre-fix code emitted near-zero output.
         let expected_min = total_frames * 2 * 4 / 5; // 0.8 ratio, minus slack
         assert!(
             out_samples > expected_min,
             "output too small: {out_samples} samples for {total_frames} input frames              (resampler FIFO regression)"
         );
+    }
+
+    #[test]
+    fn crossfeed_off_keeps_bit_exact_bypass() {
+        let mut cfg = DspConfig::default();
+        cfg.crossfeed.enabled = false;
+        assert!(cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(output, reference, "disabled crossfeed must stay bit-exact");
+    }
+
+    #[test]
+    fn crossfeed_on_is_reported_and_applies() {
+        let mut cfg = DspConfig::default();
+        cfg.crossfeed.enabled = true;
+        assert!(!cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert_eq!(pl.transformations(), vec![AudioTransformation::Crossfeed]);
+        // DC into L only: after steady state, R carries the bleed.
+        let mut input: Vec<f32> = (0..4096).flat_map(|_| [1.0f32, 0.0f32]).collect();
+        let out = pl.process(&mut input);
+        let r_out = out[out.len() - 1];
+        assert!(
+            r_out > 0.4,
+            "expected DC crossfeed near the -6.5 dB feed level, got {r_out}"
+        );
+    }
+
+    #[test]
+    fn crossfeed_config_deserializes_without_new_field() {
+        // Backward compat: a persisted DspConfig from before crossfeed
+        // existed (tools already present, crossfeed absent) must
+        // deserialize to the disabled default.
+        let raw = serde_json::json!({
+            "eq": {
+                "bands": [{
+                    "kind": "peaking",
+                    "freq_hz": 1000.0,
+                    "q": 1.0,
+                    "gain_db": 0.0,
+                    "enabled": true
+                }],
+                "preamp_db": 0.0
+            },
+            "volume_db": 0.0,
+            "replaygain": "off",
+            "reverb": {
+                "room_size": 0.5, "damping": 0.3, "wet": 0.0,
+                "width": 1.0, "input_lowpass": 0.0
+            },
+            "speed": 1.0,
+            "tools": {
+                "balance": 0.0, "phase_invert_left": false,
+                "stereo_width": 1.0, "soft_clip": 0.0
+            }
+        })
+        .to_string();
+        let cfg: DspConfig = serde_json::from_str(&raw).expect("legacy config");
+        assert!(cfg.is_bypassed(), "legacy config must stay bypassed");
+        assert!(!cfg.crossfeed.enabled);
+        assert_eq!(cfg.crossfeed.cutoff_hz, 700.0);
+        assert_eq!(cfg.crossfeed.feed_db, -6.5);
     }
 }

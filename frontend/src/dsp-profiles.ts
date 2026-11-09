@@ -14,11 +14,32 @@ function clone(config: DspConfig): DspConfig {
   return structuredClone(config);
 }
 
+const defaultCrossfeed = () => ({ enabled: false, cutoff_hz: 700, feed_db: -6.5 });
+
+/** Legacy profiles (pre-crossfeed) round-trip with disabled defaults. */
+function ensureCrossfeed(d: DspConfig): DspConfig {
+  d.crossfeed ??= defaultCrossfeed();
+  d.crossfeed.enabled = Boolean(d.crossfeed.enabled);
+  d.crossfeed.cutoff_hz = Number.isFinite(d.crossfeed.cutoff_hz)
+    ? Math.max(20, Math.min(5000, d.crossfeed.cutoff_hz))
+    : 700;
+  d.crossfeed.feed_db = Number.isFinite(d.crossfeed.feed_db)
+    ? Math.max(-24, Math.min(0, d.crossfeed.feed_db))
+    : -6.5;
+  return d;
+}
+
 export async function getDspProfiles(): Promise<Profiles> {
   try {
-    if (platform === "web") return (await kvGet<Profiles>(KEY)) ?? {};
-    const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
-    return raw ? (JSON.parse(raw) as Profiles) : {};
+    let profiles: Profiles = {};
+    if (platform === "web") {
+      profiles = (await kvGet<Profiles>(KEY)) ?? {};
+    } else {
+      const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
+      profiles = raw ? (JSON.parse(raw) as Profiles) : {};
+    }
+    Object.values(profiles).forEach(ensureCrossfeed);
+    return profiles;
   } catch { return {}; }
 }
 

@@ -8,6 +8,20 @@ import type { DspConfig } from "../types";
 
 type ToolKey = "balance" | "stereo_width" | "soft_clip";
 
+const defaultCrossfeed = () => ({ enabled: false, cutoff_hz: 700, feed_db: -6.5 });
+
+function ensureCrossfeed(d: DspConfig) {
+  d.crossfeed ??= defaultCrossfeed();
+  d.crossfeed.enabled = Boolean(d.crossfeed.enabled);
+  d.crossfeed.cutoff_hz = Number.isFinite(d.crossfeed.cutoff_hz)
+    ? Math.max(20, Math.min(5000, d.crossfeed.cutoff_hz))
+    : 700;
+  d.crossfeed.feed_db = Number.isFinite(d.crossfeed.feed_db)
+    ? Math.max(-24, Math.min(0, d.crossfeed.feed_db))
+    : -6.5;
+  return d;
+}
+
 const defaultTools = () => ({
   balance: 0,
   phase_invert_left: false,
@@ -29,6 +43,11 @@ function toolsActive(d: DspConfig): boolean {
     Math.abs(d.tools.stereo_width - 1) > 1e-6 || d.tools.soft_clip > 1e-6;
 }
 
+function crossfeedActive(d: DspConfig): boolean {
+  ensureCrossfeed(d);
+  return d.crossfeed?.enabled === true;
+}
+
 export const effectsPage: Page = {
   id: "effects",
   title: "Effects & Tools",
@@ -36,6 +55,8 @@ export const effectsPage: Page = {
     if (!app.dsp) return;
     const d = app.dsp;
     ensureTools(d);
+    ensureCrossfeed(d);
+    const cf = ensureCrossfeed(d).crossfeed!;
     const currentTrack = app.selectedPath;
     root.innerHTML = `
       <section class="page">
@@ -50,6 +71,18 @@ export const effectsPage: Page = {
           </div>
           <label class="ctl"><input id="tool-phase" type="checkbox"> Invert left phase</label>
           <div class="page-actions"><button class="btn" id="tool-reset" type="button">Reset global tools</button></div>
+        </div>
+        <div class="eq-card">
+          <header class="card-head"><div><p class="overline">Headphone stage · bs2b</p><h2>Crossfeed (наушники)</h2></div><strong id="crossfeed-state"></strong></header>
+          <label class="ctl"><input id="crossfeed-enabled" type="checkbox"> Enable crossfeed</label>
+          <div class="ctl-grid">
+            <label class="ctl">Cutoff <input id="crossfeed-cutoff" type="range" min="200" max="1000" step="10"><span id="crossfeed-cutoff-v"></span></label>
+            <label class="ctl">Feed <input id="crossfeed-feed" type="range" min="-12" max="0" step="0.5"><span id="crossfeed-feed-v"></span></label>
+          </div>
+          <div class="page-actions">
+            <button class="btn" id="crossfeed-bs2b" type="button">bs2b default (700 Hz / -6.5 dB)</button>
+          </div>
+          <p class="hint">Bleeds an attenuated, lowpassed copy of each channel into the opposite ear — speaker-like imaging on headphones. Stereo only; reported as a signal transformation when active.</p>
         </div>
         <div class="eq-card">
           <p class="overline">Per-track profile</p>
@@ -70,6 +103,8 @@ export const effectsPage: Page = {
     const drawState = () => {
       const state = root.querySelector<HTMLElement>("#tools-state");
       if (state) state.textContent = toolsActive(d) ? "ACTIVE · transformed" : "BYPASSED · bit-exact";
+      const cfState = root.querySelector<HTMLElement>("#crossfeed-state");
+      if (cfState) cfState.textContent = crossfeedActive(d) ? "ACTIVE · transformed" : "BYPASSED · bit-exact";
     };
     // Serialize IPC writes so a slower slider update cannot finish after a
     // newer one and leave the kernel with stale settings.
@@ -95,10 +130,48 @@ export const effectsPage: Page = {
     bind("#tool-clip", "#tool-clip-v", "soft_clip", (v) => `${Math.round(v * 100)}%`);
     const phase = root.querySelector<HTMLInputElement>("#tool-phase");
     if (phase) { phase.checked = d.tools.phase_invert_left; phase.addEventListener("change", () => { d.tools.phase_invert_left = phase.checked; save(); }); }
+
+    const cfEnabled = root.querySelector<HTMLInputElement>("#crossfeed-enabled");
+    if (cfEnabled) {
+      cfEnabled.checked = cf.enabled;
+      cfEnabled.addEventListener("change", () => { cf.enabled = cfEnabled.checked; save(); });
+    }
+    const cfCutoff = root.querySelector<HTMLInputElement>("#crossfeed-cutoff");
+    const cfCutoffV = root.querySelector<HTMLElement>("#crossfeed-cutoff-v");
+    if (cfCutoff && cfCutoffV) {
+      cfCutoff.value = String(cf.cutoff_hz);
+      cfCutoffV.textContent = `${Math.round(cf.cutoff_hz)} Hz`;
+      cfCutoff.addEventListener("input", () => {
+        cf.cutoff_hz = Number(cfCutoff.value);
+        cfCutoffV.textContent = `${Math.round(cf.cutoff_hz)} Hz`;
+        save();
+      });
+    }
+    const cfFeed = root.querySelector<HTMLInputElement>("#crossfeed-feed");
+    const cfFeedV = root.querySelector<HTMLElement>("#crossfeed-feed-v");
+    if (cfFeed && cfFeedV) {
+      cfFeed.value = String(cf.feed_db);
+      cfFeedV.textContent = `${cf.feed_db.toFixed(1)} dB`;
+      cfFeed.addEventListener("input", () => {
+        cf.feed_db = Number(cfFeed.value);
+        cfFeedV.textContent = `${cf.feed_db.toFixed(1)} dB`;
+        save();
+      });
+    }
+    root.querySelector<HTMLButtonElement>("#crossfeed-bs2b")?.addEventListener("click", () => {
+      cf.cutoff_hz = 700;
+      cf.feed_db = -6.5;
+      if (cfCutoff) cfCutoff.value = "700";
+      if (cfCutoffV) cfCutoffV.textContent = "700 Hz";
+      if (cfFeed) cfFeed.value = "-6.5";
+      if (cfFeedV) cfFeedV.textContent = "-6.5 dB";
+      save();
+    });
     drawState();
 
     root.querySelector<HTMLButtonElement>("#tool-reset")?.addEventListener("click", () => {
       d.tools = defaultTools();
+      d.crossfeed = defaultCrossfeed();
       void save();
       effectsPage.mount(root);
     });

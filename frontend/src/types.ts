@@ -33,6 +33,11 @@ export interface DspConfig {
     stereo_width: number;
     soft_clip: number;
   };
+  crossfeed?: {
+    enabled: boolean;
+    cutoff_hz: number;
+    feed_db: number;
+  };
 }
 
 export interface QueueTrack {

@@ -148,8 +148,8 @@ export interface InitOutput {
     readonly webkernel_subscribe: (a: number, b: any) => number;
     readonly webkernel_track_bpm: (a: number, b: number, c: number) => any;
     readonly webkernel_web_pull: (a: number, b: number) => any;
-    readonly __wasm_bindgen_func_elem_270: (a: number, b: number, c: number, d: any) => void;
-    readonly __wasm_bindgen_func_elem_287: (a: number, b: number, c: any, d: any) => void;
+    readonly __wasm_bindgen_func_elem_272: (a: number, b: number, c: number, d: any) => void;
+    readonly __wasm_bindgen_func_elem_289: (a: number, b: number, c: any, d: any) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number, b: number, c: number) => void;

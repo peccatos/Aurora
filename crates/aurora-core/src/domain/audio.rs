@@ -104,6 +104,8 @@ pub enum AudioTransformation {
     ExternalPlugin,
     /// Portable built-in playback tools such as balance, width, phase, and soft clip.
     EffectTools,
+    /// bs2b-style headphone crossfeed (low-frequency inter-aural bleed).
+    Crossfeed,
 }
 
 // ---------------------------------------------------------------------------
