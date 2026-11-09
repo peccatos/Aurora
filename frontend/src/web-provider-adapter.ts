@@ -144,12 +144,15 @@ async function requestJson(
   // Non-GET calls must carry it (server rejects otherwise); the playlist
   // detail endpoint additionally requires it on GET as a read-driving
   // defense, so it is attached uniformly rather than method-gated.
+  // Always send Origin so the backend's allowlist check passes.
+  const origin = apiBase.origin;
   const token = csrfToken();
   const response = await fetch(url, {
     ...init,
     credentials: "include",
     headers: {
       Accept: "application/json",
+      Origin: origin,
       ...(token ? { "X-CSRF-Token": token } : {}),
       ...(init?.headers ?? {}),
     },
