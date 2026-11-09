@@ -1,0 +1,26 @@
+name: Stage VST helper binaries (externalBin)
+description: >-
+  externalBin files are gitignored build artifacts; tauri-build requires them
+  in the checkout. Dependency bins (vst3-host-*) need an explicit --bins
+  build to exist in target/debug.
+runs:
+  using: composite
+  steps:
+    - name: Stage VST helper binaries (externalBin)
+      shell: bash
+      run: |
+        cargo build --workspace --bins --exclude aurora-desktop
+        mkdir -p apps/desktop/binaries
+        TRIPLE=$(rustc -vV | sed -n 's/host: //p')
+        EXT=""
+        case "$TRIPLE" in *windows*) EXT=".exe";; esac
+        for name in vst3-host-helper vst3-host-probe vst-gui-helper; do
+          if [ -f "target/debug/$name$EXT" ]; then
+            cp "target/debug/$name$EXT" "apps/desktop/binaries/$name-$TRIPLE$EXT"
+          fi
+        done
+        if [ -f "bin/yt-dlp$EXT" ]; then
+          cp "bin/yt-dlp$EXT" "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
+        fi
+        test -f "apps/desktop/binaries/yt-dlp-$TRIPLE$EXT"
+        ls -la apps/desktop/binaries/ || true
