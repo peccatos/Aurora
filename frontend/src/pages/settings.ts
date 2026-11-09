@@ -70,6 +70,20 @@ function render(root: HTMLElement, syncAccounts = true) {
 
       <div class="eq-card">
         <header class="card-head">
+          <p class="overline">Перевод текста песен</p>
+        </header>
+        <div class="settings-row">
+          <label class="hint" style="display:flex;gap:8px;align-items:center"><input id="translation-enabled" type="checkbox" /> Включить построчный перевод</label>
+        </div>
+        <div class="settings-row">
+          <input id="translation-endpoint" type="url" placeholder="https://translate.disroot.org/translate" style="flex:1;min-width:260px" />
+          <button class="btn" id="translation-endpoint-save" type="button">Сохранить</button>
+        </div>
+        <p class="hint">Текст песни уходит на внешний сервис перевода (LibreTranslate, по умолчанию translate.disroot.org). Перевод сохраняется в библиотеке и выполняется один раз.</p>
+      </div>
+
+      <div class="eq-card">
+        <header class="card-head">
           <p class="overline">Integrity</p>
         </header>
         <div class="settings-row">
@@ -186,6 +200,27 @@ function render(root: HTMLElement, syncAccounts = true) {
         ? `Server library: ${tracks.length} track${tracks.length === 1 ? "" : "s"}`
         : "Saved — no tracks found (check library.json and CORS)",
     );
+  });
+
+  // Lyrics translation: LibreTranslate-compatible endpoint, OFF by default.
+  const translationToggle = root.querySelector<HTMLInputElement>("#translation-enabled");
+  const translationEndpointInput = root.querySelector<HTMLInputElement>("#translation-endpoint");
+  void import("../translation-service").then(({ translationEnabled, translationEndpoint, setTranslationEnabled, setTranslationEndpoint }) => {
+    if (translationToggle) translationToggle.checked = translationEnabled();
+    if (translationEndpointInput) translationEndpointInput.value = translationEndpoint();
+    translationToggle?.addEventListener("change", () => {
+      setTranslationEnabled(translationToggle.checked);
+      setToast(translationToggle.checked ? "Перевод включён" : "Перевод выключен");
+    });
+    root.querySelector<HTMLButtonElement>("#translation-endpoint-save")?.addEventListener("click", () => {
+      const value = translationEndpointInput?.value.trim() ?? "";
+      if (value && !/^https:\/\//i.test(value)) {
+        setToast("Endpoint must use HTTPS");
+        return;
+      }
+      setTranslationEndpoint(value);
+      setToast("Endpoint сохранён");
+    });
   });
 
   void (async () => {

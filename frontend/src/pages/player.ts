@@ -19,6 +19,12 @@ import {
   parseLyricsText,
   type LyricsResult,
 } from "../lyrics-service";
+import {
+  translateLyrics,
+  lyricsToTranslateLines,
+  translationEnabled,
+  TRANSLATION_LANGUAGES,
+} from "../translation-service";
 
 const SIGNAL_FIELDS: Array<[string, (s: PlaybackStatus | null) => string]> = [
   ["state", (s) => s?.state ?? "idle"],
@@ -150,6 +156,12 @@ function drawLyrics(root: HTMLElement) {
   const displayLyrics = stored?.lyrics
     ? parseStoredLyrics(stored.lyrics)
     : lyrics?.lines ?? [];
+  // Translation lines aligned to displayLyrics when a stored translation
+  // exists (same line count expected; mismatch = honest skip).
+  const translationLines = stored?.lyrics_translation
+    ? parseStoredLyrics(stored.lyrics_translation).map((l) => l.text)
+    : [];
+  const showTranslation = translationLines.length === displayLyrics.length && translationLines.length > 0;
   if (lyricsState === "loading" && !stored?.lyrics) {
     const p = document.createElement("p");
     p.className = "np-lyrics-hint";
@@ -167,6 +179,13 @@ function drawLyrics(root: HTMLElement) {
       el.dataset.lineIdx = String(i);
       el.textContent = line.text || "♪";
       box.appendChild(el);
+      if (showTranslation && translationLines[i]) {
+        const tr = document.createElement("p");
+        tr.className = "np-lyrics-line-translation";
+        tr.dataset.lineIdx = String(i);
+        tr.textContent = translationLines[i];
+        box.appendChild(tr);
+      }
     });
     const src = document.createElement("p");
     src.className = "np-lyrics-source";
@@ -176,11 +195,59 @@ function drawLyrics(root: HTMLElement) {
 
   const editor = document.createElement("div");
   editor.className = "np-lyrics-editor";
-  editor.innerHTML = `<label>Текст песни<textarea id="lyrics-edit-text" rows="5"></textarea></label><label>Перевод<textarea id="lyrics-edit-translation" rows="4"></textarea></label><button class="btn" id="lyrics-save" type="button">Сохранить текст</button><p class="np-lyrics-hint" id="lyrics-save-hint"></p>`;
+  editor.innerHTML = `<label>Текст песни<textarea id="lyrics-edit-text" rows="5"></textarea></label><label>Перевод<textarea id="lyrics-edit-translation" rows="4"></textarea></label><button class="btn" id="lyrics-save" type="button">Сохранить текст</button><div class="np-lyrics-translate-row"><label>Перевести<select id="lyrics-translate-lang">${TRANSLATION_LANGUAGES.map((l) => `<option value="${l.code}"${l.code === "ru" ? " selected" : ""}>${l.label}</option>`).join("")}</select></label><button class="btn" id="lyrics-translate" type="button" ${stored?.lyrics && translationEnabled() ? "" : "disabled"}>Перевести</button><p class="np-lyrics-hint" id="lyrics-translate-hint">${translationEnabled() ? "" : "Перевод выключен — включите в настройках"}</p></div><p class="np-lyrics-hint" id="lyrics-save-hint"></p>`;
   const text = editor.querySelector<HTMLTextAreaElement>("#lyrics-edit-text");
   const translation = editor.querySelector<HTMLTextAreaElement>("#lyrics-edit-translation");
   if (text) text.value = lyricsEditText;
   if (translation) translation.value = lyricsEditTranslation;
+
+  // Translate the current lyrics into the picked language. The text goes
+  // to an external service (user opted in); the result is persisted via
+  // the enrichment path so the work is done once.
+  editor.querySelector<HTMLButtonElement>("#lyrics-translate")?.addEventListener("click", async () => {
+    const track = currentLibraryTrack();
+    const button = editor.querySelector<HTMLButtonElement>("#lyrics-translate");
+    const hint = editor.querySelector<HTMLElement>("#lyrics-translate-hint");
+    const lang = editor.querySelector<HTMLSelectElement>("#lyrics-translate-lang")?.value ?? "ru";
+    const sourceText = text?.value.trim() ?? "";
+    if (!track) {
+      if (hint) hint.textContent = "Перевод доступен для треков открытой библиотеки";
+      return;
+    }
+    if (!sourceText) {
+      if (hint) hint.textContent = "Сначала введите или найдите текст песни";
+      return;
+    }
+    if (button) button.disabled = true;
+    if (hint) hint.textContent = "Перевожу… текст уходит во внешний сервис";
+    try {
+      const lines = lyricsToTranslateLines(sourceText);
+      const translated = await translateLyrics(lines, lang);
+      const translatedText = translated.join("\n");
+      await saveTrackEnrichment({
+        track_id: track.id,
+        lyrics_translation: translatedText,
+        lyrics_translation_language: lang,
+      });
+      track.lyrics_translation = translatedText;
+      track.lyrics_translation_language = lang;
+      lyricsEditTranslation = translatedText;
+      if (translation) translation.value = translatedText;
+      const webTrack = getWebTrackByPath(track.path);
+      if (webTrack) {
+        webTrack.lyrics_translation = translatedText;
+        webTrack.lyrics_translation_language = lang;
+      }
+      if (hint) hint.textContent = "Перевод сохранён";
+      drawLyrics(root);
+      window.dispatchEvent(new CustomEvent("aurora:web-track-metadata-updated", { detail: { id: track.id } }));
+    } catch (error) {
+      if (hint) hint.textContent = error instanceof Error ? error.message : "Не удалось перевести";
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+
   editor.querySelector<HTMLButtonElement>("#lyrics-save")?.addEventListener("click", async () => {
     if (!stored) {
       setToast("Сохранение доступно для треков открытой библиотеки");
@@ -224,11 +291,16 @@ function parseStoredLyrics(text: string): Array<{ timeS: number | null; text: st
 }
 
 function scrollLyrics(root: HTMLElement, posS: number) {
-  if (!lyrics || !lyrics.synced) return;
   const box = root.querySelector<HTMLElement>("#np-lyrics");
   if (!box) return;
-  const idx = activeLineIndex(lyrics.lines, posS);
-  box.querySelectorAll<HTMLElement>(".np-lyrics-line").forEach((el) => {
+  // Sync source: stored (sidecar/user) lyrics when present, else LRCLIB.
+  const stored = currentLibraryTrack();
+  const lines = stored?.lyrics
+    ? parseStoredLyrics(stored.lyrics)
+    : lyrics?.lines ?? null;
+  if (!lines || !lines.some((l) => l.timeS != null)) return;
+  const idx = activeLineIndex(lines, posS);
+  box.querySelectorAll<HTMLElement>(".np-lyrics-line, .np-lyrics-line-translation").forEach((el) => {
     el.classList.toggle("active", Number(el.dataset.lineIdx) === idx);
   });
   if (!lyricsAutoScroll) return;
