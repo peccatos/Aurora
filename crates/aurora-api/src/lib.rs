@@ -429,12 +429,12 @@ pub fn router(state: AppState) -> Router {
         // The web shell is served from this same service, so the browser sees
         // one origin and the session/CSRF cookies are first-party everywhere
         // (same-site fetches and the top-level OAuth callback redirect).
+        // Hash-router SPA: the shell is one index.html, so unmatched paths
+        // serve it (200) and the client router renders from the #hash.
         .fallback_service(
-            ServeDir::new(AURORA_WEB_DIST)
-                .not_found_service(ServeFile::new(format!(
-                    "{AURORA_WEB_DIST}/index.html"
-                ))),
+            ServeDir::new(AURORA_WEB_DIST).fallback(get(spaverse)),
         )
+
         .layer(middleware::from_fn(guard::bounded_body))
         .layer(
             CorsLayer::new()
@@ -452,6 +452,25 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Response {
     (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+}
+
+/// SPA fallback: static assets under `/assets` are matched by ServeDir; any
+/// other unmatched path returns the shell (200) so the client router renders
+/// the route. Asset files exist on disk, so this only fires for app routes.
+async fn spaverse() -> Response {
+    let path = std::path::PathBuf::from(AURORA_WEB_DIST).join("index.html");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "web shell missing from image");
+            (StatusCode::NOT_FOUND, "web shell not available").into_response()
+        }
+    }
 }
 async fn ready(State(state): State<AppState>) -> Response {
     match aurora_storage::health_check(&state.pool).await {
