@@ -524,10 +524,24 @@ fn provider_settings<'a>(
     }
 }
 fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
-    headers
+    // Check Origin header first (cross-origin requests)
+    if let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|o| config.allowed_origins.iter().any(|x| x == o))
+    {
+        return config.allowed_origins.iter().any(|x| x == origin);
+    }
+    // For same-origin requests, browsers don't send Origin.
+    // Fall back to Referer header check.
+    if let Some(referer) = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        && let Ok(referer_url) = url::Url::parse(referer)
+    {
+        let referer_origin = referer_url.origin().ascii_serialization();
+        return config.allowed_origins.contains(&referer_origin);
+    }
+    false
 }
 /// A session cookie is accepted only when it is a base64url token of the
 /// expected length. The cookie *before* this check is fully attacker-controlled

@@ -85,7 +85,7 @@ struct SpotifyAlbum {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct YoutubeItemsPage {
     #[serde(default)]
     items: Vec<YoutubeItem>,
@@ -94,13 +94,13 @@ struct YoutubeItemsPage {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct YoutubeItem {
     snippet: Option<YoutubeSnippet>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct YoutubeSnippet {
     title: Option<String>,
     #[serde(default)]
@@ -109,7 +109,7 @@ struct YoutubeSnippet {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct YoutubeResourceId {
     video_id: Option<String>,
 }
@@ -528,10 +528,13 @@ mod tests {
 
     #[test]
     fn youtube_payload_is_normalized_to_neutral_tracks() {
-        let body = br#"{"items":[
-            {"snippet":{"title":"Video","videoOwnerChannelTitle":"Channel","resourceId":{"videoId":"v1"}}},
-            {"snippet":{"title":"no resource"}}
-        ],"nextPageToken":"CAEQABgE"}"#;
+        // Mirrors the real YouTube Data API v3 playlistItems response shape:
+        // every item carries kind/etag/id, every snippet carries the full
+        // set of fields the API documents.
+        let body = br#"{"kind":"youtube#playlistItemListResponse","etag":"etag-1","items":[
+            {"kind":"youtube#playlistItem","etag":"e1","id":"i1","snippet":{"publishedAt":"2026-01-01T00:00:00Z","channelId":"c1","channelTitle":"CT","playlistId":"pl","position":0,"description":"d","thumbnails":{"default":{"url":"u"}},"title":"Video","videoOwnerChannelTitle":"Channel","resourceId":{"kind":"youtube#video","videoId":"v1"}}},
+            {"kind":"youtube#playlistItem","etag":"e2","id":"i2","snippet":{"publishedAt":"2026-01-01T00:00:00Z","channelId":"c1","channelTitle":"CT","playlistId":"pl","position":1,"description":"","thumbnails":{"default":{"url":"u"}},"title":"no resource"}}
+        ],"nextPageToken":"CAEQABgE","pageInfo":{"totalResults":7,"resultsPerPage":5}}"#;
         let tracks = normalize_youtube(body).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].id, "v1");
@@ -548,7 +551,9 @@ mod tests {
         assert!(normalize_youtube(b"{").is_err());
         // Unknown fields mean the provider contract changed: reject, do not guess.
         assert!(normalize_spotify(br#"{"items":[],"next":null,"total":3}"#).is_err());
-        assert!(normalize_youtube(br#"{"items":[],"unexpected":true}"#).is_err());
+        // NOTE: YouTube payloads are parsed tolerantly (no deny_unknown_fields)
+        // because the real wire format carries envelope fields (kind, etag,
+        // id, pageInfo) that vary over time; unknown keys are simply ignored.
         // Empty or hostile identifiers inside an otherwise valid envelope.
         assert!(
             normalize_spotify(br#"{"items":[{"track":{"id":"","name":"x"}}],"next":null}"#)
@@ -562,13 +567,13 @@ mod tests {
         );
         assert!(
             normalize_youtube(
-                br#"{"items":[{"snippet":{"title":"t","resource_id":{"video_id":"<script>"}}}]}"#
+                br#"{"items":[{"snippet":{"title":"t","resourceId":{"videoId":"<script>"}}}]}"#
             )
             .is_err()
         );
         assert!(
             normalize_youtube(
-                br#"{"items":[{"snippet":{"title":"   ","resource_id":{"video_id":"v1"}}}]}"#
+                br#"{"items":[{"snippet":{"title":"   ","resourceId":{"videoId":"v1"}}}]}"#
             )
             .is_err()
         );
