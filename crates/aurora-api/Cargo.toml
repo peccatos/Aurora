@@ -18,6 +18,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 tower-http.workspace = true
 url = "2"
 uuid.workspace = true

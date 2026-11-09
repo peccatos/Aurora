@@ -8,8 +8,8 @@ import type { RemotePlaylistSnapshot, RemotePlaylistSummary, RemoteProvider, Rem
 declare global {
   interface ImportMeta {
     readonly env?: {
-      readonly VITE_OAUTH_API_BASE_URL?: string;
-      readonly VITE_MEDIA_API_BASE_URL?: string;
+      readonly VITE_AURORA_OAUTH_BASE_URL?: string;
+      readonly VITE_AURORA_MEDIA_BASE_URL?: string;
     };
   }
 }
@@ -22,13 +22,18 @@ type WebProvider = (typeof WEB_PROVIDERS)[number];
 let apiBaseOverride: string | null = null;
 
 /** Overrides the configured OAuth service base URL. Pass `null` to fall
- *  back to `VITE_OAUTH_API_BASE_URL`. Intended for tests. */
+ *  back to `VITE_AURORA_OAUTH_BASE_URL`. Intended for tests. */
 export function setApiBaseForTests(value: string | null): void {
   apiBaseOverride = value;
 }
 
 function configuredApiBase(): URL | null {
-  const raw = (apiBaseOverride ?? import.meta.env?.VITE_OAUTH_API_BASE_URL)?.trim();
+  // Same-origin by default: the web shell is served by the API service itself,
+  // which keeps the session/CSRF cookies first-party. An absolute base URL
+  // (legacy split deployment) can still be forced via build-time env.
+  const raw = apiBaseOverride
+    ?? (import.meta.env?.VITE_AURORA_OAUTH_BASE_URL
+      || (typeof window !== "undefined" ? window.location.origin : ""));
   if (!raw) return null;
   try {
     const url = new URL(raw);
@@ -135,13 +140,19 @@ async function requestJson(
     if (value !== null && value !== undefined && value !== "") url.searchParams.set(key, value);
   }
   const method = (init?.method ?? "GET").toUpperCase();
-  // State-changing requests must echo the session-bound token from the readable cookie.
-  const token = method === "GET" || method === "HEAD" ? null : csrfToken();
+  // Echo the session-bound token from the readable cookie whenever present.
+  // Non-GET calls must carry it (server rejects otherwise); the playlist
+  // detail endpoint additionally requires it on GET as a read-driving
+  // defense, so it is attached uniformly rather than method-gated.
+  // Always send Origin so the backend's allowlist check passes.
+  const origin = apiBase.origin;
+  const token = csrfToken();
   const response = await fetch(url, {
     ...init,
     credentials: "include",
     headers: {
       Accept: "application/json",
+      Origin: origin,
       ...(token ? { "X-CSRF-Token": token } : {}),
       ...(init?.headers ?? {}),
     },

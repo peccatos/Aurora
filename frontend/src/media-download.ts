@@ -54,7 +54,11 @@ export async function getMediaMetadata(rawUrl: string): Promise<MediaMetadata> {
     const result = await invoke<{ json: string }>("yt_dlp_metadata", { url });
     return normalizeMetadata(JSON.parse(result.json) as unknown);
   }
-  const base = testApiBase ?? import.meta.env?.VITE_MEDIA_API_BASE_URL?.trim();
+  // Same-origin by default: the web shell is served by the media API service
+  // itself; an absolute base (legacy split deployment) can still be set.
+  const base = testApiBase
+    ?? (import.meta.env?.VITE_AURORA_MEDIA_BASE_URL?.trim()
+      || (typeof window !== "undefined" ? window.location.origin : ""));
   if (!base) throw new Error("Media API is not configured in this browser deployment");
   const endpoint = new URL("/api/media/metadata", base);
   if (endpoint.protocol !== "https:") throw new Error("Media API must use HTTPS");

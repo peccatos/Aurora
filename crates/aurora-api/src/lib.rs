@@ -26,13 +26,24 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use url::Url;
+
+/// Directory the built web shell is baked into the image at (Dockerfile
+/// `COPY --from=web`). Serving it from the API itself keeps the browser on a
+/// single origin, which is what makes the session cookies first-party.
+const AURORA_WEB_DIST: &str = "/usr/share/aurora/web";
 use uuid::Uuid;
 
 use guard::RateLimiter;
 
 const SESSION_COOKIE: &str = "__Host-aurora_session";
 const CSRF_COOKIE: &str = "__Host-aurora_csrf";
+/// Long-lived (180d) anonymous user identity: token rows are keyed by this
+/// hash, NOT the 8h session hash. Losing or rotating the session therefore
+/// never orphans a stored grant — the account survives reconnects, second
+/// tabs, and cookie cleanup. Same shape as a session token.
+const USER_COOKIE: &str = "__Host-aurora_user";
 pub(crate) const CSRF_HEADER: &str = "x-csrf-token";
 const TX_TTL: Duration = Duration::from_secs(600);
 
@@ -420,6 +431,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/oauth/{provider}", delete(disconnect))
         .route("/api/media/metadata", post(media::metadata))
         .route("/api/media/ping", get(media::ping))
+        // The web shell is served from this same service, so the browser sees
+        // one origin and the session/CSRF cookies are first-party everywhere
+        // (same-site fetches and the top-level OAuth callback redirect).
+        // Hash-router SPA: the shell is one index.html, so unmatched paths
+        // serve it (200) and the client router renders from the #hash.
+        .fallback_service(
+            ServeDir::new(AURORA_WEB_DIST).fallback(get(spaverse)),
+        )
+
         .layer(middleware::from_fn(guard::bounded_body))
         .layer(
             CorsLayer::new()
@@ -437,6 +457,25 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Response {
     (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+}
+
+/// SPA fallback: static assets under `/assets` are matched by ServeDir; any
+/// other unmatched path returns the shell (200) so the client router renders
+/// the route. Asset files exist on disk, so this only fires for app routes.
+async fn spaverse() -> Response {
+    let path = std::path::PathBuf::from(AURORA_WEB_DIST).join("index.html");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "web shell missing from image");
+            (StatusCode::NOT_FOUND, "web shell not available").into_response()
+        }
+    }
 }
 async fn ready(State(state): State<AppState>) -> Response {
     match aurora_storage::health_check(&state.pool).await {
@@ -497,6 +536,9 @@ fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
 fn session(headers: &HeaderMap) -> Option<String> {
     cookie_value(headers, SESSION_COOKIE).filter(|sid| limits::is_session_token(sid))
 }
+fn user_token(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, USER_COOKIE).filter(|uid| limits::is_user_token(uid))
+}
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)
@@ -521,13 +563,23 @@ fn fail(status: StatusCode) -> Response {
         .into_response()
 }
 fn cookie(id: &str) -> String {
-    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Strict")
+    // Lax: the frontend is served from THIS service (same origin), so the
+    // session cookie is first-party everywhere — set on same-origin fetch
+    // responses, sent back on all API calls, and carried by the top-level
+    // OAuth callback redirect back from accounts.google.com (Lax allows
+    // top-level GET navigation). Same-site attackers cannot exist by
+    // construction; the session-bound X-CSRF-Token header remains as
+    // defense in depth.
+    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax")
 }
 /// The CSRF cookie is intentionally readable by scripts on the allowed origins so the
 /// frontend can echo it in the `X-CSRF-Token` header; it is scoped exactly like the
 /// session cookie. A cross-site attacker can read neither it nor the session cookie.
+fn user_cookie(id: &str) -> String {
+    format!("{USER_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=15552000")
+}
 fn csrf_cookie(token: &str) -> String {
-    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Strict")
+    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax")
 }
 fn cookie_header(value: &str) -> HeaderValue {
     value
@@ -644,8 +696,14 @@ async fn authorize_csrf(state: &AppState, headers: &HeaderMap) -> Result<String,
     .await
     {
         Ok(true) => Ok(sid),
-        Ok(false) => Err(fail(StatusCode::FORBIDDEN)),
-        Err(_) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR)),
+        Ok(false) => {
+            tracing::warn!("csrf rejected: token not bound to the presented session");
+            Err(fail(StatusCode::FORBIDDEN))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "csrf validation storage failure");
+            Err(fail(StatusCode::INTERNAL_SERVER_ERROR))
+        }
     }
 }
 
@@ -664,9 +722,12 @@ async fn begin(
     if !["spotify", "youtube-music"].contains(&provider.as_str()) {
         return fail(StatusCode::FORBIDDEN);
     }
-    // A readable CSRF cookie must only ever be handed to an allowed origin. No cookie means
-    // no session yet, which is the only case that skips the session-bound CSRF check.
-    if headers.get(header::COOKIE).is_none() && !origin_ok(&headers, &state.config) {
+    // A readable CSRF cookie must only ever be handed to an allowed origin. No
+    // session cookie yet means there is no CSRF possession to prove, so the
+    // origin check gates the minting of a brand-new session (the frontend
+    // always sends Origin on its fetches; curl probes without one are fine
+    // only when no cookies are involved).
+    if session(&headers).is_none() && !origin_ok(&headers, &state.config) {
         return fail(StatusCode::FORBIDDEN);
     }
     if let Some(rejection) = rate_limit(&state, guard::client_ip(peer.0), &provider) {
@@ -687,25 +748,36 @@ async fn begin(
                     (sid, false)
                 }
                 Ok(None) => {
-                    // A session cookie that is unknown or expired is never tolerated silently,
-                    // regardless of the presented Origin.
-                    if headers.get(header::COOKIE).is_some() {
-                        return fail(StatusCode::UNAUTHORIZED);
-                    }
+                    // An unknown or expired session cookie is the normal state
+                    // after a database reset, a migration, or 8h expiry: the
+                    // cookie value is server-minted base64url, not attacker
+                    // chosen (forged values are filtered by `session` above).
+                    // `begin` is the session bootstrap: mint a fresh session
+                    // (and Set-Cookie it) rather than 401-locking the user out
+                    // of connecting. The long-lived user cookie is untouched,
+                    // so any stored grant stays reachable after the re-mint.
+                    tracing::info!(
+                        provider,
+                        "begin: unknown or expired session cookie, minting a fresh session"
+                    );
                     (random(), true)
                 }
                 Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
             }
         }
         None => {
-            // A cookie that is present but is not a well-formed session token is
-            // a forged or corrupted value, not the absence of a session: reject
-            // it instead of minting a fresh session on top of it.
-            if headers.get(header::COOKIE).is_some() {
-                return fail(StatusCode::UNAUTHORIZED);
-            }
+            // A cookie header that is present but carries no session cookie
+            // (only, say, the user or CSRF cookie) is not a session to renew.
+            // A malformed session *value* was already filtered out by `session`
+            // above — that filter is the whole forgery check.
             (random(), true)
         }
+    };
+    // The user id is orthogonal to the session: mint once, keep for 180d.
+    // Tokens are keyed by its hash, so a session reset never orphans them.
+    let (uid, new_user) = match user_token(&headers) {
+        Some(uid) => (uid, false),
+        None => (random(), true),
     };
     let csrf_token = random();
     let expires = Utc::now() + chrono::Duration::hours(8);
@@ -773,6 +845,11 @@ async fn begin(
             .headers_mut()
             .append(header::SET_COOKIE, cookie_header(&cookie(&sid)));
     }
+    if new_user {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, cookie_header(&user_cookie(&uid)));
+    }
     // Re-issued on every begin so the readable CSRF cookie always matches the stored hash.
     response
         .headers_mut()
@@ -789,15 +866,29 @@ async fn callback(
 ) -> Response {
     let sid = match session(&headers) {
         Some(x) => x,
-        None => return fail(StatusCode::UNAUTHORIZED),
+        None => {
+            tracing::warn!(provider, "oauth callback: no session cookie");
+            return fail(StatusCode::UNAUTHORIZED);
+        }
+    };
+    // Token rows are keyed by the long-lived user cookie, not the session.
+    // Presence is validated; the callback saves under this id below.
+    let _uid = match user_token(&headers) {
+        Some(x) => x,
+        None => {
+            tracing::warn!(provider, "oauth callback: no user cookie");
+            return fail(StatusCode::UNAUTHORIZED);
+        }
     };
     if query.error.is_some() {
+        tracing::warn!(provider, "oauth callback: provider returned an error");
         return fail(StatusCode::BAD_REQUEST);
     }
     // Bounds before any storage or provider call: an oversized or non-base64url
     // `state` and an oversized `code` are rejected here, so neither reaches a
     // hash, a SQL binding, or the outbound token request.
     if !limits::is_oauth_state(&query.state) {
+        tracing::warn!(provider, "oauth callback: malformed state");
         return fail(StatusCode::BAD_REQUEST);
     }
     let code = match query
@@ -806,17 +897,27 @@ async fn callback(
         .filter(|x| limits::is_authorization_code(x))
     {
         Some(x) => x.to_owned(),
-        None => return fail(StatusCode::BAD_REQUEST),
+        None => {
+            tracing::warn!(provider, "oauth callback: missing or malformed code");
+            return fail(StatusCode::BAD_REQUEST);
+        }
     };
     if let Some(rejection) = rate_limit(&state, guard::client_ip(peer.0), &provider) {
+        tracing::warn!(provider, "oauth callback: rate limited");
         return rejection;
     }
     match aurora_storage::get_oauth_session(&state.pool, &hash(&sid), &Utc::now().to_rfc3339())
         .await
     {
         Ok(Some(_)) => {}
-        Ok(None) => return fail(StatusCode::UNAUTHORIZED),
-        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => {
+            tracing::warn!(provider, "oauth callback: session cookie not recognized");
+            return fail(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: session lookup failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
     let tx = match aurora_storage::claim_oauth_transaction(
         &state.pool,
@@ -828,14 +929,30 @@ async fn callback(
     .await
     {
         Ok(Some(tx)) => tx,
-        _ => return fail(StatusCode::BAD_REQUEST),
+        Ok(None) => {
+            tracing::warn!(
+                provider,
+                "oauth callback: transaction not found/claimed (state mismatch, expired, or different session)"
+            );
+            return fail(StatusCode::BAD_REQUEST);
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: transaction claim failed");
+            return fail(StatusCode::BAD_REQUEST);
+        }
     };
     let verifier = tx.verifier;
     let redirect_uri = tx.redirect_uri;
     let settings = match provider_settings(&state.config, &provider) {
         Some((s, _, _, _)) if valid_redirect_uri(&provider, &s.redirect_uri) => s.clone(),
-        Some(_) => return fail(StatusCode::SERVICE_UNAVAILABLE),
-        None => return fail(StatusCode::SERVICE_UNAVAILABLE),
+        Some(_) => {
+            tracing::error!(provider, "oauth callback: redirect URI misconfigured");
+            return fail(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        None => {
+            tracing::error!(provider, "oauth callback: provider not configured");
+            return fail(StatusCode::SERVICE_UNAVAILABLE);
+        }
     };
     let (account, tokens) = match state
         .oauth
@@ -843,16 +960,34 @@ async fn callback(
         .await
     {
         Ok(x) => x,
-        Err(()) => return fail(StatusCode::BAD_GATEWAY),
+        Err(()) => {
+            tracing::error!(provider, "oauth callback: token exchange failed");
+            return fail(StatusCode::BAD_GATEWAY);
+        }
     };
+    // The refresh token is what keeps later imports working after the
+    // ~1h access-token expiry. Google omits it when it believes the consent
+    // did not request offline access; log its presence so a connect that
+    // cannot self-refresh is identifiable immediately.
+    tracing::warn!(
+        provider,
+        has_refresh_token = tokens.refresh_token.is_some(),
+        "oauth tokens received from provider"
+    );
     let token_bytes = match tokens.encode_native() {
         Ok(x) => x,
-        Err(_) => return fail(StatusCode::BAD_GATEWAY),
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: token encode failed");
+            return fail(StatusCode::BAD_GATEWAY);
+        }
     };
     let encrypted = match aurora_storage::encrypt_oauth_tokens(&state.encryption_key, &token_bytes)
     {
         Ok(x) => x,
-        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: token encryption failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
     let persisted = OAuthAccount {
         subject: account.subject.clone(),
@@ -863,18 +998,28 @@ async fn callback(
         auth_state: "connected".into(),
         last_auth_error: None,
     };
-    if aurora_storage::save_oauth_account(
+    match aurora_storage::save_oauth_account(
         &state.pool,
-        &hash(&sid),
+        &hash(&_uid),
         &provider,
         &persisted,
         &format!("{provider}:{}", account.subject),
         &encrypted,
     )
     .await
-    .is_err()
     {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(()) => {
+            tracing::info!(
+        provider,
+        subject = %account.subject,
+        session = %&hash(&sid)[..8],
+        "oauth account connected"
+    );
+        }
+        Err(e) => {
+            tracing::error!(provider, error = %e, "oauth callback: account save failed");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
     Redirect::to(&state.config.frontend_url).into_response()
 }
@@ -883,7 +1028,7 @@ async fn callback(
 /// refresh token. An update that matches no row also counts as a failure.
 async fn persist_tokens(
     state: &AppState,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
     tokens: &aurora_providers::token::TokenSet,
 ) -> bool {
@@ -894,7 +1039,7 @@ async fn persist_tokens(
         return false;
     };
     matches!(
-        aurora_storage::update_oauth_tokens(&state.pool, session_hash, provider, &encoded).await,
+        aurora_storage::update_oauth_tokens(&state.pool, user_hash, provider, &encoded).await,
         Ok(true)
     )
 }
@@ -905,21 +1050,25 @@ async fn persist_tokens(
 async fn provider_error(
     error: aurora_providers::playlist::Error,
     state: &AppState,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
 ) -> Response {
     match error {
         aurora_providers::playlist::Error::ReauthorizationRequired => {
+            tracing::warn!(provider, "provider rejected the stored grant: reauthorization required");
             let _ = aurora_storage::mark_oauth_reauth_required(
                 &state.pool,
-                session_hash,
+                user_hash,
                 provider,
                 "refresh_failed",
             )
             .await;
             fail(StatusCode::UNAUTHORIZED)
         }
-        _ => fail(StatusCode::BAD_GATEWAY),
+        other => {
+            tracing::error!(provider, error = %other, "provider playlist request failed");
+            fail(StatusCode::BAD_GATEWAY)
+        }
     }
 }
 
@@ -928,7 +1077,7 @@ async fn provider_error(
 /// failure leaves the stored token set untouched.
 async fn persist_after_request(
     state: &AppState,
-    session_hash: &str,
+    user_hash: &str,
     provider: &str,
     tokens: &aurora_providers::token::TokenSet,
     error: Option<&aurora_providers::playlist::Error>,
@@ -939,7 +1088,7 @@ async fn persist_after_request(
     ) {
         return true;
     }
-    persist_tokens(state, session_hash, provider, tokens).await
+    persist_tokens(state, user_hash, provider, tokens).await
 }
 
 async fn status(
@@ -967,7 +1116,14 @@ async fn status(
         Ok(None) => return fail(StatusCode::UNAUTHORIZED),
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
     }
-    match aurora_storage::get_oauth_account(&state.pool, &hash(&sid), &provider).await {
+    // The account is keyed by the long-lived user cookie: an expired session
+    // 401s here, but a valid session with a mismatched (rotated) history
+    // still finds the stored grant, so the UI keeps showing "connected".
+    let uid = match user_token(&headers) {
+        Some(x) => x,
+        None => return fail(StatusCode::UNAUTHORIZED),
+    };
+    match aurora_storage::get_oauth_account(&state.pool, &hash(&uid), &provider).await {
         Ok(Some(a)) => (
             StatusCode::OK,
             [(header::CACHE_CONTROL, "no-store")],
@@ -1013,8 +1169,14 @@ async fn playlists(
         Ok(None) => return fail(StatusCode::UNAUTHORIZED),
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
     }
+    // Token rows are keyed by the user cookie hash: the session only carries
+    // CSRF. A rotated/expired-and-reconnected session still reaches the grant.
+    let user_hash = match user_token(&headers) {
+        Some(x) => hash(&x),
+        None => return fail(StatusCode::UNAUTHORIZED),
+    };
     let ciphertext =
-        match aurora_storage::get_oauth_token_ciphertext(&state.pool, &session_hash, &provider)
+        match aurora_storage::get_oauth_token_ciphertext(&state.pool, &user_hash, &provider)
             .await
         {
             Ok(Some(value)) => value,
@@ -1057,7 +1219,7 @@ async fn playlists(
     };
     // Refresh serialization key: opaque, derived from the same hashes the
     // credential rows are keyed by. No token material crosses here.
-    let refresh_key = format!("{session_hash}:{provider}");
+    let refresh_key = format!("{user_hash}:{provider}");
     let mut http = state.playlist_http.lock().await;
     let result = if provider == "spotify" {
         let mut url = Url::parse("https://api.spotify.com/v1/me/playlists").expect("constant URL");
@@ -1145,7 +1307,7 @@ async fn playlists(
     // interpreted, so a failed page request can no longer discard them.
     let persisted = persist_after_request(
         &state,
-        &session_hash,
+        &user_hash,
         &provider,
         &tokens,
         result.as_ref().err(),
@@ -1163,7 +1325,7 @@ async fn playlists(
             )
                 .into_response()
         }
-        Err(error) => provider_error(error, &state, &session_hash, &provider).await,
+        Err(error) => provider_error(error, &state, &user_hash, &provider).await,
     }
 }
 
@@ -1180,11 +1342,16 @@ async fn disconnect(
         return rejection;
     }
     // Exact-Origin check plus the session-bound CSRF token (defense in depth).
-    let sid = match authorize_csrf(&state, &headers).await {
+    let _sid = match authorize_csrf(&state, &headers).await {
         Ok(sid) => sid,
         Err(rejection) => return rejection,
     };
-    if aurora_storage::delete_oauth_account(&state.pool, &hash(&sid), &provider)
+    // The account row is keyed by the user cookie hash.
+    let uid = match user_token(&headers) {
+        Some(x) => x,
+        None => return fail(StatusCode::UNAUTHORIZED),
+    };
+    if aurora_storage::delete_oauth_account(&state.pool, &hash(&uid), &provider)
         .await
         .is_err()
     {
@@ -1376,9 +1543,17 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+        let uid = cookies
+            .iter()
+            .find_map(|c| c.strip_prefix(&format!("{USER_COOKIE}=")))
+            .expect("user cookie is set")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
         let body = body_json(response).await;
         let csrf = body["csrf_token"].as_str().expect("csrf token").to_owned();
-        (sid, csrf, cookies)
+        (format!("{sid}; {USER_COOKIE}={uid}"), csrf, cookies)
     }
 
     /// A file-backed store, because `sqlite::memory:` gives every pooled connection its own
@@ -1436,7 +1611,7 @@ mod tests {
             .iter()
             .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
             .expect("session cookie is set");
-        for attribute in ["Path=/", "Secure", "SameSite=Strict"] {
+        for attribute in ["Path=/", "Secure", "SameSite=Lax"] {
             assert!(csrf_cookie_value.contains(attribute));
             assert!(session_cookie_value.contains(attribute));
         }
@@ -1531,7 +1706,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_session_cookie_never_grants_a_new_session() {
+    async fn unknown_session_cookie_gets_a_reminted_session() {
+        // An unknown (but well-formed, server-minted-format) session cookie is
+        // the post-expiry / post-reset state, not an attack: `begin` is the
+        // session bootstrap and must issue a fresh session instead of 401.
         let (app, _store) = state_with_store(config()).await;
         let cookie = format!("{SESSION_COOKIE}={}", random());
         let r = begin(
@@ -1541,7 +1719,13 @@ mod tests {
             peer(),
         )
         .await;
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r.status(), StatusCode::OK);
+        let set = r
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(set.contains(SESSION_COOKIE), "fresh session is issued");
     }
 
     #[tokio::test]

@@ -18,6 +18,11 @@ fn provider(prefix: &str) -> Result<Option<ProviderSettings>, Box<dyn std::error
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Diagnosability on PaaS: every OAuth failure path is logged with a
+    // reason; RUST_LOG tunes verbosity (defaults to info).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let origins: Vec<String> = env::var("AURORA_API_ALLOWED_ORIGINS")
         .ok()
         .filter(|v| !v.trim().is_empty())
