@@ -1,6 +1,7 @@
 /** Settings page: output device, bit-perfect (exclusive + verify), files. */
 
 import { invoke, platform } from "../invoke";
+import { navigate } from "../router";
 import { PROVIDERS } from "../provider-registry";
 import { disconnectAccount, getAccountRecord, hasProviderAuthAdapter, markAuthorizationPending, markAuthorizationTimeout, recordAuthorizationError, refreshAccountStatus, startAuthorization } from "../accounts";
 import { pickAudioFiles } from "../file-picker";
@@ -55,6 +56,16 @@ function render(root: HTMLElement, syncAccounts = true) {
         <div id="account-cards" class="account-cards" aria-live="polite"></div>
         <p class="hint">Aurora stores only connection metadata here. Tokens remain in the native/backend secure store; providers without a configured adapter cannot start authorization.</p>
         <p class="hint" id="account-callback-status" role="status"></p>
+      </div>
+
+      <div class="eq-card">
+        <header class="card-head">
+          <p class="overline">Правовые документы</p>
+        </header>
+        <div class="settings-row">
+          <button class="btn" data-legal-link="privacy" type="button">Политика конфиденциальности</button>
+          <button class="btn" data-legal-link="tos" type="button">Условия использования</button>
+        </div>
       </div>
 
       <div class="eq-card">
@@ -218,6 +229,10 @@ function render(root: HTMLElement, syncAccounts = true) {
     } catch (e) {
       setToast(`Device select failed: ${String(e)}`);
     }
+  });
+
+  root.querySelectorAll<HTMLButtonElement>("[data-legal-link]").forEach((btn) => {
+    btn.addEventListener("click", () => navigate(`legal?doc=${btn.dataset.legalLink}`));
   });
 
   root.querySelector<HTMLButtonElement>("#pick-file")?.addEventListener("click", async () => {
