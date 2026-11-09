@@ -24,6 +24,27 @@ import {
   type RemotePlaylistSummary,
   type RemoteProvider,
 } from "../remote-playlist-import";
+import {
+  matchRatePercent,
+  readImportHistory,
+  recordImportQuality,
+} from "../import-metrics";
+
+/** Records the import into the persisted quality history (best-effort:
+ *  the import itself is the source of truth, the metric is telemetry). */
+function trackImportQuality(report: PlaylistImportReport): void {
+  try {
+    recordImportQuality(
+      { matched: report.matchedEntries, unmatched: report.unmatchedEntries },
+      {
+        provider: report.sourceProvider,
+        playlistName: report.playlist.name,
+      },
+    );
+  } catch {
+    /* metric persistence is degradable */
+  }
+}
 
 /** Renders one import report (shared by the file and provider paths). */
 function showImportReport(root: HTMLElement, report: PlaylistImportReport): void {
@@ -46,6 +67,46 @@ function showImportReport(root: HTMLElement, report: PlaylistImportReport): void
   close.textContent = "Dismiss";
   close.addEventListener("click", () => box.remove());
   box.append(heading, close);
+
+  // Matching-quality summary: one line the user can read at a glance,
+  // plus an expandable unmatched list (capped by the metric module).
+  const summary = document.createElement("p");
+  summary.className = "hint";
+  summary.textContent = `Импортировано: ${report.quality.matched} из ${report.quality.totalRemote} треков (${matchRatePercent(report.quality)})`;
+  box.append(summary);
+  const kinds = Object.entries(report.quality.matchedByKind)
+    .filter(([, count]) => count > 0)
+    .map(([kind, count]) => `${kind}: ${count}`)
+    .join(", ");
+  if (kinds) {
+    const kindLine = document.createElement("p");
+    kindLine.className = "hint";
+    kindLine.textContent = `Совпадения — ${kinds}`;
+    box.append(kindLine);
+  }
+  if (report.quality.unmatchedTracks.length) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn";
+    toggle.textContent = `Показать несовпавшие (${report.quality.unmatchedTracks.length})`;
+    const details = document.createElement("ul");
+    details.style.display = "none";
+    for (const track of report.quality.unmatchedTracks) {
+      const row = document.createElement("li");
+      row.textContent = track.artists
+        ? `${track.title} — ${track.artists}`
+        : track.title;
+      details.appendChild(row);
+    }
+    toggle.addEventListener("click", () => {
+      const shown = details.style.display !== "none";
+      details.style.display = shown ? "none" : "";
+      toggle.textContent = shown
+        ? `Показать несовпавшие (${report.quality.unmatchedTracks.length})`
+        : "Скрыть несовпавшие";
+    });
+    box.append(toggle, details);
+  }
 
   const section = (title: string, items: string[]) => {
     if (!items.length) return;
@@ -90,6 +151,7 @@ async function importFromProvider(root: HTMLElement, provider: RemoteProvider): 
   const snapshot = await getRemotePlaylist(provider, chosen.id);
   const localTracks = await getAllTracks();
   const report = await importRemotePlaylist(snapshot, { name: requestedName, localTracks });
+  trackImportQuality(report);
   setToast(
     `Imported "${report.playlist.name}": ${report.matched} matched` +
       (report.unmatched ? `, ${report.unmatched} not found` : ""),
@@ -175,7 +237,34 @@ function renderList(root: HTMLElement) {
     <div class="ytm-shelf-row" id="pl-grid"></div>
     <p class="hint" id="pl-empty"></p>
     <section class="pl-import-report" id="pl-import-report" aria-live="polite" hidden></section>
+    <div id="pl-quality-history"></div>
   `;
+
+  // Per-import matching-quality history (localStorage, newest first).
+  const historyBox = root.querySelector<HTMLElement>("#pl-quality-history")!;
+  const history = readImportHistory();
+  if (history.length) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn";
+    toggle.textContent = "История импорта";
+    const details = document.createElement("ul");
+    details.style.display = "none";
+    for (const entry of history.slice(0, 5)) {
+      const row = document.createElement("li");
+      const date = new Date(entry.date).toLocaleString();
+      row.textContent =
+        `${entry.playlistName || entry.provider || "импорт"} — ` +
+        `${matchRatePercent(entry.report)} (${entry.report.matched}/${entry.report.totalRemote}), ${date}`;
+      details.appendChild(row);
+    }
+    toggle.addEventListener("click", () => {
+      const shown = details.style.display !== "none";
+      details.style.display = shown ? "none" : "";
+      toggle.textContent = shown ? "История импорта" : "Скрыть историю";
+    });
+    historyBox.append(toggle, details);
+  }
 
   const grid = root.querySelector<HTMLElement>("#pl-grid")!;
   const empty = root.querySelector<HTMLElement>("#pl-empty")!;

@@ -1,5 +1,6 @@
 import type { StoredTrack } from "./library-db";
 import type { Playlist } from "./playlist-service";
+import { summarizeImportQuality, type ImportQualityReport } from "./import-metrics.ts";
 
 /** Provider-neutral remote playlist contracts.
  *
@@ -108,6 +109,9 @@ export interface PlaylistImportReport extends RemoteMatchCounters {
   localTrackIds: string[];
   /** "Artist — Title" labels for the unmatched source positions. */
   unmatchedLabels: string[];
+  /** Aggregated matching-quality metric (kind breakdown, rate, capped
+   *  unmatched list) — see import-metrics.ts. */
+  quality: ImportQualityReport;
 }
 
 /** NFKC + lower-case + punctuation-folded key. Bracketed suffixes
@@ -378,6 +382,7 @@ export async function applyRemotePlaylistImport(
         ? `${entry.remote.artists.join(", ")} — ${entry.remote.title}`
         : entry.remote.title,
     ),
+    quality: summarizeImportQuality(result, snapshot.tracks.length),
   };
 }
 
