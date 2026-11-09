@@ -27,7 +27,7 @@ export function setApiBaseForTests(value: string | null): void {
   apiBaseOverride = value;
 }
 
-function configuredApiBase(): URL | null {
+export function configuredApiBase(): URL | null {
   // Same-origin by default: the web shell is served by the API service itself,
   // which keeps the session/CSRF cookies first-party. An absolute base URL
   // (legacy split deployment) can still be forced via build-time env.

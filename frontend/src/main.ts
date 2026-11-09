@@ -32,6 +32,7 @@ import { playlistsPage, playlistDetailPage } from "./pages/playlists";
 import { searchPage } from "./pages/search";
 import { historyPage } from "./pages/history";
 import { legalPage } from "./pages/legal";
+import { authPage } from "./pages/auth";
 import { genresPage } from "./pages/genres";
 import { artistPage } from "./pages/artist";
 import { effectsPage } from "./pages/effects";
@@ -65,6 +66,7 @@ if (isWebShell()) {
   registerPage(historyPage);
   registerPage(genresPage);
   registerPage(legalPage);
+  registerPage(authPage);
   registerPage(artistPage);
 }
 

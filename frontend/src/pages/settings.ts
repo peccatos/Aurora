@@ -44,6 +44,11 @@ function render(root: HTMLElement, syncAccounts = true) {
           <p class="overline" id="accounts-heading">Accounts &amp; providers</p>
         </header>
         <div class="settings-row">
+          <strong>Аккаунт</strong>
+          <span class="hint" id="auth-identity">Проверка…</span>
+        </div>
+        <div class="settings-row" id="auth-identity-actions"></div>
+        <div class="settings-row">
           <strong>Local library</strong>
           <span class="hint ok">Available</span>
         </div>
@@ -98,6 +103,58 @@ function render(root: HTMLElement, syncAccounts = true) {
   `;
 
   const deviceSel = root.querySelector<HTMLSelectElement>("#device-select");
+
+  // Identity card (email/password account, web shell only — the auth
+  // endpoints live on the API service). getMe() is a cheap same-origin
+  // GET; on failure the card falls back to the anonymous state.
+  const identityEl = root.querySelector<HTMLElement>("#auth-identity");
+  const identityActions = root.querySelector<HTMLElement>("#auth-identity-actions");
+  const renderIdentity = (identity: { authenticated: boolean; email?: string } | null): void => {
+    if (!identityEl || !identityActions) return;
+    identityEl.className = "hint";
+    identityActions.innerHTML = "";
+    if (identity?.authenticated && identity.email) {
+      identityEl.textContent = identity.email;
+      const logoutBtn = document.createElement("button");
+      logoutBtn.className = "btn";
+      logoutBtn.type = "button";
+      logoutBtn.textContent = "Выйти";
+      logoutBtn.addEventListener("click", async () => {
+        logoutBtn.disabled = true;
+        try {
+          const { logout } = await import("../auth-service");
+          await logout();
+          setToast("Вы вышли из аккаунта");
+        } catch {
+          // A stale CSRF token (session rotated elsewhere) surfaces here;
+          // the honest recovery is a reload, which re-reads the cookies.
+          setToast("Не удалось выйти — обновите страницу и попробуйте снова");
+        }
+        render(root, false);
+      });
+      identityActions.appendChild(logoutBtn);
+    } else {
+      identityEl.textContent = "Вы не вошли — подключённые аккаунты привязаны к этому браузеру";
+      const loginBtn = document.createElement("button");
+      loginBtn.className = "btn";
+      loginBtn.type = "button";
+      loginBtn.textContent = "Войти";
+      loginBtn.addEventListener("click", () => navigate("auth?mode=login"));
+      const registerBtn = document.createElement("button");
+      registerBtn.className = "btn";
+      registerBtn.type = "button";
+      registerBtn.textContent = "Создать аккаунт";
+      registerBtn.addEventListener("click", () => navigate("auth?mode=register"));
+      identityActions.append(loginBtn, registerBtn);
+    }
+  };
+  if (platform === "web" && identityEl && identityActions) {
+    void import("../auth-service").then(({ getMe }) => getMe()).then(renderIdentity).catch(() => renderIdentity(null));
+  } else if (identityEl && identityActions) {
+    // Desktop shell: no API auth surface — the card stays hidden entirely.
+    identityEl.closest(".settings-row")?.remove();
+    identityActions.remove();
+  }
 
   const accountCards = root.querySelector<HTMLElement>("#account-cards");
   if (accountCards) {
