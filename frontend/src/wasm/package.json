@@ -1,0 +1,16 @@
+{
+  "name": "aurora-web",
+  "type": "module",
+  "version": "0.2.0",
+  "license": "MIT OR Apache-2.0",
+  "files": [
+    "aurora_web_bg.wasm",
+    "aurora_web.js",
+    "aurora_web.d.ts"
+  ],
+  "main": "aurora_web.js",
+  "types": "aurora_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

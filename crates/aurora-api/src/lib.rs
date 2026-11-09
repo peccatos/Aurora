@@ -26,7 +26,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
+
+/// Directory the built web shell is baked into the image at (Dockerfile
+/// `COPY --from=web`). Serving it from the API itself keeps the browser on a
+/// single origin, which is what makes the session cookies first-party.
+const AURORA_WEB_DIST: &str = "/usr/share/aurora/web";
 use uuid::Uuid;
 
 use guard::RateLimiter;
@@ -420,6 +426,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/oauth/{provider}", delete(disconnect))
         .route("/api/media/metadata", post(media::metadata))
         .route("/api/media/ping", get(media::ping))
+        // The web shell is served from this same service, so the browser sees
+        // one origin and the session/CSRF cookies are first-party everywhere
+        // (same-site fetches and the top-level OAuth callback redirect).
+        .fallback_service(
+            ServeDir::new(AURORA_WEB_DIST)
+                .not_found_service(ServeFile::new(format!(
+                    "{AURORA_WEB_DIST}/index.html"
+                ))),
+        )
         .layer(middleware::from_fn(guard::bounded_body))
         .layer(
             CorsLayer::new()
@@ -521,21 +536,20 @@ fn fail(status: StatusCode) -> Response {
         .into_response()
 }
 fn cookie(id: &str) -> String {
-    // None (not Lax/Strict): the API and the frontend are hosted on different
-    // sites (PaaS subdomains like *.onrender.com are in the Public Suffix
-    // List, so they are never same-site), so the session cookie must be
-    // storable from a cross-site fetch response and attachable to the
-    // top-level OAuth callback redirect from accounts.google.com. Secure is
-    // mandatory for SameSite=None. Cross-site attackers still cannot read it
-    // (HttpOnly) or send it meaningfully: state-changing API calls require the
-    // session-bound X-CSRF-Token header.
-    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=None")
+    // Lax: the frontend is served from THIS service (same origin), so the
+    // session cookie is first-party everywhere — set on same-origin fetch
+    // responses, sent back on all API calls, and carried by the top-level
+    // OAuth callback redirect back from accounts.google.com (Lax allows
+    // top-level GET navigation). Same-site attackers cannot exist by
+    // construction; the session-bound X-CSRF-Token header remains as
+    // defense in depth.
+    format!("{SESSION_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax")
 }
 /// The CSRF cookie is intentionally readable by scripts on the allowed origins so the
 /// frontend can echo it in the `X-CSRF-Token` header; it is scoped exactly like the
 /// session cookie. A cross-site attacker can read neither it nor the session cookie.
 fn csrf_cookie(token: &str) -> String {
-    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=None")
+    format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax")
 }
 fn cookie_header(value: &str) -> HeaderValue {
     value
@@ -1508,7 +1522,7 @@ mod tests {
             .iter()
             .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
             .expect("session cookie is set");
-        for attribute in ["Path=/", "Secure", "SameSite=None"] {
+        for attribute in ["Path=/", "Secure", "SameSite=Lax"] {
             assert!(csrf_cookie_value.contains(attribute));
             assert!(session_cookie_value.contains(attribute));
         }

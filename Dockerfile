@@ -1,14 +1,27 @@
 # Aurora API (OAuth BFF) — container for PaaS deploys (Render, Fly, etc.).
 #
-# Build context: repository root. Only the aurora-api server binary is
-# produced; the desktop shell (Tauri) and the frontend static site are not
-# part of this image.
+# Build context: repository root. The image contains the aurora-api server
+# binary AND the built web shell: serving both from one service keeps the
+# browser on a single origin, so the session/CSRF cookies are first-party
+# (third-party cookie blocking makes a split frontend/API deployment
+# unworkable in modern browsers). The desktop shell (Tauri) is not part of
+# this image.
 #
 # yt-dlp note: this image intentionally does NOT bundle yt-dlp. The media
 # endpoints degrade gracefully: GET /api/media/ping reports
 # {"available":false} (503) and POST /api/media/metadata answers 503, and
 # the UI hides the feature. Bundling it is a deliberate per-deployment
 # decision (license/size/upgrade cadence), not a default.
+
+FROM node:22-slim AS web
+WORKDIR /web
+# Build the browser bundle. The API base URL is same-origin by default, so
+# no build-time env is needed; VITE_AURORA_* overrides remain available.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend ./
+# The generated wasm glue is a local artifact; keep it out of the context.
+RUN npm run build
 
 FROM rust:1.94 AS builder
 WORKDIR /app
@@ -32,6 +45,8 @@ RUN useradd --system --home-dir /data --create-home aurora \
     && mkdir -p /data && chown aurora:aurora /data
 WORKDIR /app
 COPY --from=builder /app/target/release/aurora-api /usr/local/bin/aurora-api
+# Web shell, served by the API at the SPA fallback (see lib.rs ServeDir).
+COPY --from=web /web/dist /usr/share/aurora/web
 ENV AURORA_DATABASE_PATH=/data/aurora.db
 USER aurora
 EXPOSE 8080
