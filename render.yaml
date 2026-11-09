@@ -32,7 +32,7 @@ services:
       - key: AURORA_API_ALLOWED_ORIGINS
         value: https://aurora-api-3.onrender.com
       - key: AURORA_API_FRONTEND_URL
-        value: https://aurora-api-3.onrender.com/settings/accounts
+        value: https://aurora-api-3.onrender.com/#/settings
       - key: AURORA_OAUTH_ENCRYPTION_KEY
         sync: false # base64url of 32 random bytes
       - key: AURORA_DATABASE_PATH
