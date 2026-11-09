@@ -536,11 +536,10 @@ fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
     if let Some(referer) = headers
         .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
+        && let Ok(referer_url) = url::Url::parse(referer)
     {
-        if let Ok(referer_url) = url::Url::parse(referer) {
-            let referer_origin = referer_url.origin().ascii_serialization();
-            return config.allowed_origins.iter().any(|x| *x == referer_origin);
-        }
+        let referer_origin = referer_url.origin().ascii_serialization();
+        return config.allowed_origins.contains(&referer_origin);
     }
     false
 }
