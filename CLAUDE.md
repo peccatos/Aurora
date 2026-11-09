@@ -1,19 +1,24 @@
 # Aurora — project guidance for Claude
 
-## Current state (2026-11-09)
+## Current state (2026-11-10)
 - **Ф7 (HTTPS deploy) — ✅ CLOSED, live on Render**: `aurora-api-3.onrender.com`
-- **Ф5 (playlist import) — ✅ CLOSED 2026-11-09, verified live end-to-end**: begin → Google → callback → grant under user_hash → Connected in UI → playlist import succeeded (7-track playlist). Three prod bugs fixed on the way: hash-router frontend URL (`5b8b3b7`), same-origin 403 via Referer fallback in `origin_ok` (`b93b154`), YouTube playlistItems parse — `deny_unknown_fields` rejected the real wire envelope (kind/etag/pageInfo) → tolerant parse (`06d2156`).
-- **Ф1–Ф4, Ф6, Ф8** — code + tests closed.
-- 88 tests green, clippy clean.
+- **Ф5 (playlist import) — ✅ CLOSED 2026-11-09, verified live end-to-end**.
+- **User authentication — ✅ CLOSED 2026-11-10** (`61247e9` + `3e71d9d`): email+password (argon2id), `__Host-aurora_auth` 30d cookie, login/register page `/#/auth?mode=login`, Аккаунт card in Settings, anonymous grants claimed on login, `AURORA_REGISTRATION_OPEN` env gate, reset deferred.
+- **Security hardening — ✅ mostly CLOSED** (`7e1b7c2`+`e723d37`): live Google secret scrubbed from git (ROTATION STILL REQUIRED — old secret in history), security headers (CSP/HSTS/X-Frame-Options/Referrer-Policy/Permissions-Policy). Verifier erasure + log-scrub test remain open.
+- **Lyrics+translation — ✅ CLOSED** (`6f5d670`): embedded tags (USLT/syncText→LRC), LRC sidecars, LibreTranslate per-line translation (off by default, endpoint configurable), synced two-line player display.
+- **Legal docs — ✅ CLOSED** (`c311dd4`): privacy policy + ToS (RU) at `/#/legal?doc=privacy|tos`. Google Cloud Console privacy-policy URL is a MANUAL step.
+- **DSP audiophile block — ✅ quick wins + reverb CLOSED** (`78fa497`+`2573020`): bs2b crossfeed, surgical EQ (31 bands, Q≤12), partitioned time-domain convolution reverb with 3 synthetic IR presets + user IR upload (10s/5MB cap). Bit-perfect path provably untouched. Deferred: ReplayGain2/LUFS scan, room correction.
+- **CI fast lane — ✅ CLOSED** (`5beb49a`): fast lane on push/PR; heavy matrix/MSRV/bundles gated by tag v*/dispatch/label `bundle`.
+- **UX 401-cycle — ✅ CLOSED** (`e723d37`): single-flight session bootstrap + one retry in requestJson.
+- 222 Rust + 109 frontend tests green, clippy -D warnings clean.
 
 ## Roadmap (next, in order)
-1. **User authentication** in the service (email+password; replace anonymous 180d cookie as the grant key).
-2. **UX fixes**: 401-cycle (import/флоу сами перевыпускают сессию), Settings page error/retry states.
-3. **UI pass** over the web shell.
-4. Lyrics (legal sources only: user files/LRC, no site scraping) + translation via LibreTranslate/Argos.
-5. Audio effects for audiophiles (custom reverbs, DSP).
-6. Legal: privacy policy, ToS.
-7. Security hardening: headers, log scrubbing of state tokens.
+1. REVOKE/rotate Google client secret (manual, blocking security).
+2. Set privacy-policy URL in Google Cloud Console consent screen (manual).
+3. Live smoke: register account → grant claims → login from second browser.
+4. Verifier erasure after callback exchange + log-scrub regression test.
+5. ReplayGain 2.0/LUFS loudness scan; room correction (deferred DSP).
+6. Matching-quality metric for imports (offline harness).
 
 ## Architecture reminder
 - Single-origin deployment: API serves web shell from `/` (SPA fallback), so cookies are first-party. `render.yaml` blueprint.
