@@ -893,6 +893,15 @@ async fn callback(
             return fail(StatusCode::BAD_GATEWAY);
         }
     };
+    // The refresh token is what keeps later imports working after the
+    // ~1h access-token expiry. Google omits it when it believes the consent
+    // did not request offline access; log its presence so a connect that
+    // cannot self-refresh is identifiable immediately.
+    tracing::warn!(
+        provider,
+        has_refresh_token = tokens.refresh_token.is_some(),
+        "oauth tokens received from provider"
+    );
     let token_bytes = match tokens.encode_native() {
         Ok(x) => x,
         Err(e) => {
