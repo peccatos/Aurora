@@ -1,0 +1,59 @@
+# Render Blueprint for the Aurora web app (single-origin).
+#
+# The web shell is served by the API service itself (the Docker image builds
+# the Vite bundle and the API serves it as the SPA fallback), so the browser
+# stays on one origin and the OAuth session/CSRF cookies are first-party.
+# A split frontend/API deployment does not work: *.onrender.com subdomains
+# are distinct sites per the Public Suffix List, so the cookies would be
+# third-party and blocked by modern browsers.
+#
+# Before deploying:
+#  1. Create the two OAuth apps (Spotify dev console, Google Cloud Console)
+#     and set the redirect URIs to:
+#       https://aurora-api-3.onrender.com/api/oauth/spotify/callback
+#       https://aurora-api-3.onrender.com/api/oauth/youtube-music/callback
+#  2. Generate the encryption key:  openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+#     and set it as the AURORA_OAUTH_ENCRYPTION_KEY secret below.
+#
+# The SQLite database lives on the attached disk (/data) so OAuth grants
+# survive restarts. Render free instances reboot daily but keep disks.
+# Note: free instances spin down after inactivity; the first request after
+# a cold start takes ~30s.
+
+services:
+  - type: web
+    name: aurora-api
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: AURORA_API_ALLOWED_ORIGINS
+        value: https://aurora-api-3.onrender.com
+      - key: AURORA_API_FRONTEND_URL
+        value: https://aurora-api-3.onrender.com/settings/accounts
+      - key: AURORA_OAUTH_ENCRYPTION_KEY
+        sync: false # base64url of 32 random bytes
+      - key: AURORA_DATABASE_PATH
+        value: /data/aurora.db
+      - key: AURORA_SPOTIFY_ENABLED
+        value: true
+      - key: AURORA_SPOTIFY_CLIENT_ID
+        sync: false
+      - key: AURORA_SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: AURORA_SPOTIFY_REDIRECT_URI
+        sync: false # https://aurora-api-3.onrender.com/api/oauth/spotify/callback
+      - key: AURORA_YOUTUBE_MUSIC_ENABLED
+        value: true
+      - key: AURORA_YOUTUBE_MUSIC_CLIENT_ID
+        sync: false
+      - key: AURORA_YOUTUBE_MUSIC_CLIENT_SECRET
+        sync: false
+      - key: AURORA_YOUTUBE_MUSIC_REDIRECT_URI
+        sync: false # https://aurora-api-3.onrender.com/api/oauth/youtube-music/callback
+    disk:
+      name: aurora-data
+      mountPath: /data
+      sizeGB: 1
