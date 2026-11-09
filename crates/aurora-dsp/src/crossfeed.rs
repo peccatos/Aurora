@@ -85,13 +85,11 @@ impl Crossfeed {
         }
         let (a, g) = (self.a, self.g);
         let (mut lp_l, mut lp_r) = (self.lp_l, self.lp_r);
-        for frame in samples.chunks_exact_mut(2) {
-            let left = frame[0];
-            let right = frame[1];
-            lp_l += a * (left - lp_l);
-            lp_r += a * (right - lp_r);
-            frame[0] = left + g * lp_r;
-            frame[1] = right + g * lp_l;
+        for [left, right] in samples.as_chunks_mut::<2>().0 {
+            lp_l += a * (*left - lp_l);
+            lp_r += a * (*right - lp_r);
+            *left += g * lp_r;
+            *right += g * lp_l;
         }
         self.lp_l = lp_l;
         self.lp_r = lp_r;

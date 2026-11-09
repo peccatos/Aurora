@@ -372,29 +372,27 @@ pub(crate) async fn playlist_detail(
         }
     };
     // Session gate above passed; tokens are keyed by the long-lived user
-    // cookie so a rotated session still reaches the stored grant.
-    let session_hash = match crate::user_token(&headers) {
-        Some(x) => hash(&x),
+    // identity (a login session's account hash when logged in, else the
+    // anonymous user cookie) so a rotated session still reaches the grant.
+    let user_hash = match crate::resolve_user_hash(&state, &headers).await {
+        Some(x) => x,
         None => return fail(StatusCode::UNAUTHORIZED),
     };
-    let ciphertext = match aurora_storage::get_oauth_token_ciphertext(
-        &state.pool,
-        &session_hash,
-        &path.provider,
-    )
-    .await
-    {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            tracing::warn!(
-                provider = %path.provider,
-                user = %&session_hash[..8],
-                "playlist detail: no stored tokens for this user"
-            );
-            return fail(StatusCode::NOT_FOUND);
-        }
-        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
-    };
+    let ciphertext =
+        match aurora_storage::get_oauth_token_ciphertext(&state.pool, &user_hash, &path.provider)
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                tracing::warn!(
+                    provider = %path.provider,
+                    user = %&user_hash[..8],
+                    "playlist detail: no stored tokens for this user"
+                );
+                return fail(StatusCode::NOT_FOUND);
+            }
+            Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+        };
     let plaintext = match aurora_storage::decrypt_oauth_tokens(&state.encryption_key, &ciphertext) {
         Ok(value) => value,
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
@@ -436,7 +434,7 @@ pub(crate) async fn playlist_detail(
     let mut detail_http: Box<dyn aurora_providers::playlist::Http + Send> = Box::new(detail_http);
     // Refresh serialization key: opaque, derived from the same hashes the
     // credential rows are keyed by. No token material crosses here.
-    let refresh_key = format!("{session_hash}:{}", path.provider);
+    let refresh_key = format!("{user_hash}:{}", path.provider);
     let result = if path.provider == "spotify" {
         spotify_detail(
             &mut tokens,
@@ -462,7 +460,7 @@ pub(crate) async fn playlist_detail(
     // interpreted, so a failed detail request cannot discard them.
     let persisted = crate::persist_after_request(
         &state,
-        &session_hash,
+        &user_hash,
         &path.provider,
         &tokens,
         result.as_ref().err(),
@@ -470,7 +468,7 @@ pub(crate) async fn playlist_detail(
     .await;
     let mut detail = match result {
         Ok(value) => value,
-        Err(error) => return provider_error(error, &state, &session_hash, &path.provider).await,
+        Err(error) => return provider_error(error, &state, &user_hash, &path.provider).await,
     };
     if !persisted {
         return fail(StatusCode::INTERNAL_SERVER_ERROR);

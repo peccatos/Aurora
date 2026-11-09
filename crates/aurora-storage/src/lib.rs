@@ -314,13 +314,12 @@ pub async fn get_oauth_token_ciphertext(
     user_hash: &str,
     provider: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
-    let row = sqlx::query(
-        "SELECT token_ciphertext FROM oauth_accounts WHERE user_hash=? AND provider=?",
-    )
-    .bind(user_hash)
-    .bind(provider)
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        sqlx::query("SELECT token_ciphertext FROM oauth_accounts WHERE user_hash=? AND provider=?")
+            .bind(user_hash)
+            .bind(provider)
+            .fetch_optional(pool)
+            .await?;
     match row {
         Some(x) => Ok(Some(x.try_get::<Vec<u8>, _>("token_ciphertext")?)),
         None => Ok(None),
@@ -360,6 +359,168 @@ pub async fn delete_oauth_account(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Email/password accounts (migration 0007)
+// ---------------------------------------------------------------------------
+
+/// A row of the `users` table.
+#[derive(Debug, Clone)]
+pub struct User {
+    pub id: i64,
+    pub email: String,
+}
+
+/// Insert a new user; `Ok(None)` when the email is already registered.
+///
+/// The UNIQUE constraint is the arbiter (not a pre-read), so two concurrent
+/// registrations of the same email cannot both succeed.
+pub async fn insert_user(
+    pool: &SqlitePool,
+    email: &str,
+    password_hash: &str,
+) -> Result<Option<i64>, StorageError> {
+    // INSERT OR IGNORE: a UNIQUE hit on `email` is the "already registered"
+    // outcome, not an error -- surfaced as `Ok(None)` instead of an Err so a
+    // taken address is a 409 rather than a 500.
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(email)
+    .bind(password_hash)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    // SQLite reuses rowids after a DELETE; LAST_INSERT_ROWID is only
+    // meaningful when a row was actually inserted (rows_affected == 1).
+    Ok((result.rows_affected() == 1).then(|| result.last_insert_rowid()))
+}
+
+pub async fn get_user_by_email(
+    pool: &SqlitePool,
+    email: &str,
+) -> Result<Option<User>, StorageError> {
+    let row = sqlx::query("SELECT id, email FROM users WHERE email=?")
+        .bind(email)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| User {
+        id: r.try_get("id").unwrap_or_default(),
+        email: r.try_get("email").unwrap_or_default(),
+    }))
+}
+
+/// Insert a login session; upsertes by id hash so a re-mint replaces cleanly.
+pub async fn insert_login_session(
+    pool: &SqlitePool,
+    id_hash: &str,
+    user_id: i64,
+    csrf_hash: &str,
+    expires_at: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO login_sessions (id_hash, user_id, csrf_hash, expires_at, created_at) 
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT(id_hash) DO UPDATE SET 
+         user_id=excluded.user_id, csrf_hash=excluded.csrf_hash, 
+         expires_at=excluded.expires_at",
+    )
+    .bind(id_hash)
+    .bind(user_id)
+    .bind(csrf_hash)
+    .bind(expires_at)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// CSRF validation for login sessions: the header token's hash must match the
+/// row's `csrf_hash` while the session is live. Mirrors
+/// `validate_oauth_csrf` exactly.
+pub async fn validate_login_csrf(
+    pool: &SqlitePool,
+    id_hash: &str,
+    csrf_hash: &str,
+    now: &str,
+) -> Result<bool, StorageError> {
+    let row = sqlx::query(
+        "SELECT 1 FROM login_sessions WHERE id_hash=? AND csrf_hash=? AND expires_at>?",
+    )
+    .bind(id_hash)
+    .bind(csrf_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// The user a live login session belongs to. `Ok(None)` means no such session
+/// or it is expired; the caller cannot distinguish the two, by design.
+pub async fn get_login_session(
+    pool: &SqlitePool,
+    id_hash: &str,
+    now: &str,
+) -> Result<Option<i64>, StorageError> {
+    let row = sqlx::query("SELECT user_id FROM login_sessions WHERE id_hash=? AND expires_at>?")
+        .bind(id_hash)
+        .bind(now)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get("user_id").ok()))
+}
+
+/// The stored password hash (PHC string) for a user id. Separate from the
+/// `User` read so login can fetch exactly the one credential it verifies.
+pub async fn get_user_password_hash(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<String>, StorageError> {
+    let row = sqlx::query("SELECT password_hash FROM users WHERE id=?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get("password_hash").ok()))
+}
+
+pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<Option<User>, StorageError> {
+    let row = sqlx::query("SELECT id, email FROM users WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| User {
+        id: r.try_get("id").unwrap_or_default(),
+        email: r.try_get("email").unwrap_or_default(),
+    }))
+}
+
+pub async fn delete_login_session(pool: &SqlitePool, id_hash: &str) -> Result<(), StorageError> {
+    sqlx::query("DELETE FROM login_sessions WHERE id_hash=?")
+        .bind(id_hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Moves every stored OAuth grant from one user hash to another, in one
+/// transaction. Idempotent: re-claiming an already-moved hash is a no-op.
+/// Grants already owned by `new_user_hash` stay exactly where they are.
+pub async fn claim_grants(
+    pool: &SqlitePool,
+    old_user_hash: &str,
+    new_user_hash: &str,
+) -> Result<u64, StorageError> {
+    let mut tx = pool.begin().await?;
+    let affected =
+        sqlx::query("UPDATE oauth_accounts SET user_hash=? WHERE user_hash=? AND user_hash<>?")
+            .bind(new_user_hash)
+            .bind(old_user_hash)
+            .bind(new_user_hash)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    tx.commit().await?;
+    Ok(affected)
 }
 
 // ---------------------------------------------------------------------------
