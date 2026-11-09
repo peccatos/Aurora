@@ -1006,6 +1006,14 @@ async fn callback(
             return fail(StatusCode::BAD_REQUEST);
         }
     };
+    // The transaction is now consumed: the authorization code is single-use,
+    // so this verifier can never redeem anything again. Erase it at rest
+    // (best-effort: a failed scrub must not fail an otherwise-successful
+    // connect) while the row itself is retained for replay detection.
+    let state_hash = hash(&query.state);
+    if let Err(e) = aurora_storage::clear_oauth_verifier(&state.pool, &state_hash).await {
+        tracing::warn!(provider, error = %e, "oauth callback: verifier scrub failed");
+    }
     let verifier = tx.verifier;
     let redirect_uri = tx.redirect_uri;
     let settings = match provider_settings(&state.config, &provider) {

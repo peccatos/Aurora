@@ -265,6 +265,24 @@ pub async fn claim_oauth_transaction(
         expires_at: x.try_get("expires_at").unwrap_or_default(),
     }))
 }
+/// Erases the PKCE verifier of a consumed OAuth transaction.
+///
+/// The consumed row is retained (replay detection needs it; see
+/// [`cleanup_expired_oauth`]) but the verifier is a credential: once the
+/// transaction is claimed the code is single-use and the verifier can never
+/// redeem anything again, so leaving it in the clear at rest is pure
+/// exposure. An unconsumed row is left untouched - its verifier is still
+/// live for a pending callback. Idempotent: scrubbing twice is fine.
+pub async fn clear_oauth_verifier(pool: &SqlitePool, state_hash: &str) -> Result<(), StorageError> {
+    sqlx::query(
+        "UPDATE oauth_transactions SET verifier='' WHERE state_hash=? AND consumed_at IS NOT NULL",
+    )
+    .bind(state_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn save_oauth_account(
     pool: &SqlitePool,
     user_hash: &str,
@@ -1194,5 +1212,62 @@ mod tests {
         let all = all_tracks(&pool).await.unwrap();
         assert!((all[0].replaygain_track_db.unwrap() + 6.53).abs() < 1e-9);
         assert!((all[0].replaygain_album_db.unwrap() + 5.8).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn clear_oauth_verifier_scrubs_only_consumed_rows() {
+        let pool = pool().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = OAuthTransaction {
+            provider: "spotify".into(),
+            session_id_hash: "session-hash".into(),
+            verifier: "live-verifier".into(),
+            redirect_uri: "https://api.example/api/oauth/spotify/callback".into(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+        };
+        save_oauth_transaction(&pool, "hash-consumed", &tx)
+            .await
+            .unwrap();
+        save_oauth_transaction(&pool, "hash-pending", &tx)
+            .await
+            .unwrap();
+
+        // Scrubbing before the claim must not touch the pending verifier.
+        clear_oauth_verifier(&pool, "hash-pending").await.unwrap();
+        assert_eq!(
+            stored_verifier(&pool, "hash-pending").await,
+            "live-verifier"
+        );
+
+        let claimed =
+            claim_oauth_transaction(&pool, "hash-consumed", "spotify", "session-hash", &now)
+                .await
+                .unwrap()
+                .expect("the transaction is claimable");
+        assert_eq!(
+            claimed.verifier, "live-verifier",
+            "the claim still returns the verifier"
+        );
+
+        clear_oauth_verifier(&pool, "hash-consumed").await.unwrap();
+        assert_eq!(
+            stored_verifier(&pool, "hash-consumed").await,
+            "",
+            "the consumed verifier must be erased"
+        );
+        // Idempotent: a second scrub is a no-op, not an error.
+        clear_oauth_verifier(&pool, "hash-consumed").await.unwrap();
+        // An unknown state hash is also fine (never existed or already pruned).
+        clear_oauth_verifier(&pool, "hash-unknown").await.unwrap();
+    }
+
+    async fn stored_verifier(pool: &SqlitePool, state_hash: &str) -> String {
+        let row: (String,) =
+            sqlx::query_as("SELECT verifier FROM oauth_transactions WHERE state_hash=?")
+                .bind(state_hash)
+                .fetch_one(pool)
+                .await
+                .expect("transaction row exists");
+        row.0
     }
 }
