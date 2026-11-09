@@ -381,7 +381,11 @@ pub(crate) async fn playlist_detail(
     {
         Ok(Some(value)) => value,
         Ok(None) => {
-            tracing::warn!(provider = %path.provider, "playlist detail: no stored tokens for this session");
+            tracing::warn!(
+                provider = %path.provider,
+                session = %&session_hash[..8],
+                "playlist detail: no stored tokens for this session"
+            );
             return fail(StatusCode::NOT_FOUND);
         }
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),

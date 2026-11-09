@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use url::Url;
 
 /// Directory the built web shell is baked into the image at (Dockerfile
@@ -970,7 +970,12 @@ async fn callback(
     .await
     {
         Ok(()) => {
-            tracing::info!(provider, subject = %account.subject, "oauth account connected");
+            tracing::info!(
+        provider,
+        subject = %account.subject,
+        session = %&hash(&sid)[..8],
+        "oauth account connected"
+    );
         }
         Err(e) => {
             tracing::error!(provider, error = %e, "oauth callback: account save failed");
