@@ -29,8 +29,8 @@
   (локальная копия `.aurora_encryption_key_local.txt`, в gitignore).
   Старые гранты нечитаемы — **пользователь должен переподключить аккаунт один раз**
   после деплоя миграции 0006 (ожидаемо, записано в логах деплоя).
-- **Google client secret сменён** (`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`),
-  старый `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` отозван в Google Cloud Console.
+- **Google client secret сменён** (значение — только в Render env vars / Google
+  Cloud Console), старый отозван в Google Cloud Console.
 - **Rate limiter — in-process** (документировано, масштабирование — общий стор).
 - **Consent screen в Production** — refresh-токены не истекают через 7 дней.
 - **Rate limiter — in-process.** Задокументировано, но при масштабировании на
