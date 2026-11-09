@@ -108,6 +108,8 @@ pub enum AudioTransformation {
     Crossfeed,
     /// Partitioned time-domain convolution reverb (impulse response mixing).
     Convolution,
+    /// User-loaded room correction filters (REW parametric EQ import).
+    RoomCorrection,
 }
 
 // ---------------------------------------------------------------------------

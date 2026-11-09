@@ -4,6 +4,8 @@ import { app, setToast } from "../state";
 import { invoke, platform, setConvolutionIr } from "../invoke";
 import { kvPut } from "../library-db";
 import { resetDspProfile, saveDspProfile } from "../dsp-profiles";
+import { formatCorrectionFilter, parseRewFilters, RewParseError } from "../rew-parser";
+import type { CorrectionFilter } from "../rew-parser";
 import type { DspConfig } from "../types";
 
 type ToolKey = "balance" | "stereo_width" | "soft_clip";
@@ -55,6 +57,22 @@ function convolutionActive(d: DspConfig): boolean {
   return d.convolution?.enabled === true && d.convolution.ir_id > 0;
 }
 
+const defaultRoomCorrection = () => ({ enabled: false, filters: [] as CorrectionFilter[] });
+
+function ensureRoomCorrection(d: DspConfig) {
+  d.room_correction ??= defaultRoomCorrection();
+  d.room_correction.enabled = Boolean(d.room_correction.enabled);
+  d.room_correction.filters = Array.isArray(d.room_correction.filters)
+    ? d.room_correction.filters
+    : [];
+  return d;
+}
+
+function roomCorrectionActive(d: DspConfig): boolean {
+  ensureRoomCorrection(d);
+  return d.room_correction?.enabled === true && d.room_correction.filters.length > 0;
+}
+
 const defaultTools = () => ({
   balance: 0,
   phase_invert_left: false,
@@ -90,6 +108,7 @@ export const effectsPage: Page = {
     ensureTools(d);
     ensureCrossfeed(d);
     const cv = ensureConvolution(d).convolution!;
+    const rc = ensureRoomCorrection(d).room_correction!;
     const cf = ensureCrossfeed(d).crossfeed!;
     const currentTrack = app.selectedPath;
     root.innerHTML = `
@@ -142,6 +161,13 @@ export const effectsPage: Page = {
           <p class="hint" id="conv-ir-note">Built-in presets are synthetic (generated in Rust, no licensed assets). A user IR is decoded to f32, capped at 10 s / 5 MB, and mono is upmixed. Web only for now.</p>
         </div>
         <div class="eq-card">
+          <header class="card-head"><div><p class="overline">REW parametric import</p><h2>Room correction (REW)</h2></div><strong id="rc-state"></strong></header>
+          <label class="ctl"><input id="rc-enabled" type="checkbox"> Enable room correction</label>
+          <label class="ctl">Load REW filter export <input id="rc-file" type="file" accept=".txt,text/plain"></label>
+          <div id="rc-filters" class="ctl" style="display:grid;gap:2px"></div>
+          <p class="hint" id="rc-note">Export "Filter as text" from REW (Room EQ Wizard). Filters apply as a biquad cascade after convolution; PK/LS/HS only, max 32 filters, bounds-checked (out-of-range files are rejected, not clamped).</p>
+        </div>
+        <div class="eq-card">
           <p class="overline">Per-track profile</p>
           <p class="hint" id="current-track-label"></p>
           <div class="page-actions">
@@ -164,6 +190,8 @@ export const effectsPage: Page = {
       if (cfState) cfState.textContent = crossfeedActive(d) ? "ACTIVE · transformed" : "BYPASSED · bit-exact";
       const cvState = root.querySelector<HTMLElement>("#conv-state");
       if (cvState) cvState.textContent = convolutionActive(d) ? "ACTIVE · transformed" : "BYPASSED · bit-exact";
+      const rcState = root.querySelector<HTMLElement>("#rc-state");
+      if (rcState) rcState.textContent = roomCorrectionActive(d) ? "ACTIVE · transformed" : "BYPASSED · bit-exact";
     };
     // Serialize IPC writes so a slower slider update cannot finish after a
     // newer one and leave the kernel with stale settings.
@@ -307,12 +335,57 @@ export const effectsPage: Page = {
         irFile.value = "";
       });
     }
+    // --- Room correction (REW) card ---
+    const rcFilters = root.querySelector<HTMLElement>("#rc-filters");
+    const drawFilters = () => {
+      if (!rcFilters) return;
+      rcFilters.innerHTML = "";
+      for (const f of rc.filters) {
+        const line = document.createElement("p");
+        line.className = "hint";
+        line.textContent = formatCorrectionFilter(f);
+        rcFilters.appendChild(line);
+      }
+    };
+    drawFilters();
+    const rcEnabled = root.querySelector<HTMLInputElement>("#rc-enabled");
+    if (rcEnabled) {
+      rcEnabled.checked = rc.enabled;
+      rcEnabled.addEventListener("change", () => { rc.enabled = rcEnabled.checked; save(); });
+    }
+    const rcFile = root.querySelector<HTMLInputElement>("#rc-file");
+    if (rcFile) {
+      rcFile.addEventListener("change", async () => {
+        const file = rcFile.files?.[0];
+        if (!file) return;
+        const note = root.querySelector<HTMLElement>("#rc-note");
+        try {
+          if (file.size > 1024 * 1024) throw new Error("file exceeds the 1 MB cap");
+          const text = await file.text();
+          // Frontend parse for validation + preview; the kernel applies the
+          // same filters from DspConfig (mirrored parser, tested identical).
+          const filters: CorrectionFilter[] = parseRewFilters(text);
+          rc.filters = filters;
+          rc.enabled = true;
+          if (rcEnabled) rcEnabled.checked = true;
+          drawFilters();
+          if (note) note.textContent = `REW import ok: ${filters.length} filters loaded.`;
+          save();
+        } catch (e: unknown) {
+          const msg = e instanceof RewParseError ? e.message : String(e);
+          if (note) note.textContent = `REW import failed: ${msg}`;
+          setToast(`Room correction import failed: ${msg}`);
+        }
+        rcFile.value = "";
+      });
+    }
     drawState();
 
     root.querySelector<HTMLButtonElement>("#tool-reset")?.addEventListener("click", () => {
       d.tools = defaultTools();
       d.crossfeed = defaultCrossfeed();
       d.convolution = defaultConvolution();
+      d.room_correction = defaultRoomCorrection();
       void save();
       effectsPage.mount(root);
     });

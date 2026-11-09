@@ -45,6 +45,16 @@ function ensureConvolution(d: DspConfig): DspConfig {
   return d;
 }
 
+/** Legacy profiles (pre-room-correction) round-trip with disabled defaults. */
+function ensureRoomCorrection(d: DspConfig): DspConfig {
+  d.room_correction ??= { enabled: false, filters: [] };
+  d.room_correction.enabled = Boolean(d.room_correction.enabled);
+  d.room_correction.filters = Array.isArray(d.room_correction.filters)
+    ? d.room_correction.filters
+    : [];
+  return d;
+}
+
 /** Legacy profiles (pre-crossfeed) round-trip with disabled defaults. */
 function ensureCrossfeed(d: DspConfig): DspConfig {
   d.crossfeed ??= defaultCrossfeed();
@@ -67,7 +77,7 @@ export async function getDspProfiles(): Promise<Profiles> {
       const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
       profiles = raw ? (JSON.parse(raw) as Profiles) : {};
     }
-    Object.values(profiles).forEach((d) => ensureConvolution(ensureCrossfeed(d)));
+    Object.values(profiles).forEach((d) => ensureRoomCorrection(ensureConvolution(ensureCrossfeed(d))));
     return profiles;
   } catch { return {}; }
 }

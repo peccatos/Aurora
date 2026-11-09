@@ -46,6 +46,15 @@ export interface DspConfig {
     predelay_ms: number;
     ir_gain_db: number;
   };
+  room_correction?: {
+    enabled: boolean;
+    filters: {
+      kind: "pk" | "ls" | "hs";
+      fc_hz: number;
+      gain_db: number;
+      q: number;
+    }[];
+  };
 }
 
 export interface QueueTrack {

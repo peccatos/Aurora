@@ -18,6 +18,7 @@ pub mod lufs;
 pub mod pipeline;
 pub mod resample;
 pub mod reverb;
+pub mod room_correction;
 pub mod tools;
 
 pub use biquad::{Biquad, BiquadKind, BiquadParams};
@@ -29,4 +30,7 @@ pub use gain::{Gain, ReplayGainMode, TpdfDither};
 pub use pipeline::{DspConfig, DspPipeline, ReplayGainModeDef};
 pub use resample::Resampler;
 pub use reverb::Reverb;
+pub use room_correction::{
+    CorrectionFilter, CorrectionFilterKind, RoomCorrection, RoomCorrectionParams, parse_rew_filters,
+};
 pub use tools::{Tools, ToolsParams};
