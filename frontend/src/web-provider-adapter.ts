@@ -126,11 +126,51 @@ function authorizationUrl(provider: WebProvider, value: unknown): string {
   return url.href;
 }
 
+/**
+ * Single-flight session bootstrap: on a 401 (8h session cookie expired),
+ * POST /begin once — the server re-mints the expired session and its CSRF
+ * cookie without requiring the old CSRF token (unknown/expired session
+ * path) — then the caller retries its original request. Parallel 401s
+ * share one re-mint; the in-flight guard is released in a microtask so a
+ * later genuine 401 can bootstrap again instead of being masked.
+ */
+let bootstrapInFlight: Promise<boolean> | null = null;
+
+async function bootstrapSession(apiBase: URL): Promise<boolean> {
+  if (!bootstrapInFlight) {
+    bootstrapInFlight = (async () => {
+      try {
+        // The session is provider-independent (any begin re-mints it for all
+        // endpoints); spotify is used purely as a valid route segment.
+        const url = new URL(apiBase.href);
+        url.pathname = `${url.pathname.replace(/\/+$/, "")}/api/oauth/spotify/begin`;
+        const token = csrfToken();
+        const res = await fetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Accept: "application/json",
+            Origin: apiBase.origin,
+            ...(token ? { "X-CSRF-Token": token } : {}),
+          },
+        });
+        return res.ok;
+      } catch {
+        return false;
+      } finally {
+        queueMicrotask(() => { bootstrapInFlight = null; });
+      }
+    })();
+  }
+  return bootstrapInFlight;
+}
+
 async function requestJson(
   apiBase: URL,
   path: string,
   init?: RequestInit,
   query?: Record<string, string | null | undefined>,
+  retried = false,
 ): Promise<unknown> {
   const url = new URL(apiBase.href);
   url.pathname = `${apiBase.pathname.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
@@ -139,7 +179,6 @@ async function requestJson(
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value !== null && value !== undefined && value !== "") url.searchParams.set(key, value);
   }
-  const method = (init?.method ?? "GET").toUpperCase();
   // Echo the session-bound token from the readable cookie whenever present.
   // Non-GET calls must carry it (server rejects otherwise); the playlist
   // detail endpoint additionally requires it on GET as a read-driving
@@ -159,6 +198,16 @@ async function requestJson(
   });
   if (!response.ok) {
     if (response.status === 404) return undefined;
+    // An expired 8h session is the normal daily state on the web shell; the
+    // server re-mints it on `begin`, so retry exactly once before surfacing
+    // an error. csrfToken() reads the fresh cookie at retry time.
+    if (response.status === 401 && !retried) {
+      const renewed = await bootstrapSession(apiBase);
+      if (renewed) {
+        return requestJson(apiBase, path, init, query, true);
+      }
+      throw new Error("Session expired and renewal failed — reconnect the account in Settings");
+    }
     throw new Error(`OAuth service request failed (${response.status})`);
   }
   return response.status === 204 ? null : readJson(response);

@@ -441,6 +441,39 @@ pub fn router(state: AppState) -> Router {
         )
 
         .layer(middleware::from_fn(guard::bounded_body))
+        // Security headers (reviewed against the built web shell):
+        // - CSP: scripts only from self (the Vite bundle has no inline
+        //   scripts); styles need 'unsafe-inline' because pages use inline
+        //   style attributes; connect-src self covers same-origin API calls
+        //   plus the provider/token/translation endpoints the shell reaches;
+        //   media/img allow the data: artwork URLs and https sources.
+        // - X-Frame-Options + frame-ancestors: the shell is never framed.
+        // - HSTS: the service is HTTPS-only on Render.
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: https:; media-src 'self' data: blob:; \
+                 connect-src 'self' https://api.spotify.com https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com https://openidconnect.googleapis.com https://translate.disroot.org https://libretranslate.com; \
+                 font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            ),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(origins)
