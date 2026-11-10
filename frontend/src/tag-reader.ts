@@ -29,6 +29,52 @@ export interface TrackTags {
   /** Embedded cover art (ID3v2 APIC / FLAC picture / MP4 covr), when
    *  present: MIME format + raw picture bytes. */
   picture: { format: string; data: Uint8Array } | null;
+  /** Embedded lyrics (USLT / Vorbis LYRICS / MP4 ©lyr) — plain or
+   *  LRC-formatted text, when tagged. */
+  lyrics: string | null;
+  /** Detected lyrics language ('ru' / 'en' by script heuristic, else null). */
+  lyricsLanguage: string | null;
+}
+
+/** music-metadata v12 exposes common.lyrics as ILyricsTag[] with either
+ *  plain `text` or `syncText` entries. Flatten to one usable text blob. */
+export function extractLyricsText(
+  tags: ReadonlyArray<{ text?: string; syncText?: ReadonlyArray<{ text: string; timestamp?: number }> }>,
+): string | null {
+  for (const tag of tags) {
+    const text = tag.text?.trim();
+    if (text) return text;
+    const sync = tag.syncText;
+    if (sync?.length) {
+      const lines = sync
+        .filter((l) => l.text?.trim())
+        .map((l) => (l.timestamp != null ? `[${lrcStamp(l.timestamp)}]${l.text}` : l.text));
+      const joined = lines.join("\n").trim();
+      if (joined) return joined;
+    }
+  }
+  return null;
+}
+
+function lrcStamp(timestampS: number): string {
+  const m = Math.floor(timestampS / 60);
+  const s = Math.floor(timestampS % 60);
+  const cs = Math.round((timestampS - Math.floor(timestampS)) * 100);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+}
+
+/** Script heuristic: Cyrillic vs Latin by letter counts, else null. */
+export function detectLyricsLanguage(text: string): string | null {
+  let cyr = 0;
+  let lat = 0;
+  for (const ch of text) {
+    if (/[Ѐ-ӿ]/.test(ch)) cyr += 1;
+    else if (/[A-Za-zÀ-ɏ]/.test(ch)) lat += 1;
+  }
+  if (cyr === 0 && lat === 0) return null;
+  if (cyr > lat) return "ru";
+  if (lat > cyr) return "en";
+  return null;
 }
 
 export async function readTrackTags(file: File): Promise<TrackTags> {
@@ -44,6 +90,7 @@ export async function readTrackTags(file: File): Promise<TrackTags> {
       ),
     ]);
     const c = mm.common;
+    const lyricsText = c.lyrics ? extractLyricsText(c.lyrics) : null;
     return {
       title: c.title?.trim() || null,
       artist: c.artist?.trim() || c.albumartist?.trim() || null,
@@ -60,6 +107,8 @@ export async function readTrackTags(file: File): Promise<TrackTags> {
       picture: c.picture?.[0]?.data
         ? { format: c.picture[0].format, data: c.picture[0].data }
         : null,
+      lyrics: lyricsText,
+      lyricsLanguage: lyricsText ? detectLyricsLanguage(lyricsText) : null,
     };
   } catch {
     // Corrupt/unknown tags: honest empties, filename fallback stays.
@@ -77,6 +126,8 @@ export async function readTrackTags(file: File): Promise<TrackTags> {
       codec: null,
       bitrateKbps: null,
       picture: null,
+      lyrics: null,
+      lyricsLanguage: null,
     };
   }
 }

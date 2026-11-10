@@ -33,6 +33,7 @@ const ENCRYPTION_KEY: [u8; 32] = [7u8; 32];
 const USER_COOKIE: &str = "__Host-aurora_user";
 const SESSION_COOKIE: &str = "__Host-aurora_session";
 const CSRF_COOKIE: &str = "__Host-aurora_csrf";
+const AUTH_COOKIE: &str = "__Host-aurora_auth";
 const CSRF_HEADER: &str = "x-csrf-token";
 
 /// Mirrors the API's own `hash`: base64url(SHA-256(value)).
@@ -160,6 +161,7 @@ impl Harness {
 fn config() -> Config {
     Config {
         allowed_origins: vec![ORIGIN.into()],
+        registration_open: true,
         frontend_url: FRONTEND.into(),
         spotify: Some(ProviderSettings {
             client_id: "spotify-client-id".into(),
@@ -338,10 +340,7 @@ fn query_params(url: &str) -> HashMap<String, String> {
 
 /// Drives `POST begin` for a provider from a clean (session-less) client and
 /// returns the session id, the CSRF token, the `Set-Cookie` headers and body.
-async fn begin(
-    app: &axum::Router,
-    provider: &str,
-) -> (String, String, String, Vec<String>, Value) {
+async fn begin(app: &axum::Router, provider: &str) -> (String, String, String, Vec<String>, Value) {
     let response = send(
         app,
         request(Method::POST, &format!("/api/oauth/{provider}/begin"))
@@ -607,6 +606,7 @@ async fn begin_rejects_an_unconfigured_provider_and_accepts_youtube_when_configu
     let state = aurora_api::test_state(
         Config {
             allowed_origins: vec![ORIGIN.into()],
+            registration_open: true,
             frontend_url: FRONTEND.into(),
             spotify: None,
             youtube: Some(ProviderSettings {
@@ -836,9 +836,7 @@ async fn callback_rejects_a_missing_or_empty_code() {
         format!("state={state}&code="),
         format!("state={state}&error="),
     ] {
-        let response = callback(
-        &h.app,
-        Some(&cookies_hdr), &query).await;
+        let response = callback(&h.app, Some(&cookies_hdr), &query).await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -909,7 +907,10 @@ async fn callback_rejects_an_expired_transaction() {
 
     let response = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         h.transport.calls(),
@@ -928,14 +929,20 @@ async fn callback_rejects_a_replayed_state() {
 
     let first = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
     assert_eq!(first.status(), StatusCode::SEE_OTHER);
     let calls_after_first = h.transport.calls();
     let tokens_after_first = token_ciphertext(&h, &raw_hash(&uid)).await;
 
     let replay = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
     assert_eq!(
         replay.status(),
         StatusCode::BAD_REQUEST,
@@ -954,7 +961,12 @@ async fn callback_rejects_a_replayed_state() {
     // The session itself stays usable.
     let status = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &cookies_hdr, &csrf),
+        authed(
+            Method::GET,
+            "/api/oauth/spotify/status",
+            &cookies_hdr,
+            &csrf,
+        ),
     )
     .await;
     assert_eq!(status.status(), StatusCode::OK);
@@ -968,7 +980,10 @@ async fn callback_reports_a_provider_failure_as_bad_gateway() {
     let state = authorization_state(&body);
     let response = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
@@ -981,7 +996,10 @@ async fn callback_reports_a_malformed_token_response_as_bad_gateway() {
     let state = authorization_state(&body);
     let response = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_tokens(None, &h, &raw_hash(&uid)).await;
 }
@@ -998,7 +1016,10 @@ async fn successful_callback_persists_sanitized_account_metadata() {
     let state = authorization_state(&body);
     let response = callback(
         &h.app,
-        Some(&cookies_hdr), &format!("state={state}&code=auth-code")).await;
+        Some(&cookies_hdr),
+        &format!("state={state}&code=auth-code"),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
@@ -1045,7 +1066,9 @@ async fn successful_callback_persists_sanitized_account_metadata() {
             raw[column]
         );
     }
-    let ciphertext = token_ciphertext(&h, &raw_hash(&uid)).await.expect("token stored");
+    let ciphertext = token_ciphertext(&h, &raw_hash(&uid))
+        .await
+        .expect("token stored");
     assert!(
         !ciphertext
             .windows(b"secret-access-token".len())
@@ -1063,7 +1086,12 @@ async fn successful_callback_persists_sanitized_account_metadata() {
     // The status endpoint answers with the sanitized account only.
     let status = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/status", &cookies_hdr, &csrf),
+        authed(
+            Method::GET,
+            "/api/oauth/spotify/status",
+            &cookies_hdr,
+            &csrf,
+        ),
     )
     .await;
     assert_eq!(status.status(), StatusCode::OK);
@@ -1235,7 +1263,12 @@ async fn status_reports_not_found_for_a_provider_without_an_account() {
 
     let missing = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/youtube-music/status", &cookies, &csrf),
+        authed(
+            Method::GET,
+            "/api/oauth/youtube-music/status",
+            &cookies,
+            &csrf,
+        ),
     )
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
@@ -1297,7 +1330,12 @@ async fn disconnect_requires_session_bound_csrf_and_an_allowed_origin() {
 
     let wrong_csrf = send(
         &h.app,
-        authed(Method::DELETE, "/api/oauth/spotify", &cookies, "not-the-token"),
+        authed(
+            Method::DELETE,
+            "/api/oauth/spotify",
+            &cookies,
+            "not-the-token",
+        ),
     )
     .await;
     assert_eq!(wrong_csrf.status(), StatusCode::FORBIDDEN);
@@ -1432,7 +1470,12 @@ async fn playlists_requires_origin_session_and_stored_tokens() {
 
     let no_account = send(
         &h.app,
-        authed(Method::GET, "/api/oauth/spotify/playlists", &cookies_hdr, &csrf),
+        authed(
+            Method::GET,
+            "/api/oauth/spotify/playlists",
+            &cookies_hdr,
+            &csrf,
+        ),
     )
     .await;
     assert_eq!(no_account.status(), StatusCode::NOT_FOUND);
@@ -1541,7 +1584,11 @@ async fn playlist_detail_requires_origin_session_csrf_and_stored_tokens() {
 
     let no_csrf = send(
         &h.app,
-        session_only(Method::GET, "/api/oauth/spotify/playlists/abc123", &cookies_hdr),
+        session_only(
+            Method::GET,
+            "/api/oauth/spotify/playlists/abc123",
+            &cookies_hdr,
+        ),
     )
     .await;
     assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
@@ -1857,4 +1904,233 @@ async fn media_metadata_is_rate_limited_under_tiny_ceilings() {
     )
     .await;
     assert_eq!(still_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
+// Email/password auth over the real router (grant claiming, logout, me)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn register_claims_the_anonymous_users_grants() {
+    let h = Harness::new(successful_exchange("claim-access-token")).await;
+    // An anonymous browser connects Spotify first: the callback stores the
+    // grant under the anonymous user cookie hash.
+    let (cookies, uid_hash, _csrf) = connected_session(&h).await;
+    assert!(token_ciphertext(&h, &uid_hash).await.is_some());
+
+    // That browser then registers, still carrying the anonymous cookie: the
+    // grants move to the account hash.
+    let response = send(
+        &h.app,
+        request(Method::POST, "/api/auth/register")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, cookies.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "claimer@example.com",
+                    "password": "long enough pass"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let cookies_set = set_cookies(&response);
+    let _auth_cookie = cookie_value(&cookies_set, AUTH_COOKIE).expect("auth cookie is set");
+    let account_hash = {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT id FROM users WHERE email='claimer@example.com'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+        let id: i64 = row.try_get("id").unwrap();
+        raw_hash(&format!("user:{id}"))
+    };
+    // The grant now belongs to the account; the old anonymous hash has none.
+    assert!(token_ciphertext(&h, &account_hash).await.is_some());
+    assert!(token_ciphertext(&h, &uid_hash).await.is_none());
+}
+
+#[tokio::test]
+async fn register_without_the_anonymous_cookie_does_not_steal_grants() {
+    let h = Harness::new(successful_exchange("victim-access-token")).await;
+    // A victim browser connects Spotify.
+    let (_cookies, uid_hash, _csrf) = connected_session(&h).await;
+    assert!(token_ciphertext(&h, &uid_hash).await.is_some());
+
+    // A different browser (no cookies at all) registers a fresh account: it
+    // has no anonymous cookie, so nothing is claimed.
+    let response = send(
+        &h.app,
+        request(Method::POST, "/api/auth/register")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "other@example.com",
+                    "password": "long enough pass"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    // The victim's grant is untouched.
+    assert!(token_ciphertext(&h, &uid_hash).await.is_some());
+}
+
+#[tokio::test]
+async fn login_and_logout_round_trip_and_me_reflects_it() {
+    let h = Harness::new(vec![]).await;
+    // Register.
+    let response = send(
+        &h.app,
+        request(Method::POST, "/api/auth/register")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "round@example.com",
+                    "password": "long enough pass"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mut set = set_cookies(&response);
+    let auth = cookie_value(&set, AUTH_COOKIE).expect("auth cookie");
+    let csrf = cookie_value(&set, CSRF_COOKIE).expect("csrf cookie");
+
+    // /me sees the session.
+    let me_request = send(
+        &h.app,
+        request(Method::GET, "/api/auth/me")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, format!("{AUTH_COOKIE}={auth}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(me_request.status(), StatusCode::OK);
+    let me_body = body_json(me_request).await;
+    assert_eq!(me_body["authenticated"], true);
+    assert_eq!(me_body["email"], "round@example.com");
+
+    // Logout without the CSRF header is refused.
+    let no_csrf = send(
+        &h.app,
+        request(Method::POST, "/api/auth/logout")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, format!("{AUTH_COOKIE}={auth}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+    // Logout with the CSRF token deletes the session and clears the cookie.
+    let out = send(
+        &h.app,
+        request(Method::POST, "/api/auth/logout")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, format!("{AUTH_COOKIE}={auth}"))
+            .header(CSRF_HEADER, &csrf)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(out.status(), StatusCode::NO_CONTENT);
+    set = set_cookies(&out);
+    let cleared = set
+        .iter()
+        .find(|c| c.starts_with(&format!("{AUTH_COOKIE}=")))
+        .expect("auth cookie is cleared");
+    assert!(cleared.contains("Max-Age=0"));
+
+    // /me now reports anonymous.
+    let me_after = send(
+        &h.app,
+        request(Method::GET, "/api/auth/me")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, format!("{AUTH_COOKIE}={auth}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(me_after.status(), StatusCode::OK);
+    assert_eq!(body_json(me_after).await["authenticated"], false);
+
+    // Login again after logout.
+    let again = send(
+        &h.app,
+        request(Method::POST, "/api/auth/login")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "round@example.com",
+                    "password": "long enough pass"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_endpoints_are_rate_limited() {
+    let pool = aurora_storage::open_in_memory().await.unwrap();
+    let mut state = aurora_api::test_state(
+        config(),
+        pool,
+        ENCRYPTION_KEY,
+        std::sync::Arc::new(ScriptedOAuthService {
+            transport: std::sync::Arc::new(FakeTransport::new(vec![])),
+        }),
+        Box::new(RecordingPlaylistHttp::default()),
+    );
+    aurora_api::with_rate_limits(&mut state, std::time::Duration::from_secs(60), 100, 2);
+    let app = router(state);
+    for i in 0..2 {
+        let response = send(
+            &app,
+            request(Method::POST, "/api/auth/register")
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "email": format!("user{i}@example.com"),
+                        "password": "long enough pass"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "request {i}");
+    }
+    let limited = send(
+        &app,
+        request(Method::POST, "/api/auth/register")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "third@example.com",
+                    "password": "long enough pass"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_json(limited).await["error"], "rate_limited");
 }

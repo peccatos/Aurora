@@ -104,6 +104,12 @@ pub enum AudioTransformation {
     ExternalPlugin,
     /// Portable built-in playback tools such as balance, width, phase, and soft clip.
     EffectTools,
+    /// bs2b-style headphone crossfeed (low-frequency inter-aural bleed).
+    Crossfeed,
+    /// Partitioned time-domain convolution reverb (impulse response mixing).
+    Convolution,
+    /// User-loaded room correction filters (REW parametric EQ import).
+    RoomCorrection,
 }
 
 // ---------------------------------------------------------------------------

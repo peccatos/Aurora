@@ -37,6 +37,7 @@ services:
         sync: false # base64url of 32 random bytes
       - key: AURORA_DATABASE_PATH
         value: /data/aurora.db
+      # AURORA_REGISTRATION_OPEN optional (default true)
       - key: AURORA_SPOTIFY_ENABLED
         value: true
       - key: AURORA_SPOTIFY_CLIENT_ID

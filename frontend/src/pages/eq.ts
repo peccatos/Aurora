@@ -5,6 +5,7 @@ import type { Page } from "../router";
 import { app, setToast } from "../state";
 import type { DspConfig, EqBand, ReverbParams } from "../types";
 import { kvGet, kvPut } from "../library-db";
+import { SURGICAL_MAX_BANDS, SURGICAL_Q_DEFAULT, nextBandCount } from "../eq-surgical";
 
 const BAND_FREQS = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
@@ -36,8 +37,11 @@ function defaultDsp(): DspConfig {
     reverb: { room_size: 0.5, damping: 0.3, wet: 0, width: 1, input_lowpass: 0 },
     speed: 1,
     tools: { balance: 0, phase_invert_left: false, stereo_width: 1, soft_clip: 0 },
+    crossfeed: { enabled: false, cutoff_hz: 700, feed_db: -6.5 },
   };
 }
+
+
 
 async function saveDsp() {
   if (!app.dsp) return;
@@ -61,7 +65,8 @@ function noteText(): string {
     d.eq.preamp_db !== 0 ||
     d.volume_db !== 0 ||
     d.reverb.wet > 0 ||
-    Math.abs(d.speed - 1) > 0.01;
+    Math.abs(d.speed - 1) > 0.01 ||
+    d.crossfeed?.enabled === true;
   return active
     ? "DSP active — transformations reported in the signal path."
     : "Flat EQ = bit-exact passthrough.";
@@ -217,6 +222,98 @@ function render(root: HTMLElement) {
     void saveDsp();
   });
 
+  // Surgical mode: band-count cap is a UI concern — the Rust side
+  // accepts any band count (eq.rs compiles per-band biquads).
+  let surgical = false;
+  let selectedBand = 0;
+  const surgicalToggle = root.querySelector<HTMLInputElement>("#eq-surgical");
+  const surgicalPanel = root.querySelector<HTMLElement>("#eq-surgical-panel");
+  const addBtn = root.querySelector<HTMLButtonElement>("#eq-add-band");
+  const removeBtn = root.querySelector<HTMLButtonElement>("#eq-remove-band");
+  const setSurgical = (on: boolean) => {
+    surgical = on;
+    if (surgicalToggle) surgicalToggle.checked = on;
+    if (surgicalPanel) surgicalPanel.hidden = !on;
+    if (addBtn) addBtn.disabled = !on;
+    if (removeBtn) removeBtn.disabled = !on || d.eq.bands.length <= 1;
+    drawBandControls();
+  };
+  const drawBandControls = () => {
+    const band = d.eq.bands[selectedBand];
+    if (!band) return;
+    const freq = root.querySelector<HTMLInputElement>("#eq-band-freq");
+    const freqV = root.querySelector<HTMLElement>("#eq-band-freq-v");
+    if (freq && freqV) {
+      freq.value = String(Math.round(band.freq_hz));
+      freqV.textContent = band.freq_hz >= 1000 ? `${(band.freq_hz / 1000).toFixed(1)} kHz` : `${Math.round(band.freq_hz)} Hz`;
+    }
+    const q = root.querySelector<HTMLInputElement>("#eq-band-q");
+    const qV = root.querySelector<HTMLElement>("#eq-band-q-v");
+    if (q && qV) {
+      q.value = String(band.q);
+      qV.textContent = `Q ${band.q.toFixed(1)}`;
+    }
+    const gain = root.querySelector<HTMLInputElement>("#eq-band-gain");
+    const gainV = root.querySelector<HTMLElement>("#eq-band-gain-v");
+    if (gain && gainV) {
+      gain.value = String(band.gain_db);
+      gainV.textContent = `${band.gain_db > 0 ? "+" : ""}${band.gain_db.toFixed(1)} dB`;
+    }
+    const kind = root.querySelector<HTMLSelectElement>("#eq-band-kind");
+    if (kind) kind.value = band.kind;
+  };
+  surgicalToggle?.addEventListener("change", () => setSurgical(surgicalToggle.checked));
+  addBtn?.addEventListener("click", () => {
+    if (!surgical || nextBandCount(d.eq.bands.length, true) === null) return;
+    d.eq.bands.push({
+      kind: "peaking",
+      freq_hz: 1000,
+      q: SURGICAL_Q_DEFAULT,
+      gain_db: 0,
+      enabled: true,
+    });
+    selectedBand = d.eq.bands.length - 1;
+    if (removeBtn) removeBtn.disabled = d.eq.bands.length <= 1;
+    update(root);
+    drawBandControls();
+    void saveDsp();
+  });
+  removeBtn?.addEventListener("click", () => {
+    if (!surgical || nextBandCount(d.eq.bands.length, false) === null) return;
+    d.eq.bands.splice(selectedBand, 1);
+    selectedBand = Math.min(selectedBand, d.eq.bands.length - 1);
+    if (removeBtn) removeBtn.disabled = d.eq.bands.length <= 1;
+    update(root);
+    drawBandControls();
+    void saveDsp();
+  });
+  const bandCtl = (
+    id: string,
+    apply: (v: number, b: EqBand) => void,
+    fmt: (v: number) => string,
+  ) => {
+    const el = root.querySelector<HTMLInputElement>(id);
+    const out = root.querySelector<HTMLElement>(`${id}-v`);
+    if (!el || !out) return;
+    el.addEventListener("input", () => {
+      const band = d.eq.bands[selectedBand];
+      if (!band) return;
+      const v = Number.parseFloat(el.value);
+      apply(v, band);
+      out.textContent = fmt(v);
+      void saveDsp();
+    });
+  };
+  bandCtl("#eq-band-freq", (v, b) => (b.freq_hz = v), (v) => `${Math.round(v)} Hz`);
+  bandCtl("#eq-band-q", (v, b) => (b.q = v), (v) => `Q ${v.toFixed(1)}`);
+  bandCtl("#eq-band-gain", (v, b) => (b.gain_db = v), (v) => `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`);
+  root.querySelector<HTMLSelectElement>("#eq-band-kind")?.addEventListener("change", (e) => {
+    const band = d.eq.bands[selectedBand];
+    if (band) band.kind = (e.target as HTMLSelectElement).value as EqBand["kind"];
+    void saveDsp();
+  });
+  setSurgical(false);
+
   const note = root.querySelector<HTMLElement>("#eq-note");
   if (note) note.textContent = noteText();
 }
@@ -268,6 +365,7 @@ export async function loadDsp() {
       if (saved) {
         app.dsp = saved;
         app.dsp.tools ??= { balance: 0, phase_invert_left: false, stereo_width: 1, soft_clip: 0 };
+        app.dsp.crossfeed ??= { enabled: false, cutoff_hz: 700, feed_db: -6.5 };
         try {
           await invoke("set_dsp", { config: saved });
         } catch {

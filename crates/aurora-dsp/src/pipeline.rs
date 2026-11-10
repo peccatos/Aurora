@@ -35,6 +35,15 @@ pub struct DspConfig {
     /// Portable Orchard-inspired playback tools. Defaults to bypassed.
     #[serde(default)]
     pub tools: crate::tools::ToolsParams,
+    /// bs2b-style headphone crossfeed. Defaults to bypassed.
+    #[serde(default)]
+    pub crossfeed: crate::crossfeed::CrossfeedParams,
+    /// Convolution reverb. Defaults to bypassed (ir_id 0).
+    #[serde(default)]
+    pub convolution: crate::convolution::ConvolutionParams,
+    /// Room correction (REW parametric EQ import). Defaults to bypassed.
+    #[serde(default)]
+    pub room_correction: crate::room_correction::RoomCorrectionParams,
 }
 
 /// Serde-friendly ReplayGain mode.
@@ -60,6 +69,9 @@ impl Default for DspConfig {
             reverb: crate::reverb::ReverbParams::default(),
             speed: 1.0,
             tools: crate::tools::ToolsParams::default(),
+            crossfeed: crate::crossfeed::CrossfeedParams::default(),
+            convolution: crate::convolution::ConvolutionParams::default(),
+            room_correction: crate::room_correction::RoomCorrectionParams::default(),
         }
     }
 }
@@ -79,6 +91,9 @@ impl DspConfig {
             && self.reverb.is_bypassed()
             && (self.speed - 1.0).abs() < 1e-6
             && self.tools.is_bypassed()
+            && self.crossfeed.is_bypassed()
+            && self.convolution.is_bypassed()
+            && self.room_correction.is_bypassed()
     }
 
     /// All transformations this configuration reports when active.
@@ -92,6 +107,15 @@ impl DspConfig {
         }
         if !self.tools.is_bypassed() {
             out.push(AudioTransformation::EffectTools);
+        }
+        if !self.crossfeed.is_bypassed() {
+            out.push(AudioTransformation::Crossfeed);
+        }
+        if !self.convolution.is_bypassed() {
+            out.push(AudioTransformation::Convolution);
+        }
+        if !self.room_correction.is_bypassed() {
+            out.push(AudioTransformation::RoomCorrection);
         }
         if self.volume_db.abs() >= 1e-9 || self.replaygain != ReplayGainModeDef::Off {
             out.push(AudioTransformation::Gain);
@@ -112,6 +136,9 @@ pub struct DspPipeline {
     eq_chain: Option<crate::eq::EqChain>,
     reverb: Option<crate::reverb::Reverb>,
     tools: Option<crate::tools::Tools>,
+    crossfeed: Option<crate::crossfeed::Crossfeed>,
+    convolution: Option<crate::convolution::Convolution>,
+    room_correction: Option<crate::room_correction::RoomCorrection>,
     speed_active: bool,
     volume: Gain,
     /// Interleaved samples carried over between chunks: the resampler
@@ -207,6 +234,49 @@ impl DspPipeline {
             Some(crate::tools::Tools::new(config.tools))
         };
 
+        // Crossfeed is stereo-only: mono streams pass through honestly.
+        let crossfeed = if config.crossfeed.is_bypassed() || source_format.channels != 2 {
+            None
+        } else {
+            Some(crate::crossfeed::Crossfeed::new(
+                config.crossfeed,
+                source_format.sample_rate,
+            ))
+        };
+
+        // Convolution reverb: stereo-only, after Freeverb/before tools in
+        // the report order; stage runs after crossfeed, before gain. An
+        // enabled-but-unknown ir_id compiles to no stage (honest miss,
+        // logged) — never a silent fake reverb.
+        let convolution = if config.convolution.is_bypassed() || source_format.channels != 2 {
+            None
+        } else {
+            let built = crate::convolution::Convolution::build(
+                config.convolution,
+                source_format.sample_rate,
+            );
+            if built.is_none() {
+                tracing::warn!(
+                    ir_id = config.convolution.ir_id,
+                    "convolution enabled but IR id unknown; stage skipped"
+                );
+            }
+            built
+        };
+
+        // Room correction: a cascade of correction biquads after
+        // convolution, before tools/gain. Runs on any channel count
+        // (correction is per-channel identical, unlike the spatial stages).
+        let room_correction = if config.room_correction.is_bypassed() {
+            None
+        } else {
+            Some(crate::room_correction::RoomCorrection::compile(
+                &config.room_correction,
+                source_format.sample_rate,
+                source_format.channels,
+            ))
+        };
+
         let speed = config.speed.clamp(0.5, 2.0);
         let speed_active = (speed - 1.0).abs() > 1e-6;
 
@@ -246,6 +316,9 @@ impl DspPipeline {
             eq_chain,
             reverb,
             tools,
+            crossfeed,
+            convolution,
+            room_correction,
             speed_active,
             volume,
             replaygain_db: replaygain_db.filter(|_| config.replaygain != ReplayGainModeDef::Off),
@@ -275,6 +348,24 @@ impl DspPipeline {
 
         if let Some(tools) = self.tools.as_mut() {
             tools.process_interleaved(interleaved, self.channels);
+        }
+
+        // Crossfeed after the stereo tools, before gain: it is a
+        // spatial fix-up, not a loudness stage.
+        if let Some(cf) = self.crossfeed.as_mut() {
+            cf.process_interleaved(interleaved, self.channels);
+        }
+
+        // Convolution reverb after the algorithmic reverb and crossfeed,
+        // before gain: wet/dry mixing is spatial, not loudness.
+        if let Some(conv) = self.convolution.as_mut() {
+            conv.process_interleaved(interleaved, self.channels);
+        }
+
+        // Room correction after convolution, before gain: it is a
+        // spectral fix-up of the room, not a spatial or loudness stage.
+        if let Some(rc) = self.room_correction.as_mut() {
+            self.clipped |= rc.process_interleaved(interleaved);
         }
 
         // ReplayGain before volume: the tag sets loudness, volume trims it.
@@ -391,6 +482,19 @@ impl DspPipeline {
         if self.tools.is_some() {
             out.push(AudioTransformation::EffectTools);
         }
+        if self.crossfeed.is_some() {
+            out.push(AudioTransformation::Crossfeed);
+        }
+        if self.convolution.is_some() {
+            out.push(AudioTransformation::Convolution);
+        }
+        if self
+            .room_correction
+            .as_ref()
+            .is_some_and(|rc| !rc.is_empty())
+        {
+            out.push(AudioTransformation::RoomCorrection);
+        }
         out
     }
 
@@ -411,6 +515,9 @@ impl DspPipeline {
             && !self.speed_active
             && self.reverb.is_none()
             && self.tools.is_none()
+            && self.crossfeed.is_none()
+            && self.convolution.is_none()
+            && self.room_correction.as_ref().is_none_or(|rc| rc.is_empty())
             && self.volume.is_unity()
             && self.replaygain_db.is_none()
             && self.resampler.is_none()
@@ -739,12 +846,273 @@ mod tests {
         let tail = pipeline.flush();
         out_samples += tail.len();
 
-        // 0.8x speed: ~4.71s * 44100 * 2ch ≈ 415k samples (plus resampler
+        // 0.8x speed: ~4.71s * 44100 * 2ch ~ 415k samples (plus resampler
         // transient slack). The pre-fix code emitted near-zero output.
         let expected_min = total_frames * 2 * 4 / 5; // 0.8 ratio, minus slack
         assert!(
             out_samples > expected_min,
             "output too small: {out_samples} samples for {total_frames} input frames              (resampler FIFO regression)"
         );
+    }
+
+    #[test]
+    fn crossfeed_off_keeps_bit_exact_bypass() {
+        let mut cfg = DspConfig::default();
+        cfg.crossfeed.enabled = false;
+        assert!(cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(output, reference, "disabled crossfeed must stay bit-exact");
+    }
+
+    #[test]
+    fn crossfeed_on_is_reported_and_applies() {
+        let mut cfg = DspConfig::default();
+        cfg.crossfeed.enabled = true;
+        assert!(!cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert_eq!(pl.transformations(), vec![AudioTransformation::Crossfeed]);
+        // DC into L only: after steady state, R carries the bleed.
+        let mut input: Vec<f32> = (0..4096).flat_map(|_| [1.0f32, 0.0f32]).collect();
+        let out = pl.process(&mut input);
+        let r_out = out[out.len() - 1];
+        assert!(
+            r_out > 0.4,
+            "expected DC crossfeed near the -6.5 dB feed level, got {r_out}"
+        );
+    }
+
+    #[test]
+    fn convolution_off_keeps_bit_exact_bypass() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = false;
+        assert!(cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(
+            output, reference,
+            "disabled convolution must stay bit-exact"
+        );
+    }
+
+    #[test]
+    fn convolution_ir_id_zero_bypasses_even_when_enabled() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 0;
+        assert!(cfg.is_bypassed(), "ir_id 0 must be a bypass");
+        let pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+    }
+
+    #[test]
+    fn convolution_unknown_ir_compiles_to_no_stage() {
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 999_999; // never registered
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        // Honest miss: no stage, no transformation reported.
+        assert!(pl.is_passthrough());
+        assert!(pl.transformations().is_empty());
+        let mut input = music_like(1024);
+        let reference = input.clone();
+        assert_eq!(pl.process(&mut input), reference);
+    }
+
+    #[test]
+    fn convolution_unit_ir_is_reported_and_identity() {
+        crate::convolution::register_ir(101, &[1.0f32], &[], 44_100).expect("register");
+        let mut cfg = DspConfig::default();
+        cfg.convolution.enabled = true;
+        cfg.convolution.ir_id = 101;
+        cfg.convolution.wet = 1.0;
+        cfg.convolution.dry = 0.0;
+        assert!(!cfg.is_bypassed());
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert_eq!(pl.transformations(), vec![AudioTransformation::Convolution]);
+        // Unit IR with wet=1 dry=0: bit-exact identity through the stage.
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(output, reference, "unit IR must be identity");
+        crate::convolution::remove_ir(101);
+    }
+
+    #[test]
+    fn convolution_config_deserializes_without_new_field() {
+        // Backward compat: a persisted DspConfig from before convolution
+        // existed must deserialize to the disabled default.
+        let raw = serde_json::json!({
+            "eq": {
+                "bands": [{
+                    "kind": "peaking",
+                    "freq_hz": 1000.0,
+                    "q": 1.0,
+                    "gain_db": 0.0,
+                    "enabled": true
+                }],
+                "preamp_db": 0.0
+            },
+            "volume_db": 0.0,
+            "replaygain": "off",
+            "reverb": {
+                "room_size": 0.5, "damping": 0.3, "wet": 0.0,
+                "width": 1.0, "input_lowpass": 0.0
+            },
+            "speed": 1.0,
+            "tools": {
+                "balance": 0.0, "phase_invert_left": false,
+                "stereo_width": 1.0, "soft_clip": 0.0
+            }
+        })
+        .to_string();
+        let cfg: DspConfig = serde_json::from_str(&raw).expect("legacy config");
+        assert!(cfg.is_bypassed(), "legacy config must stay bypassed");
+        assert!(!cfg.convolution.enabled);
+        assert_eq!(cfg.convolution.ir_id, 0);
+        assert_eq!(cfg.convolution.predelay_ms, 0.0);
+    }
+
+    #[test]
+    fn crossfeed_config_deserializes_without_new_field() {
+        // Backward compat: a persisted DspConfig from before crossfeed
+        // existed (tools already present, crossfeed absent) must
+        // deserialize to the disabled default.
+        let raw = serde_json::json!({
+            "eq": {
+                "bands": [{
+                    "kind": "peaking",
+                    "freq_hz": 1000.0,
+                    "q": 1.0,
+                    "gain_db": 0.0,
+                    "enabled": true
+                }],
+                "preamp_db": 0.0
+            },
+            "volume_db": 0.0,
+            "replaygain": "off",
+            "reverb": {
+                "room_size": 0.5, "damping": 0.3, "wet": 0.0,
+                "width": 1.0, "input_lowpass": 0.0
+            },
+            "speed": 1.0,
+            "tools": {
+                "balance": 0.0, "phase_invert_left": false,
+                "stereo_width": 1.0, "soft_clip": 0.0
+            }
+        })
+        .to_string();
+        let cfg: DspConfig = serde_json::from_str(&raw).expect("legacy config");
+        assert!(cfg.is_bypassed(), "legacy config must stay bypassed");
+        assert!(!cfg.crossfeed.enabled);
+        assert_eq!(cfg.crossfeed.cutoff_hz, 700.0);
+        assert_eq!(cfg.crossfeed.feed_db, -6.5);
+    }
+    #[test]
+    fn room_correction_off_keeps_bit_exact_bypass() {
+        let mut cfg = DspConfig::default();
+        cfg.room_correction.enabled = false;
+        cfg.room_correction.filters = vec![crate::room_correction::CorrectionFilter {
+            kind: crate::room_correction::CorrectionFilterKind::Pk,
+            fc_hz: 100.0,
+            gain_db: -3.5,
+            q: 2.0,
+        }];
+        assert!(
+            cfg.is_bypassed(),
+            "disabled room correction must be a bypass"
+        );
+        let mut pl = DspPipeline::compile(&cfg, f32_stereo(44_100), None, None).unwrap();
+        assert!(pl.is_passthrough());
+        let mut input = music_like(2048);
+        let reference = input.clone();
+        let output = pl.process(&mut input);
+        assert_eq!(
+            output, reference,
+            "disabled room correction must stay bit-exact"
+        );
+    }
+
+    #[test]
+    fn room_correction_on_is_reported_and_corrects() {
+        let mut cfg = DspConfig::default();
+        cfg.room_correction.enabled = true;
+        cfg.room_correction.filters = vec![crate::room_correction::CorrectionFilter {
+            kind: crate::room_correction::CorrectionFilterKind::Pk,
+            fc_hz: 1000.0,
+            gain_db: 3.0,
+            q: 2.0,
+        }];
+        assert!(!cfg.is_bypassed());
+        assert_eq!(
+            cfg.transformations(),
+            vec![AudioTransformation::RoomCorrection]
+        );
+        let mut mono = f32_stereo(44_100);
+        mono.channels = 1;
+        let mut pl = DspPipeline::compile(&cfg, mono, None, None).unwrap();
+        assert!(
+            pl.transformations()
+                .contains(&AudioTransformation::RoomCorrection)
+        );
+        // A +3 dB PK at 1 kHz boosts 1 kHz more than 5 kHz (per channel).
+        fn amplitude(pl: &mut DspPipeline, freq: f32) -> f32 {
+            let n = 8192;
+            let mut buf: Vec<f32> = (0..n)
+                .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 44_100.0).sin() * 0.1)
+                .collect();
+            let out = pl.process(&mut buf);
+            let tail = &out[n / 2..];
+            tail.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        }
+        let at_1k = amplitude(&mut pl, 1000.0);
+        let at_5k = amplitude(&mut pl, 5000.0);
+        assert!(
+            at_1k > at_5k * 1.3,
+            "1 kHz ({at_1k}) must beat 5 kHz ({at_5k})"
+        );
+        assert!((at_1k - 0.141).abs() < 0.02, "expected ~0.141, got {at_1k}");
+    }
+
+    #[test]
+    fn room_correction_config_deserializes_without_new_field() {
+        // Backward compat: a persisted DspConfig from before room correction
+        // existed must deserialize to the disabled default.
+        let raw = serde_json::json!({
+            "eq": {
+                "bands": [{
+                    "kind": "peaking",
+                    "freq_hz": 1000.0,
+                    "q": 1.0,
+                    "gain_db": 0.0,
+                    "enabled": true
+                }],
+                "preamp_db": 0.0
+            },
+            "volume_db": 0.0,
+            "replaygain": "off",
+            "reverb": {
+                "room_size": 0.5, "damping": 0.3, "wet": 0.0,
+                "width": 1.0, "input_lowpass": 0.0
+            },
+            "speed": 1.0,
+            "tools": {
+                "balance": 0.0, "phase_invert_left": false,
+                "stereo_width": 1.0, "soft_clip": 0.0
+            },
+            "crossfeed": { "enabled": false, "cutoff_hz": 700, "feed_db": -6.5 },
+            "convolution": { "enabled": false, "ir_id": 0, "wet": 0.3, "dry": 0.8, "predelay_ms": 0, "ir_gain_db": 0 }
+        })
+        .to_string();
+        let cfg: DspConfig = serde_json::from_str(&raw).expect("legacy config");
+        assert!(cfg.is_bypassed(), "legacy config must stay bypassed");
+        assert!(!cfg.room_correction.enabled);
+        assert!(cfg.room_correction.filters.is_empty());
     }
 }

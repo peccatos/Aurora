@@ -18,6 +18,8 @@ import {
 } from "../library-db";
 import { trackArtworkUrl } from "../artwork-store";
 import { readTrackTags } from "../tag-reader";
+import { detectLyricsLanguage } from "../tag-reader";
+import { pairLrcSidecarsWithText } from "../lrc-sidecar";
 import { recordPlay, recentPlays } from "../history-service";
 import { likedIds, type LikeValue } from "../likes-service";
 import { listPlaylists, onPlaylistsChanged } from "../playlist-service";
@@ -979,8 +981,11 @@ async function render(root: HTMLElement) {
 
   async function ingest(files: FileList | null): Promise<void> {
     if (!files?.length) return;
+    const all = Array.from(files);
+    const lrcTexts = await pairLrcSidecarsWithText(all, all);
     let added = 0;
-    for (const file of Array.from(files)) {
+    for (const file of all) {
+      if (file.name.split(".").pop()?.toLowerCase() === "lrc") continue; // paired above
       const validation = validateAudioFile(file);
       if (validation) { setToast(`${file.name}: ${validation}`); continue; }
       const duplicateKey = importDuplicateKey(file);
@@ -996,6 +1001,10 @@ async function render(root: HTMLElement) {
       const artist = tags.artist ?? (dashIdx > 0 ? stem.slice(0, dashIdx) : null);
       const album = tags.album;
       const durationMs = tags.durationMs;
+      // Lyrics: embedded tags first, LRC sidecar second (the player
+      // renders LRC natively, so sidecar text is stored as-is).
+      const lyrics = tags.lyrics ?? lrcTexts.get(file.name) ?? null;
+      const lyricsLanguage = lyrics ? tags.lyricsLanguage ?? detectLyricsLanguage(lyrics) : null;
       const artworkDataUrl = tags.picture
         ? `data:${tags.picture.format};base64,${bytesToBase64(tags.picture.data)}`
         : null;
@@ -1014,6 +1023,10 @@ async function render(root: HTMLElement) {
       registerWebTrack({
         id, name, artist, album, genre: tags.genre ?? null, year: tags.year ?? null, durationMs, file, lufs,
         artwork_data_url: artworkDataUrl,
+        lyrics,
+        lyrics_language: lyricsLanguage,
+        lyrics_translation: null,
+        lyrics_translation_language: null,
         metadata_source: "embedded-tags",
       });
       // Embedded cover art (best-effort): extracted from the tags, stored
@@ -1038,8 +1051,8 @@ async function render(root: HTMLElement) {
           bytes: await file.arrayBuffer(),
           addedAt: Date.now(),
           lufs,
-          lyrics: null,
-          lyrics_language: null,
+          lyrics,
+          lyrics_language: lyricsLanguage,
           lyrics_translation: null,
           lyrics_translation_language: null,
           artwork_data_url: artworkDataUrl,

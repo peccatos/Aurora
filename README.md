@@ -137,6 +137,64 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 cd frontend && npx tsc --noEmit && npm run build
 ```
 
+## Deployment (single-origin on Render)
+
+The web deployment is a single service (`render.yaml`): the Docker image
+builds the Vite bundle, and `aurora-api` serves it from `/usr/share/aurora/web`
+with SPA fallback — so the browser stays on **one origin** and all cookies are
+first-party. (A split frontend/API deployment does not work: `*.onrender.com`
+subdomains are distinct sites, so the cookies would be third-party and blocked.)
+
+### Cookie model
+
+| Cookie | Lifetime | Role |
+|---|---|---|
+| `__Host-aurora_session` | 8h | OAuth handshake session; carries the CSRF pairing |
+| `__Host-aurora_user` | 180d (HttpOnly, SameSite=Lax) | Long-lived identity key for stored OAuth grants |
+| `__Host-aurora_auth` | 30d (HttpOnly, SameSite=Lax) | Login session for email/password accounts |
+| `__Host-aurora_csrf` | per-session | Readable echo token; every state-changing call must send the matching `x-csrf-token` header |
+
+All are `Secure; Path=/`. OAuth **grants are keyed by `user_hash`** (the hash
+of the 180d user cookie), not by the 8h session — so session expiry or cookie
+cleanup never orphans a stored grant: an unknown/expired session cookie is
+re-minted on `begin`, the user cookie is untouched.
+
+### Deep links (hash router)
+
+The web shell uses a hash router. Deep links must be `/#/settings`, never
+`/settings/accounts`. The canonical post-OAuth redirect target is
+`AURORA_API_FRONTEND_URL` (e.g. `https://aurora-api-3.onrender.com/#/settings`).
+Legal docs live at `/#/legal?doc=privacy` and `/#/legal?doc=tos` — set the
+privacy-policy URL in the Google Cloud Console OAuth consent screen to
+`https://<your-host>/#/legal?doc=privacy`.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `AURORA_API_ALLOWED_ORIGINS` | yes | Comma-separated allowed origins; the server refuses to start with open CORS |
+| `AURORA_API_FRONTEND_URL` | yes | Post-OAuth redirect target (hash-router deep link) |
+| `AURORA_OAUTH_ENCRYPTION_KEY` | yes | base64url of 32 random bytes; encrypts provider tokens at rest (AES-256-GCM) |
+| `AURORA_DATABASE_PATH` | no | SQLite path (default `aurora.db`); on Render: `/data/aurora.db` on the attached disk so grants survive restarts |
+| `AURORA_REGISTRATION_OPEN` | no | Whether `POST /api/auth/register` accepts new accounts (default `true`) |
+| `AURORA_SPOTIFY_ENABLED` / `AURORA_SPOTIFY_CLIENT_ID` / `AURORA_SPOTIFY_CLIENT_SECRET` / `AURORA_SPOTIFY_REDIRECT_URI` | per provider | Spotify OAuth app credentials |
+| `AURORA_YOUTUBE_MUSIC_ENABLED` / `AURORA_YOUTUBE_MUSIC_CLIENT_ID` / `AURORA_YOUTUBE_MUSIC_CLIENT_SECRET` / `AURORA_YOUTUBE_MUSIC_REDIRECT_URI` | per provider | YouTube Music OAuth app credentials |
+
+Generate the encryption key with
+`openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`.
+Redirect URIs: `https://<your-host>/api/oauth/spotify/callback` and
+`https://<your-host>/api/oauth/youtube-music/callback`.
+
+### Accounts and grant claiming
+
+Accounts are **email + Argon2id** (passwords stored as PHC strings; login
+performs the same Argon2 work whether or not the user exists, so timing
+cannot reveal registered emails). Logging in (or registering) from a browser
+that carries the anonymous `__Host-aurora_user` cookie **claims** that
+cookie's OAuth grants, moving them to the account's stable hash
+(`hash("user:{id}")`). After that the account's grants survive across
+browsers and logins.
+
 ## Project status & known gaps
 
 `plan.md` (git-ignored, local) tracks every weak or unfinished area of the

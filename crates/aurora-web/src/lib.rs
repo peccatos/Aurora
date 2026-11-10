@@ -155,10 +155,11 @@ impl WebKernel {
                 Err(_) => break, // honest: measure what we got
             }
         }
-        Ok(
-            aurora_dsp::lufs::integrated_lufs(&decoded, channels, format.sample_rate)
-                .map(f64::from),
-        )
+        Ok(aurora_loudness::integrated_lufs(
+            &decoded,
+            channels,
+            format.sample_rate,
+        ))
     }
 
     // -----------------------------------------------------------------
@@ -208,6 +209,28 @@ impl WebKernel {
 
     pub fn get_dsp(&self) -> Result<JsValue, JsValue> {
         to_js(self.kernel.get_dsp().map_err(js_err)?)
+    }
+
+    /// Register a user convolution-reverb impulse response (web IR
+    /// upload): f32 planar channels + source sample rate. The right
+    /// channel may be an empty array (mono upmix happens in Rust).
+    /// JS hands over plain `number[]` or Float32Array contents — copy
+    /// into wasm memory once; the IR store is global to the wasm module.
+    pub fn set_convolution_ir(
+        &self,
+        id: u32,
+        left: Vec<f32>,
+        right: Vec<f32>,
+        sample_rate: u32,
+    ) -> Result<(), JsValue> {
+        self.kernel
+            .set_convolution_ir(id, &left, &right, sample_rate)
+            .map_err(js_err)
+    }
+
+    /// Remove a user convolution IR by id.
+    pub fn remove_convolution_ir(&self, id: u32) -> Result<(), JsValue> {
+        self.kernel.remove_convolution_ir(id).map_err(js_err)
     }
 
     pub fn set_dsp(&self, config: JsValue) -> Result<JsValue, JsValue> {

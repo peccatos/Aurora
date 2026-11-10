@@ -14,11 +14,71 @@ function clone(config: DspConfig): DspConfig {
   return structuredClone(config);
 }
 
+const defaultCrossfeed = () => ({ enabled: false, cutoff_hz: 700, feed_db: -6.5 });
+
+const defaultConvolution = () => ({
+  enabled: false,
+  ir_id: 0,
+  wet: 0.3,
+  dry: 0.8,
+  predelay_ms: 0,
+  ir_gain_db: 0,
+});
+
+/** Legacy profiles (pre-convolution) round-trip with disabled defaults. */
+function ensureConvolution(d: DspConfig): DspConfig {
+  d.convolution ??= defaultConvolution();
+  d.convolution.enabled = Boolean(d.convolution.enabled);
+  d.convolution.ir_id = Number.isFinite(d.convolution.ir_id)
+    ? Math.max(0, Math.trunc(d.convolution.ir_id))
+    : 0;
+  const clamp01 = (v: number, fb: number) =>
+    Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : fb;
+  d.convolution.wet = clamp01(d.convolution.wet, 0.3);
+  d.convolution.dry = clamp01(d.convolution.dry, 0.8);
+  d.convolution.predelay_ms = Number.isFinite(d.convolution.predelay_ms)
+    ? Math.max(0, Math.min(250, d.convolution.predelay_ms))
+    : 0;
+  d.convolution.ir_gain_db = Number.isFinite(d.convolution.ir_gain_db)
+    ? Math.max(-24, Math.min(12, d.convolution.ir_gain_db))
+    : 0;
+  return d;
+}
+
+/** Legacy profiles (pre-room-correction) round-trip with disabled defaults. */
+function ensureRoomCorrection(d: DspConfig): DspConfig {
+  d.room_correction ??= { enabled: false, filters: [] };
+  d.room_correction.enabled = Boolean(d.room_correction.enabled);
+  d.room_correction.filters = Array.isArray(d.room_correction.filters)
+    ? d.room_correction.filters
+    : [];
+  return d;
+}
+
+/** Legacy profiles (pre-crossfeed) round-trip with disabled defaults. */
+function ensureCrossfeed(d: DspConfig): DspConfig {
+  d.crossfeed ??= defaultCrossfeed();
+  d.crossfeed.enabled = Boolean(d.crossfeed.enabled);
+  d.crossfeed.cutoff_hz = Number.isFinite(d.crossfeed.cutoff_hz)
+    ? Math.max(20, Math.min(5000, d.crossfeed.cutoff_hz))
+    : 700;
+  d.crossfeed.feed_db = Number.isFinite(d.crossfeed.feed_db)
+    ? Math.max(-24, Math.min(0, d.crossfeed.feed_db))
+    : -6.5;
+  return d;
+}
+
 export async function getDspProfiles(): Promise<Profiles> {
   try {
-    if (platform === "web") return (await kvGet<Profiles>(KEY)) ?? {};
-    const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
-    return raw ? (JSON.parse(raw) as Profiles) : {};
+    let profiles: Profiles = {};
+    if (platform === "web") {
+      profiles = (await kvGet<Profiles>(KEY)) ?? {};
+    } else {
+      const raw = await invoke<string | null>("get_setting_cmd", { key: "dsp.track.v1" });
+      profiles = raw ? (JSON.parse(raw) as Profiles) : {};
+    }
+    Object.values(profiles).forEach((d) => ensureRoomCorrection(ensureConvolution(ensureCrossfeed(d))));
+    return profiles;
   } catch { return {}; }
 }
 

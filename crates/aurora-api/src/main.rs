@@ -60,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = storage_state(
         Config {
             allowed_origins: origins,
+            registration_open: env::var("AURORA_REGISTRATION_OPEN")
+                .ok()
+                .map(|v| !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
             frontend_url,
             spotify: provider("SPOTIFY")?,
             youtube: provider("YOUTUBE_MUSIC")?,

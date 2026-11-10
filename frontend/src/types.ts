@@ -33,6 +33,28 @@ export interface DspConfig {
     stereo_width: number;
     soft_clip: number;
   };
+  crossfeed?: {
+    enabled: boolean;
+    cutoff_hz: number;
+    feed_db: number;
+  };
+  convolution?: {
+    enabled: boolean;
+    ir_id: number;
+    wet: number;
+    dry: number;
+    predelay_ms: number;
+    ir_gain_db: number;
+  };
+  room_correction?: {
+    enabled: boolean;
+    filters: {
+      kind: "pk" | "ls" | "hs";
+      fc_hz: number;
+      gain_db: number;
+      q: number;
+    }[];
+  };
 }
 
 export interface QueueTrack {

@@ -41,6 +41,9 @@ impl ExclusiveStream {
     ///
     /// `finished` mirrors the engine's stream-finished flag so the
     /// render thread knows silence at the end is the natural end.
+    /// `stream_error` is set when WASAPI initialization or the render
+    /// loop itself failed, so the engine can surface a real cause
+    /// (device lost, format refused) instead of a silent non-stream.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         device_key: &str,
@@ -49,6 +52,7 @@ impl ExclusiveStream {
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
+        stream_error: Option<Arc<AtomicBool>>,
     ) -> Result<Self, EngineError> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -62,9 +66,22 @@ impl ExclusiveStream {
                 let result = unsafe {
                     render_loop(&device_key, format, &mut consumer, &running, &paused, &stop)
                 };
-                // Signal the finished flag: the UI auto-advance relies on
-                // it even when the exclusive path ends abnormally.
-                let _ = result;
+                // A failed render loop (WASAPI init error, device lost
+                // mid-render) is surfaced to the engine via the
+                // stream-error flag — the same recovery channel the
+                // shared-mode path uses — and logged; it is never
+                // silently swallowed. `finished` still flips so the UI
+                // auto-advance is not left hanging.
+                if let Err(error) = result.as_ref() {
+                    tracing::error!(%error, "exclusive render loop failed");
+                    if let Some(flag) = stream_error.as_ref() {
+                        flag.store(true, Ordering::Release);
+                    }
+                    // The running flag must also fall: a dead render
+                    // thread means playback is over, whatever the ring
+                    // still holds.
+                    running.store(false, Ordering::Release);
+                }
                 finished.store(true, Ordering::Release);
                 drop(consumer);
             })

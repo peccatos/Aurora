@@ -1,3 +1,4 @@
+mod auth;
 mod guard;
 mod limits;
 mod media;
@@ -72,6 +73,9 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct Config {
     pub allowed_origins: Vec<String>,
+    /// Whether POST /api/auth/register accepts new accounts
+    /// (AURORA_REGISTRATION_OPEN, default true).
+    pub registration_open: bool,
     pub frontend_url: String,
     pub spotify: Option<ProviderSettings>,
     pub youtube: Option<ProviderSettings>,
@@ -429,6 +433,10 @@ pub fn router(state: AppState) -> Router {
             get(playlists::playlist_detail),
         )
         .route("/api/oauth/{provider}", delete(disconnect))
+        .route("/api/auth/register", post(auth::register))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
         .route("/api/media/metadata", post(media::metadata))
         .route("/api/media/ping", get(media::ping))
         // The web shell is served from this same service, so the browser sees
@@ -441,6 +449,39 @@ pub fn router(state: AppState) -> Router {
         )
 
         .layer(middleware::from_fn(guard::bounded_body))
+        // Security headers (reviewed against the built web shell):
+        // - CSP: scripts only from self (the Vite bundle has no inline
+        //   scripts); styles need 'unsafe-inline' because pages use inline
+        //   style attributes; connect-src self covers same-origin API calls
+        //   plus the provider/token/translation endpoints the shell reaches;
+        //   media/img allow the data: artwork URLs and https sources.
+        // - X-Frame-Options + frame-ancestors: the shell is never framed.
+        // - HSTS: the service is HTTPS-only on Render.
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: https:; media-src 'self' data: blob:; \
+                 connect-src 'self' https://api.spotify.com https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com https://openidconnect.googleapis.com https://translate.disroot.org https://libretranslate.com; \
+                 font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            ),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(origins)
@@ -467,7 +508,10 @@ async fn spaverse() -> Response {
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             bytes,
         )
             .into_response(),
@@ -523,19 +567,14 @@ fn provider_settings<'a>(
         _ => None,
     }
 }
-fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
+pub(crate) fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
     // Check Origin header first (cross-origin requests)
-    if let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         return config.allowed_origins.iter().any(|x| x == origin);
     }
     // For same-origin requests, browsers don't send Origin.
     // Fall back to Referer header check.
-    if let Some(referer) = headers
-        .get(header::REFERER)
-        .and_then(|v| v.to_str().ok())
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok())
         && let Ok(referer_url) = url::Url::parse(referer)
     {
         let referer_origin = referer_url.origin().ascii_serialization();
@@ -550,10 +589,22 @@ fn origin_ok(headers: &HeaderMap, config: &Config) -> bool {
 fn session(headers: &HeaderMap) -> Option<String> {
     cookie_value(headers, SESSION_COOKIE).filter(|sid| limits::is_session_token(sid))
 }
-fn user_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn user_token(headers: &HeaderMap) -> Option<String> {
     cookie_value(headers, USER_COOKIE).filter(|uid| limits::is_user_token(uid))
 }
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+
+/// The user identity every credential row is keyed by.
+///
+/// A live login session wins: the account's stable hash
+/// `hash("user:{id}")` replaces the anonymous cookie. Otherwise the
+/// anonymous `__Host-aurora_user` cookie (validated shape) is the identity.
+pub(crate) async fn resolve_user_hash(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if let Some((user_id, _)) = auth::login_user(state, headers).await {
+        return Some(hash(&format!("user:{user_id}")));
+    }
+    user_token(headers).map(|uid| hash(&uid))
+}
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -563,13 +614,13 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
                 .map(str::to_owned)
         })
 }
-fn hash(value: &str) -> String {
+pub(crate) fn hash(value: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
 }
-fn random() -> String {
+pub(crate) fn random() -> String {
     URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes())
 }
-fn fail(status: StatusCode) -> Response {
+pub(crate) fn fail(status: StatusCode) -> Response {
     (
         status,
         Json(serde_json::json!({"error":"oauth_unavailable"})),
@@ -592,10 +643,10 @@ fn cookie(id: &str) -> String {
 fn user_cookie(id: &str) -> String {
     format!("{USER_COOKIE}={id}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=15552000")
 }
-fn csrf_cookie(token: &str) -> String {
+pub(crate) fn csrf_cookie(token: &str) -> String {
     format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax")
 }
-fn cookie_header(value: &str) -> HeaderValue {
+pub(crate) fn cookie_header(value: &str) -> HeaderValue {
     value
         .parse()
         .expect("session and CSRF cookies are ASCII without separators")
@@ -655,7 +706,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// The provider argument is the already-canonicalised provider id, so a caller
 /// cannot spend a budget per spelling of the same provider. Returns the 429 to
 /// send when the call is over budget.
-fn rate_limit(state: &AppState, client: IpAddr, provider: &str) -> Option<Response> {
+pub(crate) fn rate_limit(state: &AppState, client: IpAddr, provider: &str) -> Option<Response> {
     let decision = state.limits.check(client, provider);
     (!decision.allowed).then(|| guard::rate_limited(decision.retry_after_secs))
 }
@@ -885,9 +936,9 @@ async fn callback(
             return fail(StatusCode::UNAUTHORIZED);
         }
     };
-    // Token rows are keyed by the long-lived user cookie, not the session.
-    // Presence is validated; the callback saves under this id below.
-    let _uid = match user_token(&headers) {
+    // Token rows are keyed by the long-lived user identity, not the session:
+    // a live login session's account hash, else the anonymous user cookie.
+    let user_hash = match resolve_user_hash(&state, &headers).await {
         Some(x) => x,
         None => {
             tracing::warn!(provider, "oauth callback: no user cookie");
@@ -955,6 +1006,14 @@ async fn callback(
             return fail(StatusCode::BAD_REQUEST);
         }
     };
+    // The transaction is now consumed: the authorization code is single-use,
+    // so this verifier can never redeem anything again. Erase it at rest
+    // (best-effort: a failed scrub must not fail an otherwise-successful
+    // connect) while the row itself is retained for replay detection.
+    let state_hash = hash(&query.state);
+    if let Err(e) = aurora_storage::clear_oauth_verifier(&state.pool, &state_hash).await {
+        tracing::warn!(provider, error = %e, "oauth callback: verifier scrub failed");
+    }
     let verifier = tx.verifier;
     let redirect_uri = tx.redirect_uri;
     let settings = match provider_settings(&state.config, &provider) {
@@ -1014,7 +1073,7 @@ async fn callback(
     };
     match aurora_storage::save_oauth_account(
         &state.pool,
-        &hash(&_uid),
+        &user_hash,
         &provider,
         &persisted,
         &format!("{provider}:{}", account.subject),
@@ -1024,11 +1083,11 @@ async fn callback(
     {
         Ok(()) => {
             tracing::info!(
-        provider,
-        subject = %account.subject,
-        session = %&hash(&sid)[..8],
-        "oauth account connected"
-    );
+                provider,
+                subject = %account.subject,
+                session = %&hash(&sid)[..8],
+                "oauth account connected"
+            );
         }
         Err(e) => {
             tracing::error!(provider, error = %e, "oauth callback: account save failed");
@@ -1069,7 +1128,10 @@ async fn provider_error(
 ) -> Response {
     match error {
         aurora_providers::playlist::Error::ReauthorizationRequired => {
-            tracing::warn!(provider, "provider rejected the stored grant: reauthorization required");
+            tracing::warn!(
+                provider,
+                "provider rejected the stored grant: reauthorization required"
+            );
             let _ = aurora_storage::mark_oauth_reauth_required(
                 &state.pool,
                 user_hash,
@@ -1130,14 +1192,15 @@ async fn status(
         Ok(None) => return fail(StatusCode::UNAUTHORIZED),
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
     }
-    // The account is keyed by the long-lived user cookie: an expired session
-    // 401s here, but a valid session with a mismatched (rotated) history
-    // still finds the stored grant, so the UI keeps showing "connected".
-    let uid = match user_token(&headers) {
+    // The account is keyed by the long-lived user identity (login session's
+    // account hash, else the anonymous user cookie): an expired session 401s
+    // here, but a valid session with a mismatched (rotated) history still
+    // finds the stored grant, so the UI keeps showing "connected".
+    let user_hash = match resolve_user_hash(&state, &headers).await {
         Some(x) => x,
         None => return fail(StatusCode::UNAUTHORIZED),
     };
-    match aurora_storage::get_oauth_account(&state.pool, &hash(&uid), &provider).await {
+    match aurora_storage::get_oauth_account(&state.pool, &user_hash, &provider).await {
         Ok(Some(a)) => (
             StatusCode::OK,
             [(header::CACHE_CONTROL, "no-store")],
@@ -1183,20 +1246,24 @@ async fn playlists(
         Ok(None) => return fail(StatusCode::UNAUTHORIZED),
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
     }
-    // Token rows are keyed by the user cookie hash: the session only carries
-    // CSRF. A rotated/expired-and-reconnected session still reaches the grant.
-    let user_hash = match user_token(&headers) {
-        Some(x) => hash(&x),
+    // Token rows are keyed by the user identity hash: the session only
+    // carries CSRF. A rotated/expired-and-reconnected session still reaches
+    // the grant, and a logged-in user reaches the account's claimed grants.
+    let user_hash = match resolve_user_hash(&state, &headers).await {
+        Some(x) => x,
         None => return fail(StatusCode::UNAUTHORIZED),
     };
-    let ciphertext =
-        match aurora_storage::get_oauth_token_ciphertext(&state.pool, &user_hash, &provider)
-            .await
-        {
-            Ok(Some(value)) => value,
-            Ok(None) => return fail(StatusCode::NOT_FOUND),
-            Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
-        };
+    let ciphertext = match aurora_storage::get_oauth_token_ciphertext(
+        &state.pool,
+        &user_hash,
+        &provider,
+    )
+    .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => return fail(StatusCode::NOT_FOUND),
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let plaintext = match aurora_storage::decrypt_oauth_tokens(&state.encryption_key, &ciphertext) {
         Ok(value) => value,
         Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1360,12 +1427,13 @@ async fn disconnect(
         Ok(sid) => sid,
         Err(rejection) => return rejection,
     };
-    // The account row is keyed by the user cookie hash.
-    let uid = match user_token(&headers) {
+    // The account row is keyed by the user identity hash (login session's
+    // account hash when logged in, else the anonymous user cookie hash).
+    let user_hash = match resolve_user_hash(&state, &headers).await {
         Some(x) => x,
         None => return fail(StatusCode::UNAUTHORIZED),
     };
-    if aurora_storage::delete_oauth_account(&state.pool, &hash(&uid), &provider)
+    if aurora_storage::delete_oauth_account(&state.pool, &user_hash, &provider)
         .await
         .is_err()
     {
@@ -1450,6 +1518,7 @@ mod tests {
     pub(crate) fn config() -> Config {
         Config {
             allowed_origins: vec!["https://app.example".into()],
+            registration_open: true,
             frontend_url: "https://app.example/settings/accounts".into(),
             spotify: Some(ProviderSettings {
                 client_id: "id".into(),
@@ -2025,5 +2094,168 @@ mod tests {
             .unwrap_or_default()
             .to_ascii_lowercase();
         assert!(allowed.contains(CSRF_HEADER), "got {allowed:?}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Email/password auth (auth.rs)
+    // ---------------------------------------------------------------------------
+
+    mod auth_tests {
+        use super::*;
+        use crate::auth::{login, register};
+        use axum::extract::State;
+
+        /// POSTs credentials through the handler directly (no router), mirroring
+        /// how the other handler tests in this module call handlers.
+        async fn post<H, F>(
+            handler: H,
+            app: &AppState,
+            origin: &str,
+            cookie: Option<&str>,
+            body: &str,
+        ) -> Response
+        where
+            H: FnOnce(
+                State<AppState>,
+                HeaderMap,
+                PeerAddr,
+                axum::Json<crate::auth::Credentials>,
+            ) -> F,
+            F: std::future::Future<Output = Response>,
+        {
+            let mut h = HeaderMap::new();
+            h.insert(header::ORIGIN, origin.parse().unwrap());
+            if let Some(cookie) = cookie {
+                h.insert(header::COOKIE, cookie.parse().unwrap());
+            }
+            let creds: crate::auth::Credentials = serde_json::from_str(body).unwrap();
+            handler(State(app.clone()), h, peer(), axum::Json(creds)).await
+        }
+
+        #[tokio::test]
+        async fn register_login_and_wrong_password() {
+            let (app, _store) = state_with_store(config()).await;
+            // Register issues a session + CSRF pair.
+            let r = post(
+                register,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"A@Example.com","password":"correct horse battery"}"#,
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+            let body = body_json(r).await;
+            assert_eq!(body["email"], "a@example.com");
+            let csrf = body["csrfToken"].as_str().unwrap().to_owned();
+
+            // Login with the right password works and echoes the email.
+            let ok = post(
+                login,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"a@example.com","password":"correct horse battery"}"#,
+            )
+            .await;
+            assert_eq!(ok.status(), StatusCode::OK);
+            assert_eq!(body_json(ok).await["email"], "a@example.com");
+
+            // Wrong password: 401 with the standard fail body.
+            let wrong = post(
+                login,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"a@example.com","password":"wrong password 1"}"#,
+            )
+            .await;
+            assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(body_json(wrong).await["error"], "oauth_unavailable");
+
+            // Unknown email: 401, same body shape.
+            let unknown = post(
+                login,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"nobody@example.com","password":"whatever pass"}"#,
+            )
+            .await;
+            assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(body_json(unknown).await["error"], "oauth_unavailable");
+
+            // The register CSRF token from the response body is a real token.
+            assert!(csrf.len() >= 16);
+        }
+
+        #[tokio::test]
+        async fn register_rejects_malformed_input_and_duplicate_email() {
+            let (app, _store) = state_with_store(config()).await;
+            for body in [
+                r#"{"email":"no-at-sign","password":"long enough pass"}"#,
+                r#"{"email":"a@b","password":"short"}"#,
+                r#"{"email":"a@b.c","password":"short"}"#,
+                r#"{"email":"","password":"long enough pass"}"#,
+            ] {
+                let r = post(register, &app, "https://app.example", None, body).await;
+                assert_eq!(r.status(), StatusCode::BAD_REQUEST, "accepted {body}");
+            }
+            // Foreign origin: 403, no user created.
+            let foreign = post(
+                register,
+                &app,
+                "https://evil.example",
+                None,
+                r#"{"email":"x@example.com","password":"long enough pass"}"#,
+            )
+            .await;
+            assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+            // Valid registration, then a duplicate: 409.
+            let first = post(
+                register,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"dupe@example.com","password":"long enough pass"}"#,
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::CREATED);
+            let dupe = post(
+                register,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"dupe@example.com","password":"another long pass"}"#,
+            )
+            .await;
+            assert_eq!(dupe.status(), StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
+        async fn closed_registration_returns_forbidden() {
+            let mut cfg = config();
+            cfg.registration_open = false;
+            let (app, _store) = state_with_store(cfg).await;
+            let r = post(
+                register,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"closed@example.com","password":"long enough pass"}"#,
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+            // Login is unaffected by the registration switch.
+            let login_ok = post(
+                login,
+                &app,
+                "https://app.example",
+                None,
+                r#"{"email":"closed@example.com","password":"long enough pass"}"#,
+            )
+            .await;
+            assert_eq!(login_ok.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 }
