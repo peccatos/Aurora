@@ -117,6 +117,10 @@ fn params_to_json(params: &[(u32, f64)]) -> String {
 }
 
 /// Non-blocking Win32 message pump for this thread's windows.
+/// On non-Windows platforms the vst3-host crate services its native
+/// windows through `service_platform_events` (xcb/NSWindow paths), so
+/// nothing extra is needed — the pump is a Windows-only no-op elsewhere.
+#[cfg(target_os = "windows")]
 fn pump_windows_messages() {
     use std::mem;
     use std::ptr;
@@ -130,3 +134,6 @@ fn pump_windows_messages() {
         }
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn pump_windows_messages() {}
