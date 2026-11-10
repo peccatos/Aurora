@@ -19,7 +19,12 @@ WORKDIR /web
 # no build-time env is needed; VITE_AURORA_* overrides remain available.
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY docs ./docs
+# The web shell's legal page imports docs/legal/*.md via Vite ?raw with a
+# path relative to the REPO ROOT (frontend/src/pages -> ../../../docs).
+# In this container the frontend tree lives at /web, so the import target
+# is /docs — docs must be copied one level ABOVE the workdir, mirroring
+# the repo layout.
+COPY docs /docs
 COPY frontend ./
 # The generated wasm glue is a local artifact; keep it out of the context.
 RUN npm run build
