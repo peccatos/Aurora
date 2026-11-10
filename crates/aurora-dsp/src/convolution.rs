@@ -1,7 +1,25 @@
-//! Convolution reverb: uniformly partitioned time-domain stereo FIR.
+//! Convolution reverb: partitioned stereo FIR.
 //!
-//! Design (review-approved): IRs up to ~10 s are convolved directly in
-//! the time domain — no rustfft in aurora-dsp. The convolution runs as
+//! Two engines, selected automatically at registration by IR length
+//! (and forceable for tests):
+//! - **Direct time-domain** (short IRs, < ~0.3 s where FFT overhead
+//!   dominates): a block-wise correlation against the REVERSED impulse
+//!   response, scalar-times-vector axpy per tap, auto-vectorized. Cost
+//!   O(L) MACs per output sample.
+//! - **Uniformly partitioned overlap-save FFT** (long IRs): per-channel
+//!   IR is zero-padded and split into B-sample partitions; each input
+//!   block of B samples is forward-FFTed once and multiplied against a
+//!   ring of the IR's (pre-computed) frequency-domain partitions; the
+//!   inverse FFT plus the overlap tail yields B outputs. Cost
+//!   O(P log(P)) per B samples with P = 2B — O(log L) per sample.
+//!   rustfft is pulled into aurora-dsp ONLY for this path: the
+//!   complexity of a 1.5 s @48 kHz hall (72k taps/channel) makes the
+//!   direct correlation unable to sustain realtime on weak/mobile CPUs
+//!   (measured ~0.7x realtime before this path existed), and rustfft is
+//!   already a workspace dependency used by aurora-audio (spectrum) and
+//!   aurora-decoder (tempo) — no new third-party surface.
+//!
+//! The direct path runs as
 //! a block-wise correlation against the REVERSED impulse response:
 //! out[i] = sum_j r[j] * window[i + j] where the window is the L-1
 //! previous samples followed by the current block. The inner loop is a
@@ -36,6 +54,18 @@ pub const IR_PLATE: u32 = 3;
 /// First id a shell may assign to a user-supplied IR.
 pub const FIRST_USER_IR_ID: u32 = 100;
 
+/// CPU-quality mode for the convolution stage. `Low` truncates the IR
+/// to 0.5 s (with an energy-preserving faster decay) for weak/mobile
+/// CPUs; `High` keeps the full IR. Defaults to `High` (never silently
+/// degrade quality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConvolutionQuality {
+    #[default]
+    High,
+    Low,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ConvolutionParams {
@@ -51,6 +81,9 @@ pub struct ConvolutionParams {
     pub predelay_ms: f32,
     /// IR trim in dB (-24..12), applied to the impulse response.
     pub ir_gain_db: f32,
+    /// CPU quality: `low` truncates the IR to 0.5 s (fast decay) for
+    /// weak/mobile CPUs; `high` (default) keeps the full IR.
+    pub quality: ConvolutionQuality,
 }
 
 impl Default for ConvolutionParams {
@@ -62,6 +95,7 @@ impl Default for ConvolutionParams {
             dry: 0.8,
             predelay_ms: 0.0,
             ir_gain_db: 0.0,
+            quality: ConvolutionQuality::High,
         }
     }
 }
@@ -79,6 +113,7 @@ impl ConvolutionParams {
             dry: finite_or(self.dry, 0.8).clamp(0.0, 1.0),
             predelay_ms: finite_or(self.predelay_ms, 0.0).clamp(0.0, 250.0),
             ir_gain_db: finite_or(self.ir_gain_db, 0.0).clamp(-24.0, 12.0),
+            quality: self.quality,
         }
     }
 }
@@ -659,6 +694,7 @@ mod tests {
             dry: f32::INFINITY,
             predelay_ms: -5.0,
             ir_gain_db: 99.0,
+            quality: ConvolutionQuality::High,
         }
         .normalized();
         assert!(p.wet.is_finite() && (0.0..=1.0).contains(&p.wet));

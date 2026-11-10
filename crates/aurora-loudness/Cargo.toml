@@ -1,0 +1,20 @@
+[package]
+name = "aurora-loudness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+aurora-decoder.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hound.workspace = true
+
+[lints]
+workspace = true

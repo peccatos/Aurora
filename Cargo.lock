@@ -456,6 +456,7 @@ name = "aurora-dsp"
 version = "0.2.0"
 dependencies = [
  "aurora-core",
+ "aurora-loudness",
  "proptest",
  "rubato",
  "serde",
@@ -473,6 +474,7 @@ dependencies = [
  "aurora-decoder",
  "aurora-dsp",
  "aurora-library",
+ "aurora-loudness",
  "aurora-metadata",
  "aurora-storage",
  "aurora-vst",
@@ -500,6 +502,19 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "aurora-loudness"
+version = "0.2.0"
+dependencies = [
+ "aurora-core",
+ "aurora-decoder",
+ "hound",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -599,6 +614,7 @@ dependencies = [
  "aurora-decoder",
  "aurora-dsp",
  "aurora-kernel",
+ "aurora-loudness",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",

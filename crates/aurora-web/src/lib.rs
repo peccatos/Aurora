@@ -155,10 +155,7 @@ impl WebKernel {
                 Err(_) => break, // honest: measure what we got
             }
         }
-        Ok(
-            aurora_dsp::lufs::integrated_lufs(&decoded, channels, format.sample_rate)
-                .map(f64::from),
-        )
+        Ok(aurora_loudness::integrated_lufs(&decoded, channels, format.sample_rate))
     }
 
     // -----------------------------------------------------------------

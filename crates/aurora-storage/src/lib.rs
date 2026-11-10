@@ -872,6 +872,10 @@ pub async fn set_track_bpm(
     Ok(())
 }
 
+/// Measured loudness (ReplayGain 2.0 / R128) persistence.
+mod loudness;
+pub use loudness::set_track_replaygain;
+
 // ---------------------------------------------------------------------------
 // Playlists
 // ---------------------------------------------------------------------------

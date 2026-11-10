@@ -9,6 +9,7 @@ license.workspace = true
 aurora-core.workspace = true
 aurora-decoder.workspace = true
 aurora-dsp.workspace = true
+aurora-loudness.workspace = true
 aurora-metadata.workspace = true
 serde.workspace = true
 serde_json.workspace = true

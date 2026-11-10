@@ -1070,6 +1070,75 @@ impl PlayerKernel {
     }
 
     // -----------------------------------------------------------------
+    // Loudness (measured, never fabricated) - R128 / ReplayGain 2.0
+    // -----------------------------------------------------------------
+
+    /// Look up the measured loudness for `path`; if not yet measured,
+    /// decode (bounded 60 s) and measure integrated LUFS. Returns the
+    /// ReplayGain 2.0 track gain (dB, target -18 LUFS) ready to store in
+    /// the existing `replaygain_track_db` column - so playback
+    /// normalization works with zero pipeline changes.
+    ///
+    /// Native: persists the measurement to SQLite when a library is open.
+    /// Wasm: returns the measurement; persistence is the JS shell's
+    /// business (IndexedDB), mirroring `measure_track_bpm`.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn scan_track_loudness(&self, path: &str) -> Option<f64> {
+        let library = self.library.lock().await;
+        let service = library.as_ref()?;
+        let existing = aurora_storage::track_by_path(service.pool(), path)
+            .await
+            .ok()
+            .flatten();
+        if let Some(track) = existing.as_ref()
+            && track.replaygain_track_db.is_some()
+        {
+            return track.replaygain_track_db;
+        }
+        let path_owned = path.to_string();
+        let measured = tokio::task::spawn_blocking(move || {
+            let mut source = aurora_decoder::AudioSource::open(std::path::Path::new(&path_owned))
+                .ok()?;
+            aurora_loudness::analyze_source(&mut source, 60.0)
+                .ok()
+                .and_then(|scan| scan.integrated_lufs)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(lufs) = measured {
+            let gain = aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS);
+            let _ =
+                aurora_storage::set_track_replaygain(service.pool(), path, gain).await;
+            gain
+        } else {
+            // Known track, unmeasurable audio (silence/too short): persist
+            // nothing - an unmeasured NULL is retried, an honest miss.
+            None
+        }
+    }
+
+    /// Wasm twin: measure inline (single-threaded), no SQLite cache. The
+    /// JS shell already measures at ingest via `analyze_lufs`; this
+    /// command exists for shells that hold a `web://` path.
+    #[cfg(target_family = "wasm")]
+    pub async fn scan_track_loudness(&self, path: &str) -> Option<f64> {
+        let path_owned = path.to_string();
+        let mut source =
+            aurora_decoder::AudioSource::open(std::path::Path::new(&path_owned)).ok()?;
+        aurora_loudness::analyze_source(&mut source, 60.0)
+            .ok()
+            .and_then(|scan| scan.integrated_lufs)
+            .and_then(|lufs| aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS))
+    }
+
+    /// Measured loudness (as ReplayGain 2.0 track gain, dB) by library
+    /// path. `None` = honestly unmeasurable, not an error.
+    pub async fn track_loudness_gain(&self, path: &str) -> Result<Option<f64>, KernelError> {
+        Ok(self.scan_track_loudness(path).await)
+    }
+
+    // -----------------------------------------------------------------
     // Library
     // -----------------------------------------------------------------
 

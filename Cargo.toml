@@ -5,6 +5,7 @@ members = [
     "crates/aurora-providers",
     "crates/aurora-decoder",
     "crates/aurora-dsp",
+    "crates/aurora-loudness",
     "crates/aurora-vst",
     "crates/aurora-audio",
     "crates/aurora-metadata",
@@ -30,6 +31,7 @@ aurora-core = { path = "crates/aurora-core" }
 aurora-providers = { path = "crates/aurora-providers" }
 aurora-decoder = { path = "crates/aurora-decoder" }
 aurora-dsp = { path = "crates/aurora-dsp" }
+aurora-loudness = { path = "crates/aurora-loudness" }
 aurora-vst = { path = "crates/aurora-vst" }
 aurora-audio = { path = "crates/aurora-audio" }
 aurora-metadata = { path = "crates/aurora-metadata" }
