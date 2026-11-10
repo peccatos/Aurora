@@ -19,6 +19,7 @@ WORKDIR /web
 # no build-time env is needed; VITE_AURORA_* overrides remain available.
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
+COPY docs ./docs
 COPY frontend ./
 # The generated wasm glue is a local artifact; keep it out of the context.
 RUN npm run build
@@ -29,6 +30,9 @@ WORKDIR /app
 # The workspace manifest lists all members, so the whole crates/ tree has to
 # be present even though only the aurora-api closure is compiled.
 COPY Cargo.toml Cargo.lock ./
+# vendor/sqlx-sqlite is a [patch.crates-io] path dependency (CVE override);
+# it must be present in the image or cargo cannot resolve the patch.
+COPY vendor ./vendor
 COPY crates ./crates
 # The workspace manifest lists apps/desktop as a member, but the Tauri shell
 # is out of scope here. An empty stub manifest (just [package]) satisfies the
