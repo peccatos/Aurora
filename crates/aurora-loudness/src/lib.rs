@@ -43,8 +43,6 @@ mod tests {
         assert!((replaygain2_db(Some(-12.0), RG2_TARGET_LUFS).unwrap() + 6.0).abs() < 1e-9);
         assert!((replaygain2_db(Some(-23.0), RG2_TARGET_LUFS).unwrap() - 5.0).abs() < 1e-9);
         assert!(replaygain2_db(None, RG2_TARGET_LUFS).is_none());
-        assert!(
-            (replaygain2_db(Some(-10.0), STREAMING_TARGET_LUFS).unwrap() + 4.0).abs() < 1e-9
-        );
+        assert!((replaygain2_db(Some(-10.0), STREAMING_TARGET_LUFS).unwrap() + 4.0).abs() < 1e-9);
     }
 }

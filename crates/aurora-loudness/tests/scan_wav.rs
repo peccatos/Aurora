@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use aurora_decoder::AudioSource;
-use aurora_loudness::{integrated_lufs, replaygain2_db, RG2_TARGET_LUFS};
+use aurora_loudness::{RG2_TARGET_LUFS, integrated_lufs, replaygain2_db};
 
 fn write_sine_wav(path: &Path, amp: f64, secs: f64) {
     let spec = hound::WavSpec {
@@ -17,8 +17,8 @@ fn write_sine_wav(path: &Path, amp: f64, secs: f64) {
     let frames = (secs * 44_100.0) as usize;
     for i in 0..frames {
         // Same phase per channel: a plain stereo sine.
-        let v = (amp * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 44_100.0).sin()
-            * 32_000.0) as i16;
+        let v = (amp * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 44_100.0).sin() * 32_000.0)
+            as i16;
         writer.write_sample(v).expect("write l");
         writer.write_sample(v).expect("write r");
     }

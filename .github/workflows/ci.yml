@@ -143,7 +143,7 @@ jobs:
             librsvg2-dev \
             libayatana-appindicator3-dev \
             libasound2-dev
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/stage-vst-bins
       - name: Check workspace at MSRV

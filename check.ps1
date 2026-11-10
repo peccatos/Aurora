@@ -3,13 +3,14 @@
 #                 ./check.ps1 -Rust    (только Rust)
 #                 ./check.ps1 -Frontend (только фронтенд)
 # Exit code 0 = всё зелёное; иначе печатает, какой шаг упал.
+# Корень определяется по расположению этого файла — скрипт переносим.
 param(
   [switch]$Rust,
   [switch]$Frontend
 )
 if (-not $Rust -and -not $Frontend) { $Rust = $true; $Frontend = $true }
 
-$root = "C:\Users\madei\OneDrive\Desktop\aurora"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 $fail = $null
 
@@ -28,6 +29,7 @@ if ($Rust) {
 
 if ($Frontend -and -not $fail) {
   Step "tsc --noEmit" { Set-Location "$root\frontend"; npx tsc --noEmit }
+  Step "npm test" { npm test }
   Step "vite build" { npm run build }
 }
 

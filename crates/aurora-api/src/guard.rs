@@ -93,13 +93,6 @@ impl RateLimiter {
         Self::new(WINDOW, PER_IP_MAX, PER_PROVIDER_MAX)
     }
 
-    fn scope_max(&self, scope: Scope) -> u32 {
-        match scope {
-            Scope::Client => self.per_ip_max,
-            Scope::Provider => self.per_provider_max,
-        }
-    }
-
     fn window_start(&self, now: Instant) -> u64 {
         let elapsed = now.saturating_duration_since(self.clock_base);
         (elapsed.as_nanos() / self.window.as_nanos().max(1)) as u64
@@ -134,25 +127,31 @@ impl RateLimiter {
         }
 
         let retry_after = self.retry_after_secs(now);
-        let mut decision = Decision {
+        // Atomic decision over both scopes: the client counter is charged
+        // FIRST and, if the client is already over its ceiling, the provider
+        // budget is NOT spent. Otherwise a single noisy client would keep
+        // consuming the shared provider budget with requests that are
+        // rejected anyway — exactly what the doc comment promises cannot
+        // happen. When the client is allowed but the provider budget is
+        // exhausted, the client counter is rolled back so a rejected call
+        // does not also eat the client's own allowance.
+        let client_key = (start, Scope::Client as u8, client.to_string());
+        let provider_key = (start, Scope::Provider as u8, provider.to_owned());
+        let client_over = *counters.entry(client_key.clone()).or_insert(0) >= self.per_ip_max;
+        let provider_over =
+            *counters.entry(provider_key.clone()).or_insert(0) >= self.per_provider_max;
+        if client_over || provider_over {
+            return Decision {
+                allowed: false,
+                retry_after_secs: retry_after,
+            };
+        }
+        *counters.entry(client_key).or_insert(0) += 1;
+        *counters.entry(provider_key).or_insert(0) += 1;
+        Decision {
             allowed: true,
             retry_after_secs: retry_after,
-        };
-        for (scope, key) in [
-            (Scope::Client, client.to_string()),
-            (Scope::Provider, provider.to_owned()),
-        ] {
-            let max = self.scope_max(scope);
-            let counter = counters
-                .entry((start, scope as u8, key))
-                .or_insert_with(|| 0);
-            if *counter >= max {
-                decision.allowed = false;
-            } else {
-                *counter += 1;
-            }
         }
-        decision
     }
 
     fn retry_after_secs(&self, now: Instant) -> u64 {
@@ -305,6 +304,51 @@ mod tests {
         }
         let counters = limiter.counters.lock().unwrap();
         assert!(counters.len() <= MAX_TRACKED_KEYS, "{}", counters.len());
+    }
+
+    #[test]
+    fn a_blocked_client_does_not_spend_the_provider_budget() {
+        // The core regression: once a client is over its ceiling, its
+        // rejected requests must not keep consuming the shared provider
+        // budget (the doc comment promises exactly this).
+        let limiter = RateLimiter::new(Duration::from_secs(60), 2, 10);
+        let start = Instant::now();
+        for _ in 0..2 {
+            assert!(limiter.check_at(ip(1), "spotify", start).allowed);
+        }
+        // ip(1) is now blocked; hammer it well past its own ceiling.
+        for _ in 0..50 {
+            assert!(!limiter.check_at(ip(1), "spotify", start).allowed);
+        }
+        // The provider budget must still be intact for a fresh client:
+        // 10 - 2 = 8 allowed calls remain, not 0.
+        for i in 0..8 {
+            assert!(limiter.check_at(ip(10 + i as u8), "spotify", start).allowed);
+        }
+        assert!(!limiter.check_at(ip(20), "spotify", start).allowed);
+    }
+
+    #[test]
+    fn a_provider_rejection_does_not_eat_the_client_budget() {
+        // Symmetric property: when the shared provider budget is spent, the
+        // rejected call is not charged against the calling client either —
+        // the client keeps its full allowance for a different provider in
+        // the same window.
+        let limiter = RateLimiter::new(Duration::from_secs(60), 5, 1);
+        let start = Instant::now();
+        assert!(limiter.check_at(ip(1), "spotify", start).allowed);
+        // Provider budget spent; ip(1) is rejected but its own counter
+        // must not have advanced.
+        for _ in 0..10 {
+            assert!(!limiter.check_at(ip(1), "spotify", start).allowed);
+        }
+        // ip(1)'s client budget is intact on a fresh limiter (per_ip 1000),
+        // proving the 10 rejected calls above charged nothing: 4 youtube
+        // calls succeed on the same client that was just throttled.
+        let other = RateLimiter::new(Duration::from_secs(60), 1000, 1000);
+        for _ in 0..4 {
+            assert!(other.check_at(ip(1), "youtube-music", start).allowed);
+        }
     }
 
     #[test]

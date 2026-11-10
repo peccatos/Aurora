@@ -1077,6 +1077,11 @@ impl PlaybackEngine {
         let source_duration_ms = source.info().duration_ms;
 
         // Native-only decode worker: no DSP path, bytes go verbatim.
+        // The running flag is set BEFORE the worker is spawned: the worker's
+        // first action is a `running` check, so a worker spawned against a
+        // still-false flag would exit before decoding a single chunk (race
+        // between this thread's store below and the worker's first load).
+        self.shared.running.store(true, Ordering::Release);
         let worker = std::thread::Builder::new()
             .name("aurora-decode-worker".into())
             .spawn(move || {
@@ -1127,7 +1132,8 @@ impl PlaybackEngine {
             })
             .map_err(|e| EngineError::Internal(e.to_string()))?;
 
-        self.shared.running.store(true, Ordering::Release);
+        // (running was already set above, before the worker spawned — the
+        // worker would otherwise observe false and exit immediately.)
         let exclusive = crate::exclusive_stream::ExclusiveStream::start(
             device.key(),
             source_format,
@@ -1135,6 +1141,7 @@ impl PlaybackEngine {
             Arc::clone(&self.shared.running),
             Arc::clone(&self.shared.paused),
             Arc::clone(&self.shared.finished),
+            Some(Arc::clone(&self.shared.stream_error)),
         )?;
 
         self.metrics.reset();

@@ -1097,8 +1097,8 @@ impl PlayerKernel {
         }
         let path_owned = path.to_string();
         let measured = tokio::task::spawn_blocking(move || {
-            let mut source = aurora_decoder::AudioSource::open(std::path::Path::new(&path_owned))
-                .ok()?;
+            let mut source =
+                aurora_decoder::AudioSource::open(std::path::Path::new(&path_owned)).ok()?;
             aurora_loudness::analyze_source(&mut source, 60.0)
                 .ok()
                 .and_then(|scan| scan.integrated_lufs)
@@ -1107,9 +1107,9 @@ impl PlayerKernel {
         .ok()
         .flatten();
         if let Some(lufs) = measured {
-            let gain = aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS);
-            let _ =
-                aurora_storage::set_track_replaygain(service.pool(), path, gain).await;
+            let gain =
+                aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS);
+            let _ = aurora_storage::set_track_replaygain(service.pool(), path, gain).await;
             gain
         } else {
             // Known track, unmeasurable audio (silence/too short): persist
@@ -1129,7 +1129,9 @@ impl PlayerKernel {
         aurora_loudness::analyze_source(&mut source, 60.0)
             .ok()
             .and_then(|scan| scan.integrated_lufs)
-            .and_then(|lufs| aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS))
+            .and_then(|lufs| {
+                aurora_loudness::replaygain2_db(Some(lufs), aurora_loudness::RG2_TARGET_LUFS)
+            })
     }
 
     /// Measured loudness (as ReplayGain 2.0 track gain, dB) by library
